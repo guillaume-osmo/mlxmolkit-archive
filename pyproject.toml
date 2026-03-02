@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlxmolkit"
+version = "0.1.0"
+description = "MLX/Metal-first molecular kernels: Tanimoto + Butina (phase 1 of nvMolKit port)"
+requires-python = ">=3.10"
+dependencies = ["mlx", "numpy"]
+[project.optional-dependencies]
+test = ["pytest", "rdkit"]
+
+[tool.setuptools.packages.find]
+include = ["mlxmolkit"]
