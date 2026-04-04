@@ -4,12 +4,15 @@ import mlx.core as mx
 import pytest
 
 from mlxmolkit.dg_extract import DGParams, extract_dg_params, get_bounds_matrix
+from mlxmolkit.etk_extract import extract_etk_params
 from mlxmolkit.shared_batch import (
     SharedConstraintBatch,
     pack_shared_dg_batch,
+    add_etk_to_batch,
     init_random_positions,
 )
 from mlxmolkit.conformer_metal import dg_minimize_shared
+from mlxmolkit.etk_metal import etk_minimize_shared
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +205,6 @@ class TestDGMinimizeParallelGrad:
         # Energy should match (gradient computation is mathematically equivalent)
         np.testing.assert_allclose(e_serial, e_parallel, atol=1e-4)
 
-    @pytest.mark.xfail(reason="MLX buffer aliasing: lbfgs_history_starts and out_statuses may overlap when same shape/dtype")
     def test_parallel_status_values(self):
         """Check status values are correct (not aliased with lbfgs starts)."""
         dg = _make_all_pairs_dg(15)
@@ -211,7 +213,6 @@ class TestDGMinimizeParallelGrad:
         _, _, statuses = dg_minimize_shared(
             batch, pos, max_iters=300, parallel_grad=True,
         )
-        # Statuses should be 0 or 1, not large offset values
         assert np.all(statuses <= 1), f"Status values look aliased: {statuses}"
 
 
@@ -251,7 +252,6 @@ class TestDGMinimizeScale:
 
 class TestDGMinimizeRDKit:
 
-    @pytest.mark.xfail(reason="Large molecule needs gradient scaling (nvMolKit 0.1x) not yet in TPM kernel")
     def test_aspirin(self):
         """Full pipeline: SMILES → RDKit extract → shared batch → DG minimize."""
         try:
@@ -268,11 +268,11 @@ class TestDGMinimizeRDKit:
         batch = pack_shared_dg_batch([dg_params], [k], dim=4)
         pos = init_random_positions(batch, seed=42)
         out_pos, energies, statuses = dg_minimize_shared(
-            batch, pos, max_iters=500, fourth_dim_weight=0.1,
+            batch, pos, max_iters=1000, fourth_dim_weight=0.1,
         )
-        # Aspirin with hydrogens is large; convergence depends on random init
+        # Aspirin with hydrogens is large (21 atoms, 210 constraints)
         converged = np.sum(statuses == 0)
-        assert converged >= 1, f"No conformers converged for aspirin (statuses={statuses})"
+        assert converged >= 1, f"No conformers converged for aspirin (statuses={statuses}, energies={energies})"
         assert batch.n_confs_total == k
         # Constraints stored once
         assert len(batch.dist_idx1) == len(dg_params.dist_idx1)
@@ -303,3 +303,121 @@ class TestDGMinimizeRDKit:
         assert len(energies) == 7
         converged = np.sum(statuses == 0)
         assert converged >= 5, f"Only {converged}/7 converged"
+
+
+# ---------------------------------------------------------------------------
+# ETK stage tests
+# ---------------------------------------------------------------------------
+
+class TestETKMinimize:
+
+    def _run_dg_then_etk(self, smiles_list, k):
+        """Helper: DG → extract 3D → ETK for given molecules."""
+        from rdkit import Chem
+
+        mols = [Chem.AddHs(Chem.MolFromSmiles(s)) for s in smiles_list]
+        bmats = [get_bounds_matrix(m) for m in mols]
+        dg_list = [extract_dg_params(m, b) for m, b in zip(mols, bmats)]
+        etk_list = [extract_etk_params(m, b) for m, b in zip(mols, bmats)]
+        k_list = [k] * len(mols)
+
+        # DG stage (4D)
+        batch4 = pack_shared_dg_batch(dg_list, k_list, dim=4)
+        pos4 = init_random_positions(batch4, seed=42)
+        dg_out, _, dg_s = dg_minimize_shared(batch4, pos4, max_iters=300)
+
+        # Extract 3D from 4D
+        batch3 = pack_shared_dg_batch(dg_list, k_list, dim=3)
+        add_etk_to_batch(batch3, etk_list)
+        C = batch3.n_confs_total
+        pos3 = np.zeros(int(batch3.conf_atom_starts[-1]) * 3, dtype=np.float32)
+        for c in range(C):
+            n_a = batch3.mol_n_atoms[batch3.conf_to_mol[c]]
+            s4 = int(batch4.conf_atom_starts[c]) * 4
+            p4 = dg_out[s4:s4 + n_a * 4].reshape(n_a, 4)
+            s3 = int(batch3.conf_atom_starts[c]) * 3
+            pos3[s3:s3 + n_a * 3] = p4[:, :3].flatten()
+
+        # ETK stage (3D)
+        etk_out, etk_e, etk_s = etk_minimize_shared(batch3, pos3, max_iters=200)
+        return batch3, etk_out, etk_e, etk_s
+
+    def test_etk_converges(self):
+        try:
+            from rdkit import Chem
+        except ImportError:
+            pytest.skip("RDKit not available")
+
+        _, _, energies, statuses = self._run_dg_then_etk(["c1ccccc1"], 3)
+        converged = np.sum(statuses == 0)
+        assert converged >= 2, f"ETK: only {converged}/3 converged"
+
+    def test_etk_multi_molecule(self):
+        try:
+            from rdkit import Chem
+        except ImportError:
+            pytest.skip("RDKit not available")
+
+        batch, out, energies, statuses = self._run_dg_then_etk(
+            ["c1ccccc1", "CC(=O)O"], 3,
+        )
+        assert len(energies) == 6
+        converged = np.sum(statuses == 0)
+        assert converged >= 4, f"ETK: only {converged}/6 converged"
+
+    def test_etk_positions_change(self):
+        """ETK should modify positions from DG output."""
+        try:
+            from rdkit import Chem
+        except ImportError:
+            pytest.skip("RDKit not available")
+
+        batch, etk_out, _, _ = self._run_dg_then_etk(["c1ccccc1"], 2)
+        # ETK output should be non-zero
+        assert np.max(np.abs(etk_out)) > 0.01
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline test (DG → ETK end-to-end)
+# ---------------------------------------------------------------------------
+
+class TestFullPipeline:
+
+    def test_pipeline_end_to_end(self):
+        try:
+            from rdkit import Chem
+        except ImportError:
+            pytest.skip("RDKit not available")
+
+        from mlxmolkit.conformer_pipeline_v2 import generate_conformers_nk
+
+        result = generate_conformers_nk(
+            smiles_list=["c1ccccc1", "CC(=O)O"],
+            n_confs_per_mol=3,
+            max_confs_per_batch=10,
+        )
+        assert result.total_conformers == 6
+        for m in result.molecules:
+            assert len(m.positions_3d) == 3
+            for p in m.positions_3d:
+                assert p.shape == (m.n_atoms, 3)
+                assert np.max(np.abs(p)) > 0.01
+
+    def test_pipeline_chunked(self):
+        """Force multiple batches via small max_confs_per_batch."""
+        try:
+            from rdkit import Chem
+        except ImportError:
+            pytest.skip("RDKit not available")
+
+        from mlxmolkit.conformer_pipeline_v2 import generate_conformers_nk
+
+        result = generate_conformers_nk(
+            smiles_list=["c1ccccc1", "CC(=O)O", "CCO"],
+            n_confs_per_mol=4,
+            max_confs_per_batch=5,
+        )
+        assert result.total_conformers == 12
+        assert result.n_batches >= 2
+        for m in result.molecules:
+            assert len(m.positions_3d) == 4

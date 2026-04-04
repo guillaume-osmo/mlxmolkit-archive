@@ -326,6 +326,18 @@ _MSL_DG_BODY = """
     threadgroup_barrier(mem_flags::mem_device);
 #endif
 
+    // ---- nvMolKit gradient scaling: 0.1x, halve while max > 10 ----
+    parallel_scale(my_grad, 0.1f, n_vars, tid, tpm);
+    for (int sc = 0; sc < 20; sc++) {
+        float lmx = 0.0f;
+        for (int i = (int)tid; i < n_vars; i += (int)tpm) {
+            float a = abs(my_grad[i]); if (a > lmx) lmx = a;
+        }
+        shared[tid] = lmx;
+        if (tg_reduce_max(shared, tid, tpm) <= 10.0f) break;
+        parallel_scale(my_grad, 0.5f, n_vars, tid, tpm);
+    }
+
     parallel_neg_copy(my_dir, my_grad, n_vars, tid, tpm);
 
     float local_sum_sq = 0.0f;
@@ -547,7 +559,7 @@ _MSL_DG_BODY = """
     }
 """
 
-# Cache: (tpm, lbfgs_m, parallel_grad) → compiled kernel
+# Cache: (tpm, lbfgs_m, parallel_grad) → compiled kernel (cleared on source change)
 _dg_kernel_cache: dict[tuple, object] = {}
 
 
@@ -694,7 +706,7 @@ def dg_minimize_shared(
             mx.array(chiral_bounds),
             mx.array(batch.fourth_term_starts),
             mx.array(batch.fourth_idx),
-            mx.array(lbfgs_starts[:-1]),  # per-conformer starts
+            mx.array(lbfgs_starts),  # (C+1,) — full array to avoid shape aliasing
         ],
         grid=(C * tpm, 1, 1),  # total threads = C threadgroups × TPM
         threadgroup=(tpm, 1, 1),
