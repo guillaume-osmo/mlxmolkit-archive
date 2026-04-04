@@ -696,7 +696,7 @@ def dg_minimize_shared(
             mx.array(batch.fourth_idx),
             mx.array(lbfgs_starts[:-1]),  # per-conformer starts
         ],
-        grid=(C, 1, 1),
+        grid=(C * tpm, 1, 1),  # total threads = C threadgroups × TPM
         threadgroup=(tpm, 1, 1),
         output_shapes=[
             (total_pos_size,),    # out_pos
