@@ -119,6 +119,12 @@ def _build_chunk_schedule(
 # Per-chunk processing
 # ---------------------------------------------------------------------------
 
+def _auto_iters(max_atoms: int, base: int, scale: float) -> int:
+    """Scale iterations by largest molecule size. Small molecules converge
+    early via in-kernel TOLX/grad checks — no wasted compute."""
+    return max(base, int(base + scale * max_atoms))
+
+
 def _process_chunk(
     chunk: List[tuple],
     dg_params_list: List[DGParams],
@@ -147,6 +153,19 @@ def _process_chunk(
     chunk_dg = [dg_params_list[m] for m in mol_order]
     chunk_k = [mol_k[m] for m in mol_order]
     C = sum(chunk_k)
+
+    # Auto-scale iterations by largest molecule in this chunk.
+    # Larger molecules have more constraints → harder energy landscape.
+    # Small molecules converge early via in-kernel TOLX/grad checks.
+    max_atoms = max(dg_params_list[m].n_atoms for m in mol_order)
+    max_constraints = max(len(dg_params_list[m].dist_idx1) for m in mol_order)
+    complexity = max(max_atoms, int(max_constraints ** 0.5))
+    if dg_max_iters <= 0:
+        dg_max_iters = _auto_iters(complexity, base=300, scale=20.0)
+    if etk_max_iters <= 0:
+        etk_max_iters = _auto_iters(complexity, base=150, scale=10.0)
+    if mmff_max_iters <= 0:
+        mmff_max_iters = _auto_iters(complexity, base=200, scale=15.0)
 
     # ---- Stage 1: DG minimize (4D) ----
     batch4 = pack_shared_dg_batch(chunk_dg, chunk_k, dim=4)
@@ -245,13 +264,13 @@ def generate_conformers_nk(
     *,
     max_confs_per_batch: Optional[int] = None,
     max_memory_bytes: Optional[int] = None,
-    dg_max_iters: int = 500,
-    etk_max_iters: int = 200,
+    dg_max_iters: int = 0,
+    etk_max_iters: int = 0,
     fourth_dim_weight: float = 0.1,
     chiral_weight: float = 1.0,
     variant: str = "ETKDGv2",
     run_mmff: bool = False,
-    mmff_max_iters: int = 200,
+    mmff_max_iters: int = 0,
     mmff_use_lbfgs: bool = False,
 ) -> PipelineResult:
     """Generate 3D conformers for N molecules x k conformers each.
@@ -270,9 +289,11 @@ def generate_conformers_nk(
     max_confs_per_batch : int, optional
         Max conformers per GPU batch (auto-computed from free memory).
     dg_max_iters : int
-        L-BFGS iterations for DG stage.
+        L-BFGS iterations for DG stage. 0 (default) = auto-scale by
+        molecule complexity: ``300 + 20 * max(n_atoms, sqrt(n_constraints))``.
+        Small molecules converge early via in-kernel checks — no wasted compute.
     etk_max_iters : int
-        L-BFGS iterations for ETK stage.
+        L-BFGS iterations for ETK stage. 0 = auto-scale.
     variant : str
         ETKDG variant: DG, KDG, ETDG, ETKDG, ETKDGv2, ETKDGv3, srETKDGv3.
     run_mmff : bool
