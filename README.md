@@ -37,10 +37,10 @@ GPU memory stays constant regardless of total conformers thanks to divide-and-co
 
 | Pipeline | Time | Throughput | Convergence | Batches |
 |----------|------|-----------|-------------|---------|
-| DG + ETK | 1.7s | **6,044 conf/s** | 99.98% | 1 |
-| DG + ETK + MMFF | 4.0s | **2,483 conf/s** | 99.98% | 1 |
+| DG + ETK | 3.1s | **3,210 conf/s** | 99.8% | 1 |
+| DG + ETK + MMFF | 6.5s | **1,536 conf/s** | 99.8% | 1 |
 
-1000 drug-like molecules (5-25 heavy atoms). Auto batch sizing fits all 10,000 conformers in a single GPU dispatch.
+1000 drug-like molecules with explicit H (6-33 atoms, mean 14.2). All 10,000 conformers in a single GPU batch. 100% valid 3D coordinates.
 
 ### Batch Size Impact (N=20, k=50, C=1000)
 
