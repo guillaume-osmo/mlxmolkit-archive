@@ -288,7 +288,7 @@ def generate_conformers_nk(
     variant: str = "ETKDGv2",
     run_mmff: bool = False,
     mmff_max_iters: int = 0,
-    mmff_use_lbfgs: bool = False,
+    mmff_use_lbfgs: bool | None = None,
     mmff_variant: str = "MMFF94",
 ) -> PipelineResult:
     """Generate 3D conformers for N molecules x k conformers each.
@@ -361,6 +361,12 @@ def generate_conformers_nk(
         ConformerResult(n_atoms=dg_params_list[i].n_atoms, positions_3d=[], energies=[], converged=[])
         for i in range(N)
     ]
+    # Auto-select BFGS vs L-BFGS: BFGS is faster for <150 atoms (with H)
+    _LBFGS_ATOM_THRESHOLD = 150
+    if mmff_use_lbfgs is None:
+        max_atoms_all = max(p.n_atoms for p in dg_params_list)
+        mmff_use_lbfgs = max_atoms_all >= _LBFGS_ATOM_THRESHOLD
+
     total_confs = 0
     for chunk_idx, chunk in enumerate(chunks):
         chunk_results = _process_chunk(

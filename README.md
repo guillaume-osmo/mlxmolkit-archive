@@ -73,7 +73,9 @@ MMFF BFGS memory grows as O(n^2) due to the dense Hessian (n_atoms x 3)^2. **BFG
 | Testosterone | 49 | 0.364s | 0.335s | BFGS |
 | Cholesterol | 74 | 0.590s | 0.486s | BFGS |
 
-Recommendation: use BFGS (default) for all molecules <100 atoms. Use `mmff_use_lbfgs=True` only for proteins/macrocycles >150 atoms.
+Recommendation: use BFGS (default) for all molecules <150 atoms with H. The pipeline auto-switches to L-BFGS at 150+ atoms (`mmff_use_lbfgs=None`, the default).
+
+**Important:** Always add explicit hydrogens (`Chem.AddHs`) before conformer generation. Convergence is significantly better with explicit H because the distance geometry constraints are more complete and the force field terms (bond/angle/torsion) are fully defined. The pipeline calls `AddHs` automatically.
 
 With 64 GB unified memory, a single batch can hold:
 
