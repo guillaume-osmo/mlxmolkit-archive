@@ -211,14 +211,14 @@ def generate_conformers_nk(
     etk_max_iters: int = 200,
     fourth_dim_weight: float = 0.1,
     chiral_weight: float = 1.0,
-    run_etk: bool = True,
+    variant: str = "ETKDGv2",
 ) -> PipelineResult:
     """Generate 3D conformers for N molecules x k conformers each.
 
     Full pipeline: SMILES → DG (4D, Metal) → 3D extraction → ETK (3D, Metal)
 
-    Uses divide-and-conquer batching to bound GPU memory regardless of
-    total conformer count.  Constraints stored once per molecule.
+    Supports all ETKDG variants: DG, KDG, ETDG, ETKDG, ETKDGv2, ETKDGv3,
+    srETKDGv3.  The variant controls which ETK terms are active.
 
     Parameters
     ----------
@@ -232,14 +232,17 @@ def generate_conformers_nk(
         L-BFGS iterations for DG stage.
     etk_max_iters : int
         L-BFGS iterations for ETK stage.
-    run_etk : bool
-        Whether to run ETK torsion refinement (default True).
+    variant : str
+        ETKDG variant: DG, KDG, ETDG, ETKDG, ETKDGv2, ETKDGv3, srETKDGv3.
     """
     from rdkit import Chem
 
     t_start = time.time()
     N = len(smiles_list)
     k_list = [n_confs_per_mol] * N if isinstance(n_confs_per_mol, int) else list(n_confs_per_mol)
+
+    # Determine which ETK stages to run based on variant
+    run_etk = variant != "DG"
 
     # ---- Extract per-molecule params (CPU, once) ----
     mols, dg_params_list, etk_params_list, mol_n_atoms = [], [], [], []
@@ -252,7 +255,7 @@ def generate_conformers_nk(
         bmat = get_bounds_matrix(mol)
         dg_params_list.append(extract_dg_params(mol, bmat, dim=4))
         if run_etk:
-            etk_params_list.append(extract_etk_params(mol, bmat))
+            etk_params_list.append(extract_etk_params(mol, bmat, variant=variant))
         mol_n_atoms.append(dg_params_list[-1].n_atoms)
 
     # ---- Compute batch size ----
