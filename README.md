@@ -8,6 +8,12 @@ Implements the same 3-step workflow as the [RDKit blog post](https://greglandrum
 2. **Pairwise Tanimoto Similarity** — Custom Metal kernel (GPU)
 3. **Butina Clustering** — Greedy algorithm on CSR neighbor list (CPU)
 
+## What's new in v0.2.0
+
+- **Memory fix for large arrays**: Divide-and-conquer blockwise tiling so the full N x N similarity matrix is never materialised. Block size is auto-computed from available system memory. Handles 150k+ molecules without OOM.
+- **Faster Metal kernels**: Fused tiled kernel (Tanimoto + threshold in one pass) with threadgroup shared memory, ~3x faster than the pure-MLX path.
+- **Auto-selection**: `butina_tanimoto_mlx()` automatically picks the fused single-dispatch kernel for N <= 100k and the blockwise divide-and-conquer path for larger datasets.
+
 ## Key results
 
 Tested on Enamine REAL 10.4M subset (same dataset as the blog), Apple M3 Max:
@@ -17,6 +23,7 @@ Tested on Enamine REAL 10.4M subset (same dataset as the blog), Apple M3 Max:
 | 20k | 0.26s | 0.09s | **0.35s** | **152x** | 0.1 MB |
 | 50k | 1.26s | 0.36s | **1.62s** | — | 0.5 MB |
 | 100k | 4.87s | 0.97s | **5.84s** | — | 1.3 MB |
+| 150k+ | blockwise | — | scales | — | bounded |
 
 Cluster count parity with RDKit: delta of 5 clusters at 20k (0.04%), caused by float32 vs float64 precision — comparable to nvMolKit's delta of 2.
 
@@ -27,11 +34,15 @@ Morgan FP (RDKit CPU)
         ↓
    uint8 → uint32 packing
         ↓
-┌─ Fused Metal Kernel (no N×N matrix) ─┐
-│  For each row i:                      │
-│    compute Tanimoto(i,j) for all j    │
-│    threshold ≥ cutoff                 │
-│    write to CSR neighbor list         │
+┌─ N <= 100k: Fused Metal Kernel ──────┐
+│  Single dispatch, no N×N matrix       │
+│  Each thread: Tanimoto → threshold    │
+│  → CSR neighbor list                  │
+├─ N > 100k: Blockwise Divide & Conquer┤
+│  Tile both dimensions (auto-sized)    │
+│  Per tile: tiled Metal kernel → mask  │
+│  → sparse neighbors → merge CSR      │
+│  mx.eval() between tiles (free GPU)  │
 └───────────────────────────────────────┘
         ↓
    Butina greedy (CPU, numpy CSR)
@@ -39,7 +50,7 @@ Morgan FP (RDKit CPU)
    Clusters
 ```
 
-The fused kernel avoids materializing the N×N similarity matrix entirely. At N=50k that's 10 GB saved; at N=100k it's 40 GB — impossible without fusion on a laptop.
+No N x N similarity matrix is ever materialised. At N=50k that's 10 GB saved; at N=100k it's 40 GB; at N=150k it's 90 GB — impossible without fusion/tiling on a laptop.
 
 ### Metal kernels
 

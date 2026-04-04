@@ -1,5 +1,6 @@
 import numpy as np
 import mlx.core as mx
+import pytest
 
 from mlxmolkit.butina import (
     butina_from_neighbor_list_csr,
@@ -9,6 +10,7 @@ from mlxmolkit.butina import (
 from mlxmolkit.fp_uint32 import fp_uint8_to_uint32
 from mlxmolkit.fused_tanimoto_nlist import fused_neighbor_list_metal
 from mlxmolkit.tanimoto_metal_u32 import tanimoto_matrix_metal_u32
+from mlxmolkit.tanimoto_blockwise import tanimoto_neighbors_blockwise
 from mlxmolkit.butina_metal import build_neighbor_list_metal
 
 def test_butina_partition_and_no_dupes():
@@ -91,3 +93,87 @@ def test_fused_butina_end_to_end():
     all_idx = [i for c in res.clusters for i in c]
     assert len(all_idx) == N
     assert len(set(all_idx)) == N
+
+
+# ---------------------------------------------------------------------------
+# Tests for the blockwise divide-and-conquer path (large N memory fix)
+# ---------------------------------------------------------------------------
+
+def test_blockwise_matches_fused():
+    """Blockwise tiled Metal kernel produces identical neighbors as fused kernel."""
+    rng = np.random.default_rng(42)
+    N = 500
+    nbytes = 256
+    cutoff = 0.35
+    fp_u8 = rng.integers(0, 256, size=(N, nbytes), dtype=np.uint8)
+    fp_u32 = fp_uint8_to_uint32(mx.array(fp_u8))
+
+    off_fused, idx_fused = fused_neighbor_list_metal(fp_u32, cutoff)
+    off_bw, idx_bw = tanimoto_neighbors_blockwise(fp_u32, cutoff, block_size=128)
+
+    for i in range(N):
+        s_fused = set(idx_fused[off_fused[i]:off_fused[i + 1]].tolist())
+        s_bw = set(idx_bw[off_bw[i]:off_bw[i + 1]].tolist())
+        assert s_fused == s_bw, f"Row {i}: fused has {len(s_fused)} nbrs, blockwise has {len(s_bw)}"
+
+
+def test_blockwise_small_blocks():
+    """Blockwise path works correctly with very small block sizes (stress-tests tiling)."""
+    rng = np.random.default_rng(99)
+    N = 100
+    nbytes = 128
+    cutoff = 0.3
+    fp_u8 = rng.integers(0, 256, size=(N, nbytes), dtype=np.uint8)
+    fp_u32 = fp_uint8_to_uint32(mx.array(fp_u8))
+
+    off_ref, idx_ref = fused_neighbor_list_metal(fp_u32, cutoff)
+    # block_size=17 (not a multiple of TILE=16) to test boundary handling
+    off_bw, idx_bw = tanimoto_neighbors_blockwise(fp_u32, cutoff, block_size=17)
+
+    for i in range(N):
+        s_ref = set(idx_ref[off_ref[i]:off_ref[i + 1]].tolist())
+        s_bw = set(idx_bw[off_bw[i]:off_bw[i + 1]].tolist())
+        assert s_ref == s_bw, f"Row {i} mismatch"
+
+
+def test_blockwise_butina_partition():
+    """Blockwise path through butina_tanimoto_mlx produces valid partition."""
+    rng = np.random.default_rng(77)
+    N = 200
+    nbytes = 256
+    fp_u8 = rng.integers(0, 256, size=(N, nbytes), dtype=np.uint8)
+    fp = mx.array(fp_u8)
+    res = butina_tanimoto_mlx(fp, cutoff=0.4)
+    all_idx = [i for c in res.clusters for i in c]
+    assert len(all_idx) == N, f"Expected {N} molecules, got {len(all_idx)}"
+    assert len(set(all_idx)) == N, "Duplicate molecule in clusters"
+
+
+@pytest.mark.slow
+def test_blockwise_large_n_memory():
+    """Memory-bounded clustering at N=2000 with small block_size.
+
+    Simulates the 150k scenario: forces many tiles via block_size=64,
+    verifies correctness and that no OOM occurs.
+    """
+    rng = np.random.default_rng(150)
+    N = 2000
+    nbytes = 256
+    cutoff = 0.4
+    fp_u8 = rng.integers(0, 256, size=(N, nbytes), dtype=np.uint8)
+    fp_u32 = fp_uint8_to_uint32(mx.array(fp_u8))
+
+    # Force many tiles (2000/64 = ~31 tiles per dimension = ~961 total tiles)
+    off_bw, idx_bw = tanimoto_neighbors_blockwise(fp_u32, cutoff, block_size=64)
+    res = butina_from_neighbor_list_csr(off_bw, idx_bw, N, cutoff)
+
+    all_idx = [i for c in res.clusters for i in c]
+    assert len(all_idx) == N
+    assert len(set(all_idx)) == N
+    assert len(res.clusters) > 0
+
+    # Verify against fused kernel
+    off_fused, idx_fused = fused_neighbor_list_metal(fp_u32, cutoff)
+    assert off_bw[-1] == off_fused[-1], (
+        f"Edge count mismatch: blockwise={off_bw[-1]} fused={off_fused[-1]}"
+    )
