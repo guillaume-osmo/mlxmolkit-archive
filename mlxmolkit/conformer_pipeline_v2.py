@@ -123,11 +123,13 @@ def _process_chunk(
     chunk: List[tuple],
     dg_params_list: List[DGParams],
     etk_params_list: Optional[List[ETKParams]],
-    mmff_params_list: Optional[List[MMFFParams]],
+    mols_list: Optional[list],
+    run_mmff: bool,
     seed_offset: int,
     dg_max_iters: int,
     etk_max_iters: int,
     mmff_max_iters: int,
+    mmff_use_lbfgs: bool,
     fourth_dim_weight: float,
     chiral_weight: float,
 ) -> List[tuple]:
@@ -184,13 +186,35 @@ def _process_chunk(
 
     # ---- Stage 4: MMFF94 optimization (3D) ----
     mmff_e = np.zeros(C, dtype=np.float32)
-    if mmff_params_list is not None:
-        chunk_mmff = [mmff_params_list[m] for m in mol_order]
-        chunk_mmff_k = [mol_k[m] for m in mol_order]
-        pos3, mmff_e, _ = mmff_minimize_nk(
-            chunk_mmff, chunk_mmff_k, pos3,
-            max_iters=mmff_max_iters,
-        )
+    if run_mmff and mols_list is not None:
+        from rdkit.Chem import AllChem
+        chunk_mmff = []
+        # Use first conformer of each molecule for MMFF param extraction
+        conf_cursor = 0
+        for chunk_mol_ord, mol_idx in enumerate(mol_order):
+            mol = mols_list[mol_idx]
+            n_a = dg_params_list[mol_idx].n_atoms
+            s3 = int(batch3.conf_atom_starts[conf_cursor]) * 3
+            conf_pos = pos3[s3:s3 + n_a * 3].reshape(n_a, 3)
+            if mol.GetNumConformers() == 0:
+                AllChem.EmbedMolecule(mol, randomSeed=42)
+            conf = mol.GetConformer(0)
+            for a_idx in range(n_a):
+                conf.SetAtomPosition(a_idx, conf_pos[a_idx].astype(float).tolist())
+            try:
+                chunk_mmff.append(extract_mmff_params(mol))
+            except Exception:
+                chunk_mmff = None
+                break
+            conf_cursor += mol_k[mol_idx]
+
+        if chunk_mmff is not None:
+            chunk_mmff_k = [mol_k[m] for m in mol_order]
+            pos3, mmff_e, _ = mmff_minimize_nk(
+                chunk_mmff, chunk_mmff_k, pos3,
+                max_iters=mmff_max_iters,
+                use_lbfgs=mmff_use_lbfgs,
+            )
 
     # ---- Collect results per conformer ----
     results = []
@@ -203,7 +227,7 @@ def _process_chunk(
             p3 = pos3[s3:s3 + n_a * 3].reshape(n_a, 3).copy()
             results.append((
                 mol_idx, p3,
-                float(mmff_e[c]) if mmff_params_list else float(dg_e[c]) + float(etk_e[c]),
+                float(mmff_e[c]) if run_mmff else float(dg_e[c]) + float(etk_e[c]),
                 bool(dg_s[c] == 0),
             ))
             c += 1
@@ -228,6 +252,7 @@ def generate_conformers_nk(
     variant: str = "ETKDGv2",
     run_mmff: bool = False,
     mmff_max_iters: int = 200,
+    mmff_use_lbfgs: bool = False,
 ) -> PipelineResult:
     """Generate 3D conformers for N molecules x k conformers each.
 
@@ -266,26 +291,22 @@ def generate_conformers_nk(
 
     # ---- Extract per-molecule params (CPU, once) ----
     mols, dg_params_list, etk_params_list, mmff_params_list_all, mol_n_atoms = [], [], [], [], []
+    bmats = []
     for i, smi in enumerate(smiles_list):
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
             raise ValueError(f"Invalid SMILES at index {i}: {smi}")
         mol = Chem.AddHs(mol)
-        # MMFF needs an embedded conformer for param extraction
-        if run_mmff:
-            from rdkit.Chem import AllChem
-            AllChem.EmbedMolecule(mol, randomSeed=42)
         mols.append(mol)
         bmat = get_bounds_matrix(mol)
+        bmats.append(bmat)
         dg_params_list.append(extract_dg_params(mol, bmat, dim=4))
         if run_etk:
             etk_params_list.append(extract_etk_params(mol, bmat, variant=variant))
-        if run_mmff:
-            try:
-                mmff_params_list_all.append(extract_mmff_params(mol))
-            except Exception:
-                mmff_params_list_all.append(None)
         mol_n_atoms.append(dg_params_list[-1].n_atoms)
+
+    # MMFF extraction deferred — needs a conformer, we'll embed after DG+ETK
+    # to avoid wasting time on a separate RDKit EmbedMolecule call
 
     # ---- Compute batch size ----
     if max_confs_per_batch is None:
@@ -303,19 +324,16 @@ def generate_conformers_nk(
     ]
     total_confs = 0
     for chunk_idx, chunk in enumerate(chunks):
-        # Filter out molecules with failed MMFF extraction
-        mmff_for_chunk = None
-        if run_mmff and all(p is not None for p in mmff_params_list_all):
-            mmff_for_chunk = mmff_params_list_all
-
         chunk_results = _process_chunk(
             chunk, dg_params_list,
             etk_params_list if run_etk else None,
-            mmff_for_chunk,
+            mols if run_mmff else None,
+            run_mmff,
             seed_offset=chunk_idx * 10000,
             dg_max_iters=dg_max_iters,
             etk_max_iters=etk_max_iters,
             mmff_max_iters=mmff_max_iters,
+            mmff_use_lbfgs=mmff_use_lbfgs,
             fourth_dim_weight=fourth_dim_weight,
             chiral_weight=chiral_weight,
         )

@@ -25,13 +25,16 @@ _KERNEL_DIR = Path(__file__).parent
 _MSL_HEADER = (_KERNEL_DIR / "mmff_bfgs_header.metal").read_text()
 _MSL_SOURCE = (_KERNEL_DIR / "mmff_bfgs_source.metal").read_text()
 _MSL_SOURCE_TG = (_KERNEL_DIR / "mmff_bfgs_source_tg.metal").read_text()
+_MSL_SOURCE_LBFGS_TG = (_KERNEL_DIR / "mmff_lbfgs_source_tg.metal").read_text()
 
 TG_SIZE = 32
+LBFGS_M = 8
 MAX_ATOMS_METAL = 64
 
 # Kernel caches
 _mmff_kernel = None
 _mmff_kernel_tg = None
+_mmff_kernel_lbfgs_tg = None
 
 
 def _pack_mmff_for_nk(
@@ -192,6 +195,34 @@ def _get_mmff_kernel_tg():
     return _mmff_kernel_tg
 
 
+def _get_mmff_kernel_lbfgs_tg():
+    global _mmff_kernel_lbfgs_tg
+    if _mmff_kernel_lbfgs_tg is None:
+        tg_header = _MSL_HEADER + f"\nconstant int TG_SIZE_VAL = {TG_SIZE};\nconstant int LBFGS_M_VAL = {LBFGS_M};\n"
+        _mmff_kernel_lbfgs_tg = mx.fast.metal_kernel(
+            name="mmff_lbfgs_tg",
+            input_names=[
+                "pos", "atom_starts", "lbfgs_starts", "config",
+                "all_term_starts",
+                "bond_pairs", "bond_params",
+                "angle_trips", "angle_params",
+                "sb_trips", "sb_params",
+                "oop_quads", "oop_params",
+                "tor_quads", "tor_params",
+                "vdw_pairs", "vdw_params",
+                "ele_pairs", "ele_params",
+            ],
+            output_names=[
+                "out_pos", "out_energies", "out_statuses",
+                "work_grad", "work_dir", "work_scratch",
+                "work_lbfgs", "work_rho", "work_alpha",
+            ],
+            header=tg_header,
+            source=_MSL_SOURCE_LBFGS_TG,
+        )
+    return _mmff_kernel_lbfgs_tg
+
+
 def mmff_minimize_nk(
     mmff_params_list: List[MMFFParams],
     conf_counts: List[int],
@@ -199,11 +230,9 @@ def mmff_minimize_nk(
     *,
     max_iters: int = 200,
     grad_tol: float = 1e-4,
-    use_tg: bool = True,
+    use_lbfgs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run MMFF94 BFGS entirely on GPU — zero CPU round-trips.
-
-    Uses Shivam's fused Metal kernel with full BFGS loop in-kernel.
+    """Run MMFF94 optimization entirely on GPU — zero CPU round-trips.
 
     Parameters
     ----------
@@ -213,8 +242,10 @@ def mmff_minimize_nk(
         k_i conformers per molecule.
     positions_3d : np.ndarray
         Flat (total_coords,) float32.
-    use_tg : bool
-        Use threadgroup-parallel variant (TG=32, default True).
+    use_lbfgs : bool
+        If True, use L-BFGS (O(mn) memory, no dense Hessian).
+        If False (default), use full BFGS (O(n²) Hessian, faster for
+        small molecules but more memory).
 
     Returns
     -------
@@ -227,35 +258,76 @@ def mmff_minimize_nk(
     total_pos_size = packed['total_pos_size']
     total_hessian_size = packed['total_hessian_size']
 
-    kernel = _get_mmff_kernel_tg() if use_tg else _get_mmff_kernel_tg()  # TG is always faster
+    if use_lbfgs:
+        # L-BFGS: replace dense Hessian with history vectors
+        lbfgs_starts = np.zeros(C + 1, dtype=np.int32)
+        for c in range(C):
+            n_a = int(packed['atom_starts'][c + 1].item()) - int(packed['atom_starts'][c].item())
+            n_terms = n_a * 3
+            lbfgs_starts[c + 1] = lbfgs_starts[c] + 2 * LBFGS_M * n_terms
+        total_lbfgs = int(lbfgs_starts[-1])
 
-    outputs = kernel(
-        inputs=[
-            mx.array(positions_3d),
-            packed['atom_starts'], packed['hessian_starts'], packed['config'],
-            packed['all_term_starts'],
-            packed['bond_pairs'], packed['bond_params'],
-            packed['angle_trips'], packed['angle_params'],
-            packed['sb_trips'], packed['sb_params'],
-            packed['oop_quads'], packed['oop_params'],
-            packed['tor_quads'], packed['tor_params'],
-            packed['vdw_pairs'], packed['vdw_params'],
-            packed['ele_pairs'], packed['ele_params'],
-        ],
-        output_shapes=[
-            (total_pos_size,), (C,), (C,),
-            (total_pos_size,), (total_pos_size,),
-            (total_pos_size * 3,),
-            (max(total_hessian_size, 1),),
-        ],
-        output_dtypes=[
-            mx.float32, mx.float32, mx.int32,
-            mx.float32, mx.float32, mx.float32, mx.float32,
-        ],
-        grid=(C * TG_SIZE, 1, 1),
-        threadgroup=(TG_SIZE, 1, 1),
-        template=[("total_pos_size", total_pos_size)],
-    )
+        kernel = _get_mmff_kernel_lbfgs_tg()
+        outputs = kernel(
+            inputs=[
+                mx.array(positions_3d),
+                packed['atom_starts'], mx.array(lbfgs_starts), packed['config'],
+                packed['all_term_starts'],
+                packed['bond_pairs'], packed['bond_params'],
+                packed['angle_trips'], packed['angle_params'],
+                packed['sb_trips'], packed['sb_params'],
+                packed['oop_quads'], packed['oop_params'],
+                packed['tor_quads'], packed['tor_params'],
+                packed['vdw_pairs'], packed['vdw_params'],
+                packed['ele_pairs'], packed['ele_params'],
+            ],
+            output_shapes=[
+                (total_pos_size,), (C,), (C,),
+                (total_pos_size,), (total_pos_size,),
+                (total_pos_size * 3,),
+                (max(1, total_lbfgs),),
+                (max(1, C * LBFGS_M),),
+                (max(1, C * LBFGS_M),),
+            ],
+            output_dtypes=[
+                mx.float32, mx.float32, mx.int32,
+                mx.float32, mx.float32, mx.float32,
+                mx.float32, mx.float32, mx.float32,
+            ],
+            grid=(C * TG_SIZE, 1, 1),
+            threadgroup=(TG_SIZE, 1, 1),
+            template=[("total_pos_size", total_pos_size)],
+        )
+    else:
+        # Full BFGS with dense Hessian
+        kernel = _get_mmff_kernel_tg()
+        outputs = kernel(
+            inputs=[
+                mx.array(positions_3d),
+                packed['atom_starts'], packed['hessian_starts'], packed['config'],
+                packed['all_term_starts'],
+                packed['bond_pairs'], packed['bond_params'],
+                packed['angle_trips'], packed['angle_params'],
+                packed['sb_trips'], packed['sb_params'],
+                packed['oop_quads'], packed['oop_params'],
+                packed['tor_quads'], packed['tor_params'],
+                packed['vdw_pairs'], packed['vdw_params'],
+                packed['ele_pairs'], packed['ele_params'],
+            ],
+            output_shapes=[
+                (total_pos_size,), (C,), (C,),
+                (total_pos_size,), (total_pos_size,),
+                (total_pos_size * 3,),
+                (max(total_hessian_size, 1),),
+            ],
+            output_dtypes=[
+                mx.float32, mx.float32, mx.int32,
+                mx.float32, mx.float32, mx.float32, mx.float32,
+            ],
+            grid=(C * TG_SIZE, 1, 1),
+            threadgroup=(TG_SIZE, 1, 1),
+            template=[("total_pos_size", total_pos_size)],
+        )
 
     mx.eval(outputs[0], outputs[1], outputs[2])
     return np.array(outputs[0]), np.array(outputs[1]), np.array(outputs[2]) == 0
