@@ -284,7 +284,45 @@ _ETK_BODY = """
     shared[tid] = local_e;
     float energy = tg_reduce_sum(shared, tid, tpm);
 
-    // Gradient (thread 0, serial)
+#if PARALLEL_GRAD
+    // Parallel gradient: each thread handles a stripe of vars, reads all constraints
+    for (int v=(int)tid; v<n_vars; v+=(int)tpm) {
+        int my_a=v/dim, my_c=v%dim; float g=0.0f;
+        // 1-4 distance gradient (simplest — same pattern as DG)
+        for (int t=d14_s;t<d14_e;t++) {
+            int a=d14_pairs[t*2]+atom_off, b=d14_pairs[t*2+1]+atom_off;
+            if ((my_a+atom_off)!=a && (my_a+atom_off)!=b) continue;
+            float df[3]; float d2=0.0f;
+            for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
+            float dist=sqrt(d2+1e-12f), lb=d14_bounds[t*3], ub=d14_bounds[t*3+1], wt=d14_bounds[t*3+2];
+            float pf=0.0f;
+            if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
+            else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
+            if (pf!=0.0f) g+=(((my_a+atom_off)==a)?1.0f:-1.0f)*pf*df[my_c];
+        }
+        my_grad[v] = g;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    // Torsion + improper gradients still serial (complex cross-product chain rule)
+    if (tid == 0) {
+        for (int t=tor_s;t<tor_e;t++) {
+            int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off;
+            int a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off;
+            torsion_g(out_pos,work_grad,a1,a2,a3,a4,
+                torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],
+                torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5],
+                torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],
+                torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim);
+        }
+        for (int t=imp_s;t<imp_e;t++) {
+            int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off;
+            int i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
+            improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+#else
+    // Serial gradient (thread 0 only — default, no overhead)
     if (tid == 0) {
         for (int t=tor_s;t<tor_e;t++) {
             int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off;
@@ -306,6 +344,7 @@ _ETK_BODY = """
         }
     }
     threadgroup_barrier(mem_flags::mem_device);
+#endif
 
     // ---- L-BFGS loop (identical to DG kernel) ----
     parallel_neg_copy(my_dir, my_grad, n_vars, tid, tpm);
@@ -380,6 +419,33 @@ _ETK_BODY = """
             lne+=dist14_e(out_pos,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
         shared[tid]=lne; energy=tg_reduce_sum(shared,tid,tpm);
 
+#if PARALLEL_GRAD
+        // Parallel dist14 gradient + serial torsion/improper
+        for (int v=(int)tid; v<n_vars; v+=(int)tpm) {
+            int ma=v/dim, mc=v%dim; float g=0.0f;
+            for (int t=d14_s;t<d14_e;t++) {
+                int a=d14_pairs[t*2]+atom_off, b=d14_pairs[t*2+1]+atom_off;
+                if ((ma+atom_off)!=a && (ma+atom_off)!=b) continue;
+                float df[3]; float d2=0.0f;
+                for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
+                float dist=sqrt(d2+1e-12f), lb=d14_bounds[t*3], ub=d14_bounds[t*3+1], wt=d14_bounds[t*3+2];
+                float pf=0.0f;
+                if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
+                else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
+                if (pf!=0.0f) g+=(((ma+atom_off)==a)?1.0f:-1.0f)*pf*df[mc];
+            }
+            my_grad[v] = g;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (tid==0) {
+            for (int t=tor_s;t<tor_e;t++){int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off,a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off;
+                torsion_g(out_pos,work_grad,a1,a2,a3,a4,torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5],
+                    torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim);}
+            for (int t=imp_s;t<imp_e;t++){int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
+                improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);}
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+#else
         if (tid==0) {
             for (int t=tor_s;t<tor_e;t++){int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off,a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off;
                 torsion_g(out_pos,work_grad,a1,a2,a3,a4,torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5],
@@ -390,6 +456,7 @@ _ETK_BODY = """
                 dist14_g(out_pos,work_grad,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
         }
         threadgroup_barrier(mem_flags::mem_device);
+#endif
 
         float lgt=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm){float t=abs(my_grad[i])*max(abs(my_pos[i]),1.0f);if(t>lgt)lgt=t;}
         shared[tid]=lgt; if(tg_reduce_max(shared,tid,tpm)/max(energy,1.0f)<grad_tol_v){status=0;break;}
@@ -427,10 +494,11 @@ _ETK_BODY = """
 _etk_kernel_cache: dict[tuple, object] = {}
 
 
-def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M):
-    key = (tpm, lbfgs_m)
+def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, parallel_grad: bool = False):
+    key = (tpm, lbfgs_m, parallel_grad)
     if key not in _etk_kernel_cache:
-        header = _ETK_HEADER.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
+        pg_flag = "1" if parallel_grad else "0"
+        header = f"#define PARALLEL_GRAD {pg_flag}\n" + _ETK_HEADER.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
         source = _ETK_BODY.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
         _etk_kernel_cache[key] = mx.fast.metal_kernel(
             name="etk_lbfgs_shared",
@@ -462,6 +530,7 @@ def etk_minimize_shared(
     grad_tol: float = 1e-4,
     tpm: int = DEFAULT_TPM,
     lbfgs_m: int = DEFAULT_LBFGS_M,
+    parallel_grad: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run ETK L-BFGS on all C conformers in parallel with shared constraints.
 
@@ -520,7 +589,7 @@ def etk_minimize_shared(
         lbfgs_starts[c + 1] = lbfgs_starts[c] + 2 * lbfgs_m * n_vars
     total_lbfgs = int(lbfgs_starts[-1])
 
-    kernel = _get_etk_kernel(tpm, lbfgs_m)
+    kernel = _get_etk_kernel(tpm, lbfgs_m, parallel_grad)
     results = kernel(
         inputs=[
             mx.array(positions),
