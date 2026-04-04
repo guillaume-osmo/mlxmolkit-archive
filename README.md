@@ -106,10 +106,36 @@ Morgan FP (RDKit CPU)
    Clusters
 ```
 
+## Adaptive Iteration Scaling
+
+Iterations auto-scale by molecule complexity (default). Small molecules converge early via in-kernel TOLX/gradient checks — no wasted GPU compute.
+
+Formula: `max_iters = base + scale * max(n_atoms, sqrt(n_constraints))`
+
+| Molecule | Atoms | Constraints | DG iters | ETK iters | MMFF iters |
+|----------|-------|-------------|----------|-----------|------------|
+| Methane | 5 | 10 | 400 | 200 | 275 |
+| Benzene | 12 | 66 | 540 | 270 | 380 |
+| Aspirin | 21 | 210 | 720 | 360 | 515 |
+| Testosterone | 49 | 1176 | 1280 | 640 | 935 |
+| 64-atom | 64 | 2016 | 1580 | 790 | 1160 |
+
+Override with explicit values when needed:
+
+```python
+# Auto (default) — scales with molecule size
+result = generate_conformers_nk(smiles_list, n_confs_per_mol=10)
+
+# Fixed iterations for fine control
+result = generate_conformers_nk(smiles_list, n_confs_per_mol=10,
+    dg_max_iters=1000, etk_max_iters=500, mmff_max_iters=400)
+```
+
 ## Optimization Options
 
 | Option | Flag | Effect | When to use |
 |--------|------|--------|-------------|
+| Auto iterations (default) | `dg_max_iters=0` | Scales with molecule size | Always (default) |
 | ETK parallel gradient | `parallel_grad=True` | 1.18x ETK speedup | Many distance constraints |
 | DG parallel gradient | `parallel_grad=True` | Parallelizes dist gradient | >500 distance constraints |
 | MMFF L-BFGS | `mmff_use_lbfgs=True` | 5x less memory | Molecules >50 atoms |
