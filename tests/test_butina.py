@@ -51,7 +51,7 @@ def test_butina_csr_matches_dense():
 
 
 def test_butina_tanimoto_mlx_runs():
-    """Full pipeline (nvMolKit-style): fp uint8 → Tanimoto Metal u32 → neighbor list → Butina Python."""
+    """Full pipeline (nvMolKit-style): fp uint8 -> Tanimoto Metal u32 -> neighbor list -> Butina Python."""
     rng = np.random.default_rng(2)
     N = 50
     nbytes = 128  # 1024 bits
@@ -61,7 +61,7 @@ def test_butina_tanimoto_mlx_runs():
 
 
 def test_fused_matches_nonfused():
-    """Fused Tanimoto→CSR gives identical neighbor lists as separate Tanimoto + threshold."""
+    """Fused Tanimoto->CSR gives identical neighbor lists as separate Tanimoto + threshold."""
     rng = np.random.default_rng(10)
     N = 200
     nbytes = 128
@@ -93,6 +93,39 @@ def test_fused_butina_end_to_end():
     all_idx = [i for c in res.clusters for i in c]
     assert len(all_idx) == N
     assert len(set(all_idx)) == N
+
+
+def test_native_metal_matches_mlx():
+    """Native Metal (.metallib) gives identical results to MLX compiled and JIT."""
+    from mlxmolkit.native_metal import fused_neighbor_list_native
+
+    rng = np.random.default_rng(99)
+    for N in [100, 500, 2000]:
+        nbytes = 128
+        nwords = 32
+        cutoff = 0.4
+        fp_u8 = rng.integers(0, 256, size=(N, nbytes), dtype=np.uint8)
+        fp_u32_np = fp_u8.view(np.uint32).reshape(N, nwords)
+        fp_u32_mx = fp_uint8_to_uint32(mx.array(fp_u8))
+
+        off_native, idx_native, _ = fused_neighbor_list_native(fp_u32_np, cutoff)
+        off_compiled, idx_compiled = fused_neighbor_list_metal(fp_u32_mx, cutoff, compiled=True)
+        off_jit, idx_jit = fused_neighbor_list_metal(fp_u32_mx, cutoff, compiled=False)
+
+        np.testing.assert_array_equal(
+            np.diff(off_native), np.diff(off_compiled),
+            err_msg=f"N={N}: native vs compiled counts differ",
+        )
+        np.testing.assert_array_equal(
+            np.diff(off_native), np.diff(off_jit),
+            err_msg=f"N={N}: native vs JIT counts differ",
+        )
+        for i in range(N):
+            s_nat = set(idx_native[off_native[i]:off_native[i+1]].tolist())
+            s_comp = set(idx_compiled[off_compiled[i]:off_compiled[i+1]].tolist())
+            s_jit = set(idx_jit[off_jit[i]:off_jit[i+1]].tolist())
+            assert s_nat == s_comp, f"N={N} row {i}: native != compiled"
+            assert s_nat == s_jit, f"N={N} row {i}: native != JIT"
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +160,6 @@ def test_blockwise_small_blocks():
     fp_u32 = fp_uint8_to_uint32(mx.array(fp_u8))
 
     off_ref, idx_ref = fused_neighbor_list_metal(fp_u32, cutoff)
-    # block_size=17 (not a multiple of TILE=16) to test boundary handling
     off_bw, idx_bw = tanimoto_neighbors_blockwise(fp_u32, cutoff, block_size=17)
 
     for i in range(N):
@@ -151,11 +183,7 @@ def test_blockwise_butina_partition():
 
 @pytest.mark.slow
 def test_blockwise_large_n_memory():
-    """Memory-bounded clustering at N=2000 with small block_size.
-
-    Simulates the 150k scenario: forces many tiles via block_size=64,
-    verifies correctness and that no OOM occurs.
-    """
+    """Memory-bounded clustering at N=2000 with small block_size."""
     rng = np.random.default_rng(150)
     N = 2000
     nbytes = 256
@@ -163,7 +191,6 @@ def test_blockwise_large_n_memory():
     fp_u8 = rng.integers(0, 256, size=(N, nbytes), dtype=np.uint8)
     fp_u32 = fp_uint8_to_uint32(mx.array(fp_u8))
 
-    # Force many tiles (2000/64 = ~31 tiles per dimension = ~961 total tiles)
     off_bw, idx_bw = tanimoto_neighbors_blockwise(fp_u32, cutoff, block_size=64)
     res = butina_from_neighbor_list_csr(off_bw, idx_bw, N, cutoff)
 
@@ -172,7 +199,6 @@ def test_blockwise_large_n_memory():
     assert len(set(all_idx)) == N
     assert len(res.clusters) > 0
 
-    # Verify against fused kernel
     off_fused, idx_fused = fused_neighbor_list_metal(fp_u32, cutoff)
     assert off_bw[-1] == off_fused[-1], (
         f"Edge count mismatch: blockwise={off_bw[-1]} fused={off_fused[-1]}"
