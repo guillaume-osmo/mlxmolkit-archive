@@ -136,6 +136,7 @@ def _process_chunk(
     etk_max_iters: int,
     mmff_max_iters: int,
     mmff_use_lbfgs: bool,
+    mmff_variant: str,
     fourth_dim_weight: float,
     chiral_weight: float,
 ) -> List[tuple]:
@@ -237,7 +238,7 @@ def _process_chunk(
             for a_idx in range(n_a):
                 conf.SetAtomPosition(a_idx, conf_pos[a_idx].astype(float).tolist())
             try:
-                chunk_mmff.append(extract_mmff_params(mol))
+                chunk_mmff.append(extract_mmff_params(mol, mmff_variant=mmff_variant))
             except Exception:
                 chunk_mmff = None
                 break
@@ -288,6 +289,7 @@ def generate_conformers_nk(
     run_mmff: bool = False,
     mmff_max_iters: int = 0,
     mmff_use_lbfgs: bool = False,
+    mmff_variant: str = "MMFF94",
 ) -> PipelineResult:
     """Generate 3D conformers for N molecules x k conformers each.
 
@@ -371,6 +373,7 @@ def generate_conformers_nk(
             etk_max_iters=etk_max_iters,
             mmff_max_iters=mmff_max_iters,
             mmff_use_lbfgs=mmff_use_lbfgs,
+            mmff_variant=mmff_variant,
             fourth_dim_weight=fourth_dim_weight,
             chiral_weight=chiral_weight,
         )
