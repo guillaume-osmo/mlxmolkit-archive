@@ -52,6 +52,29 @@ GPU memory stays constant regardless of total conformers thanks to divide-and-co
 
 Larger batches = fewer kernel launches = higher throughput. Auto-sizing (default) picks the largest batch that fits in free memory.
 
+### GPU Memory per Conformer
+
+| Atoms | DG (4D) | ETK (3D) | MMFF (BFGS) | MMFF (L-BFGS) |
+|------:|--------:|---------:|------------:|--------------:|
+| 5 | 1.9 KB | 1.4 KB | 1.3 KB | 1.4 KB |
+| 12 | 4.4 KB | 3.3 KB | 6.0 KB | 3.3 KB |
+| 21 | 7.6 KB | 5.7 KB | 17.2 KB | 5.7 KB |
+| 30 | 10.8 KB | 8.1 KB | 34.1 KB | 8.1 KB |
+| 50 | 18.0 KB | 13.5 KB | 92.0 KB | 13.5 KB |
+| 64 | 23.1 KB | 17.3 KB | **149.2 KB** | 17.3 KB |
+
+MMFF BFGS memory grows as O(n^2) due to the dense Hessian (n_atoms x 3)^2. For molecules >50 atoms, use `mmff_use_lbfgs=True` to reduce memory 5-10x (O(mn) with m=8 history vectors).
+
+With 64 GB unified memory, a single batch can hold:
+
+| Molecule size | DG/ETK | MMFF (BFGS) | MMFF (L-BFGS) |
+|--------------|-------:|------------:|--------------:|
+| 12 atoms | ~9.8M conformers | ~7.4M | ~9.8M |
+| 30 atoms | ~3.9M conformers | ~1.3M | ~3.9M |
+| 64 atoms | ~1.8M conformers | **~300K** | ~1.8M |
+
+The divide-and-conquer queue automatically splits into multiple batches when total exceeds free memory.
+
 ### Clustering (Enamine REAL subset, Apple M3 Max)
 
 | N | Fused sim→CSR | Butina | **Total** | vs RDKit | Memory |
