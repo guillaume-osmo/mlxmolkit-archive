@@ -33,6 +33,15 @@ Port of [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to App
 
 GPU memory stays constant regardless of total conformers thanks to divide-and-conquer batching.
 
+### Scale Test: 1000 Molecules x 10 Conformers = 10,000 Total
+
+| Pipeline | Time | Throughput | Convergence | Batches |
+|----------|------|-----------|-------------|---------|
+| DG + ETK | 43.7s | **229 conf/s** | 91.3% | 20 |
+| DG + ETK + MMFF | 61.7s | **162 conf/s** | 91.3% | 20 |
+
+1000 diverse drug-like molecules (7-25 heavy atoms, mean 15.5). Divide-and-conquer: 20 batches of 500 conformers.
+
 ### Clustering (Enamine REAL subset, Apple M3 Max)
 
 | N | Fused sim→CSR | Butina | **Total** | vs RDKit | Memory |
@@ -190,6 +199,23 @@ result = generate_conformers_nk(
     run_mmff=True,
     mmff_use_lbfgs=True,        # L-BFGS for >50 atoms
 )
+```
+
+### Example Script
+
+```bash
+# Basic: 20 molecules x 10 conformers
+python examples/conf3d_example.py
+
+# Scale test: 1000 molecules x 10 conformers with MMFF
+python examples/conf3d_example.py --n-mols 1000 --n-confs 10 --mmff
+
+# All options
+python examples/conf3d_example.py --n-mols 100 --n-confs 20 --variant ETKDGv3 \
+    --mmff --mmff-variant MMFF94s --batch-size 200
+
+# Custom SMILES
+python examples/conf3d_example.py --smiles "c1ccccc1" "CC(=O)O" --n-confs 50 --mmff
 ```
 
 ### Molecular Clustering
