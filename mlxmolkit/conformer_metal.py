@@ -257,7 +257,7 @@ _MSL_DG_BODY = """
     device float* my_Y = &work_lbfgs[lbfgs_start + lbfgs_m * n_vars];
     device float* my_rho = &work_rho[conf_idx * lbfgs_m];
 
-    // ---- Initial energy (parallel) + gradient (thread 0) ----
+    // ---- Initial energy (parallel) + gradient ----
     parallel_set(my_grad, 0.0f, n_vars, tid, tpm);
 
     float local_energy = 0.0f;
@@ -273,6 +273,45 @@ _MSL_DG_BODY = """
     shared[tid] = local_energy;
     float energy = tg_reduce_sum(shared, tid, tpm);
 
+#if PARALLEL_GRAD
+    // All threads compute gradient via gather — each thread owns a stripe of vars
+    for (int v = (int)tid; v < n_vars; v += (int)tpm) {
+        int my_atom = v / dim; int my_coord = v % dim; float g = 0.0f;
+        for (int t = dist_start; t < dist_end; t++) {
+            int a = dist_pairs[t*2], b = dist_pairs[t*2+1];
+            if (my_atom != a && my_atom != b) continue;
+            float d2 = 0.0f; float dif[4];
+            for (int d = 0; d < dim; d++) { dif[d] = out_pos[(atom_off+a)*dim+d] - out_pos[(atom_off+b)*dim+d]; d2 += dif[d]*dif[d]; }
+            float lb2 = dist_bounds[t*3], ub2 = dist_bounds[t*3+1], wt = dist_bounds[t*3+2]; float pf = 0.0f;
+            if (d2 > ub2) pf = wt*4.0f*(d2/ub2-1.0f)/ub2;
+            else if (d2 < lb2) { float l = d2+lb2; pf = wt*8.0f*lb2*(1.0f-2.0f*lb2/l)/(l*l); }
+            if (pf != 0.0f) g += ((my_atom==a)?1.0f:-1.0f) * pf * dif[my_coord];
+        }
+        if (my_coord < 3) {
+            for (int t = chiral_start_t; t < chiral_end_t; t++) {
+                int i1=chiral_quads[t*4],i2=chiral_quads[t*4+1],i3=chiral_quads[t*4+2],i4=chiral_quads[t*4+3];
+                if (my_atom!=i1&&my_atom!=i2&&my_atom!=i3&&my_atom!=i4) continue;
+                float v1[3],v2[3],v3[3];
+                for (int d=0;d<3;d++){v1[d]=out_pos[(atom_off+i1)*dim+d]-out_pos[(atom_off+i4)*dim+d];v2[d]=out_pos[(atom_off+i2)*dim+d]-out_pos[(atom_off+i4)*dim+d];v3[d]=out_pos[(atom_off+i3)*dim+d]-out_pos[(atom_off+i4)*dim+d];}
+                float cx=v2[1]*v3[2]-v2[2]*v3[1],cy=v2[2]*v3[0]-v2[0]*v3[2],cz=v2[0]*v3[1]-v2[1]*v3[0];
+                float vol=v1[0]*cx+v1[1]*cy+v1[2]*cz;
+                float vl=chiral_bounds[t*2],vu=chiral_bounds[t*2+1];float pf=0.0f;
+                if(vol<vl)pf=2.0f*chiral_weight*(vol-vl);else if(vol>vu)pf=2.0f*chiral_weight*(vol-vu);
+                if(pf!=0.0f){
+                    float gc[4][3];gc[0][0]=pf*cx;gc[0][1]=pf*cy;gc[0][2]=pf*cz;
+                    gc[1][0]=pf*(v3[1]*v1[2]-v3[2]*v1[1]);gc[1][1]=pf*(v3[2]*v1[0]-v3[0]*v1[2]);gc[1][2]=pf*(v3[0]*v1[1]-v3[1]*v1[0]);
+                    gc[2][0]=pf*(v2[2]*v1[1]-v2[1]*v1[2]);gc[2][1]=pf*(v2[0]*v1[2]-v2[2]*v1[0]);gc[2][2]=pf*(v2[1]*v1[0]-v2[0]*v1[1]);
+                    gc[3][0]=-(gc[0][0]+gc[1][0]+gc[2][0]);gc[3][1]=-(gc[0][1]+gc[1][1]+gc[2][1]);gc[3][2]=-(gc[0][2]+gc[1][2]+gc[2][2]);
+                    int at4[4]={i1,i2,i3,i4};for(int k=0;k<4;k++){if(my_atom==at4[k])g+=gc[k][my_coord];}
+                }
+            }
+        }
+        if (dim==4&&my_coord==3) { for (int t=fourth_start_t;t<fourth_end_t;t++) { if(my_atom==fourth_idx_arr[t]) g+=2.0f*fourth_dim_weight*out_pos[(atom_off+my_atom)*dim+3]; } }
+        my_grad[v] = g;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+#else
+    // Thread 0 computes gradient serially (no atomics)
     if (tid == 0) {
         for (int t = dist_start; t < dist_end; t++)
             dist_violation_g(out_pos, work_grad, dist_pairs[t*2], dist_pairs[t*2+1],
@@ -285,6 +324,7 @@ _MSL_DG_BODY = """
             fourth_dim_g(out_pos, work_grad, fourth_idx_arr[t], fourth_dim_weight, dim, atom_off);
     }
     threadgroup_barrier(mem_flags::mem_device);
+#endif
 
     parallel_neg_copy(my_dir, my_grad, n_vars, tid, tpm);
 
@@ -402,6 +442,37 @@ _MSL_DG_BODY = """
         shared[tid] = local_new_e;
         energy = tg_reduce_sum(shared, tid, tpm);
 
+#if PARALLEL_GRAD
+        for (int v = (int)tid; v < n_vars; v += (int)tpm) {
+            int my_a2 = v / dim; int my_c2 = v % dim; float g2 = 0.0f;
+            for (int t = dist_start; t < dist_end; t++) {
+                int a = dist_pairs[t*2], b = dist_pairs[t*2+1];
+                if (my_a2 != a && my_a2 != b) continue;
+                float d2 = 0.0f; float df[4];
+                for (int d = 0; d < dim; d++) { df[d] = out_pos[(atom_off+a)*dim+d] - out_pos[(atom_off+b)*dim+d]; d2 += df[d]*df[d]; }
+                float lb2 = dist_bounds[t*3], ub2 = dist_bounds[t*3+1], wt = dist_bounds[t*3+2]; float pf = 0.0f;
+                if (d2 > ub2) pf = wt*4.0f*(d2/ub2-1.0f)/ub2;
+                else if (d2 < lb2) { float l = d2+lb2; pf = wt*8.0f*lb2*(1.0f-2.0f*lb2/l)/(l*l); }
+                if (pf != 0.0f) g2 += ((my_a2==a)?1.0f:-1.0f) * pf * df[my_c2];
+            }
+            if (my_c2 < 3) {
+                for (int t = chiral_start_t; t < chiral_end_t; t++) {
+                    int i1=chiral_quads[t*4],i2=chiral_quads[t*4+1],i3=chiral_quads[t*4+2],i4=chiral_quads[t*4+3];
+                    if (my_a2!=i1&&my_a2!=i2&&my_a2!=i3&&my_a2!=i4) continue;
+                    float u1[3],u2[3],u3[3];
+                    for (int d=0;d<3;d++){u1[d]=out_pos[(atom_off+i1)*dim+d]-out_pos[(atom_off+i4)*dim+d];u2[d]=out_pos[(atom_off+i2)*dim+d]-out_pos[(atom_off+i4)*dim+d];u3[d]=out_pos[(atom_off+i3)*dim+d]-out_pos[(atom_off+i4)*dim+d];}
+                    float cx=u2[1]*u3[2]-u2[2]*u3[1],cy=u2[2]*u3[0]-u2[0]*u3[2],cz=u2[0]*u3[1]-u2[1]*u3[0];
+                    float vol=u1[0]*cx+u1[1]*cy+u1[2]*cz;
+                    float vl=chiral_bounds[t*2],vu=chiral_bounds[t*2+1];float pf=0.0f;
+                    if(vol<vl)pf=2.0f*chiral_weight*(vol-vl);else if(vol>vu)pf=2.0f*chiral_weight*(vol-vu);
+                    if(pf!=0.0f){float gc[4][3];gc[0][0]=pf*cx;gc[0][1]=pf*cy;gc[0][2]=pf*cz;gc[1][0]=pf*(u3[1]*u1[2]-u3[2]*u1[1]);gc[1][1]=pf*(u3[2]*u1[0]-u3[0]*u1[2]);gc[1][2]=pf*(u3[0]*u1[1]-u3[1]*u1[0]);gc[2][0]=pf*(u2[2]*u1[1]-u2[1]*u1[2]);gc[2][1]=pf*(u2[0]*u1[2]-u2[2]*u1[0]);gc[2][2]=pf*(u2[1]*u1[0]-u2[0]*u1[1]);gc[3][0]=-(gc[0][0]+gc[1][0]+gc[2][0]);gc[3][1]=-(gc[0][1]+gc[1][1]+gc[2][1]);gc[3][2]=-(gc[0][2]+gc[1][2]+gc[2][2]);int at4[4]={i1,i2,i3,i4};for(int k=0;k<4;k++){if(my_a2==at4[k])g2+=gc[k][my_c2];}}
+                }
+            }
+            if (dim==4&&my_c2==3){for(int t=fourth_start_t;t<fourth_end_t;t++){if(my_a2==fourth_idx_arr[t])g2+=2.0f*fourth_dim_weight*out_pos[(atom_off+my_a2)*dim+3];}}
+            my_grad[v] = g2;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+#else
         if (tid == 0) {
             for (int t = dist_start; t < dist_end; t++)
                 dist_violation_g(out_pos, work_grad, dist_pairs[t*2], dist_pairs[t*2+1],
@@ -414,6 +485,7 @@ _MSL_DG_BODY = """
                 fourth_dim_g(out_pos, work_grad, fourth_idx_arr[t], fourth_dim_weight, dim, atom_off);
         }
         threadgroup_barrier(mem_flags::mem_device);
+#endif
 
         float local_grad_test = 0.0f;
         for (int i = (int)tid; i < n_vars; i += (int)tpm) {
@@ -475,21 +547,32 @@ _MSL_DG_BODY = """
     }
 """
 
-_dg_kernel = None
+# Cache: (tpm, lbfgs_m, parallel_grad) → compiled kernel
+_dg_kernel_cache: dict[tuple, object] = {}
 
 
-def _build_dg_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M):
-    """Compile the DG L-BFGS Metal kernel with shared constraints."""
+def _build_dg_kernel(
+    tpm: int = DEFAULT_TPM,
+    lbfgs_m: int = DEFAULT_LBFGS_M,
+    parallel_grad: bool = False,
+):
+    """Compile the DG L-BFGS Metal kernel with shared constraints.
+
+    Parameters
+    ----------
+    parallel_grad : bool
+        If True, all TPM threads compute gradient in parallel using
+        atomic scatter-add.  Faster for molecules with many constraints
+        (>500 terms) but adds atomic overhead.  Default False (thread 0
+        serial gradient, zero atomic cost).
+    """
+    pg_flag = "1" if parallel_grad else "0"
     header = _MSL_HEADER.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
+    header = f"#define PARALLEL_GRAD {pg_flag}\n" + header
     source = _MSL_DG_BODY.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
 
-    # total_pos_size is used in the kernel body — inject as a constant
-    # It's computed at dispatch time and passed via a trick: we use
-    # config[6] to pass it at runtime instead.
-    # Actually, we pass it as part of config array.
-
     return mx.fast.metal_kernel(
-        name="dg_lbfgs_shared_constraints",
+        name=f"dg_lbfgs_shared_pg{pg_flag}",
         input_names=[
             "pos", "config",
             "conf_to_mol", "conf_atom_starts", "mol_n_atoms",
@@ -509,11 +592,15 @@ def _build_dg_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M):
     )
 
 
-def _get_dg_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M):
-    global _dg_kernel
-    if _dg_kernel is None:
-        _dg_kernel = _build_dg_kernel(tpm, lbfgs_m)
-    return _dg_kernel
+def _get_dg_kernel(
+    tpm: int = DEFAULT_TPM,
+    lbfgs_m: int = DEFAULT_LBFGS_M,
+    parallel_grad: bool = False,
+):
+    key = (tpm, lbfgs_m, parallel_grad)
+    if key not in _dg_kernel_cache:
+        _dg_kernel_cache[key] = _build_dg_kernel(tpm, lbfgs_m, parallel_grad)
+    return _dg_kernel_cache[key]
 
 
 def dg_minimize_shared(
@@ -526,6 +613,7 @@ def dg_minimize_shared(
     fourth_dim_weight: float = 0.1,
     tpm: int = DEFAULT_TPM,
     lbfgs_m: int = DEFAULT_LBFGS_M,
+    parallel_grad: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run DG L-BFGS on all C conformers in parallel with shared constraints.
 
@@ -535,6 +623,10 @@ def dg_minimize_shared(
         N molecules × k conformers with shared constraints.
     positions : np.ndarray, shape (n_atoms_total * dim,)
         Initial positions (random 4D).
+    parallel_grad : bool
+        If True, all TPM threads compute gradient via atomic scatter-add.
+        Useful for large molecules (>500 distance constraints).
+        Default False (thread 0 serial — no atomic overhead).
 
     Returns
     -------
@@ -586,7 +678,7 @@ def dg_minimize_shared(
     total_lbfgs = int(lbfgs_starts[-1])
 
     # Convert to MLX
-    kernel = _get_dg_kernel(tpm, lbfgs_m)
+    kernel = _get_dg_kernel(tpm, lbfgs_m, parallel_grad)
     results = kernel(
         inputs=[
             mx.array(positions),
