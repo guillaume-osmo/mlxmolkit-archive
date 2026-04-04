@@ -175,6 +175,22 @@ def _process_chunk(
         fourth_dim_weight=fourth_dim_weight, chiral_weight=chiral_weight,
     )
 
+    # ---- Stage 1b: Retry non-converged with 2x iterations (warm start) ----
+    n_failed = int(np.sum(dg_s != 0))
+    if n_failed > 0 and n_failed < C:
+        dg_out2, dg_e2, dg_s2 = dg_minimize_shared(
+            batch4, dg_out, max_iters=dg_max_iters * 2,
+            fourth_dim_weight=fourth_dim_weight, chiral_weight=chiral_weight,
+        )
+        # Keep improved results for conformers that were not converged
+        for c in range(C):
+            if dg_s[c] != 0 and (dg_s2[c] == 0 or dg_e2[c] < dg_e[c]):
+                s = int(batch4.conf_atom_starts[c]) * 4
+                e = int(batch4.conf_atom_starts[c + 1]) * 4
+                dg_out[s:e] = dg_out2[s:e]
+                dg_e[c] = dg_e2[c]
+                dg_s[c] = dg_s2[c]
+
     # ---- Stage 2: Extract 3D from 4D ----
     batch3 = pack_shared_dg_batch(chunk_dg, chunk_k, dim=3)
     pos3 = np.zeros(int(batch3.conf_atom_starts[-1]) * 3, dtype=np.float32)
