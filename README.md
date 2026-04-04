@@ -136,11 +136,20 @@ result = generate_conformers_nk(smiles_list, n_confs_per_mol=10,
 | Option | Flag | Effect | When to use |
 |--------|------|--------|-------------|
 | Auto iterations (default) | `dg_max_iters=0` | Scales with molecule size | Always (default) |
+| Warm-start retry | automatic | Re-runs non-converged with 2x iters | Always (automatic) |
 | ETK parallel gradient | `parallel_grad=True` | 1.18x ETK speedup | Many distance constraints |
 | DG parallel gradient | `parallel_grad=True` | Parallelizes dist gradient | >500 distance constraints |
+| MMFF94s variant | `mmff_variant="MMFF94s"` | Softer torsion barriers | Conjugated/aromatic molecules |
 | MMFF L-BFGS | `mmff_use_lbfgs=True` | 5x less memory | Molecules >50 atoms |
 | MMFF BFGS (default) | `mmff_use_lbfgs=False` | 2x faster for small mols | Molecules <50 atoms |
 | ETKDG variant | `variant="ETKDGv3"` | 7 variants supported | Choose per use case |
+
+### MMFF94 Force Field Variants
+
+| Variant | Flag | Torsion barriers | Best for |
+|---------|------|-----------------|----------|
+| MMFF94 (default) | `mmff_variant="MMFF94"` | Standard | General molecules |
+| MMFF94s | `mmff_variant="MMFF94s"` | Softer for conjugated systems | Aromatic, planar, conjugated |
 
 ## Usage
 
