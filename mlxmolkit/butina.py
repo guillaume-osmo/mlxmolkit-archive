@@ -84,15 +84,44 @@ def butina_from_similarity_matrix(sim: np.ndarray, cutoff: float) -> ButinaResul
 def butina_tanimoto_mlx(
     fp_bytes: mx.array,
     cutoff: float,
+    *,
+    block_size: int | None = None,
+    max_memory_bytes: int | None = None,
 ) -> ButinaResult:
     """
-    Full fused pipeline: fp uint8 → uint32 → Fused Tanimoto→CSR (Metal) → Butina greedy (CPU).
-    No N×N matrix materialized.
+    Full pipeline: fp uint8 → uint32 → Tanimoto → CSR → Butina greedy.
+
+    Automatically selects the best strategy based on N:
+
+    * **N <= 100k**: Single-dispatch fused Metal kernel (fastest).
+    * **N > 100k**: Divide-and-conquer blockwise tiling with memory-adaptive
+      block sizes so the full N×N matrix is never materialised.
+
+    Parameters
+    ----------
+    fp_bytes : mx.array, shape (N, nbytes), dtype uint8
+    cutoff : float
+        Similarity threshold.
+    block_size : int, optional
+        Override tile side-length for the blockwise path.
+    max_memory_bytes : int, optional
+        Memory budget for one tile (blockwise path).
     """
     from .fp_uint32 import fp_uint8_to_uint32
-    from .fused_tanimoto_nlist import fused_neighbor_list_metal
 
     fp_u32 = fp_uint8_to_uint32(fp_bytes)
     N = int(fp_u32.shape[0])
-    offsets, indices = fused_neighbor_list_metal(fp_u32, cutoff)
+
+    # For moderate N the single-dispatch fused kernel is fastest
+    if N <= 100_000:
+        from .fused_tanimoto_nlist import fused_neighbor_list_metal
+        offsets, indices = fused_neighbor_list_metal(fp_u32, cutoff)
+    else:
+        from .tanimoto_blockwise import tanimoto_neighbors_blockwise
+        offsets, indices = tanimoto_neighbors_blockwise(
+            fp_u32, cutoff,
+            block_size=block_size,
+            max_memory_bytes=max_memory_bytes,
+        )
+
     return butina_from_neighbor_list_csr(offsets, indices, N, cutoff)
