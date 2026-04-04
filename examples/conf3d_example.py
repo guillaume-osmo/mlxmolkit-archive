@@ -23,7 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description="3D conformer generation with mlxmolkit")
     parser.add_argument("--n-mols", type=int, default=20, help="Number of molecules (default: 20)")
     parser.add_argument("--n-confs", type=int, default=10, help="Conformers per molecule (default: 10)")
-    parser.add_argument("--batch-size", type=int, default=500, help="Max conformers per GPU batch (default: 500)")
+    parser.add_argument("--batch-size", type=int, default=0, help="Max conformers per GPU batch (0=auto from free memory)")
     parser.add_argument("--variant", type=str, default="ETKDGv2",
                         choices=["DG", "KDG", "ETDG", "ETKDG", "ETKDGv2", "ETKDGv3", "srETKDGv3"],
                         help="ETKDG variant (default: ETKDGv2)")
@@ -102,7 +102,7 @@ def main():
         run_mmff=args.mmff,
         mmff_variant=args.mmff_variant,
         mmff_use_lbfgs=args.mmff_lbfgs,
-        max_confs_per_batch=args.batch_size,
+        max_confs_per_batch=args.batch_size if args.batch_size > 0 else None,
     )
     t_total = time.time() - t0
 

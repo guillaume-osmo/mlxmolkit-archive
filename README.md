@@ -37,10 +37,20 @@ GPU memory stays constant regardless of total conformers thanks to divide-and-co
 
 | Pipeline | Time | Throughput | Convergence | Batches |
 |----------|------|-----------|-------------|---------|
-| DG + ETK | 43.7s | **229 conf/s** | 91.3% | 20 |
-| DG + ETK + MMFF | 61.7s | **162 conf/s** | 91.3% | 20 |
+| DG + ETK | 1.7s | **6,044 conf/s** | 99.98% | 1 |
+| DG + ETK + MMFF | 4.0s | **2,483 conf/s** | 99.98% | 1 |
 
-1000 diverse drug-like molecules (7-25 heavy atoms, mean 15.5). Divide-and-conquer: 20 batches of 500 conformers.
+1000 drug-like molecules (5-25 heavy atoms). Auto batch sizing fits all 10,000 conformers in a single GPU dispatch.
+
+### Batch Size Impact (N=20, k=50, C=1000)
+
+| Batch | Batches | Time | conf/s |
+|------:|--------:|-----:|-------:|
+| 100 | 10 | 0.62s | 1,610 |
+| 500 | 2 | 0.29s | 3,394 |
+| 1000+ | 1 | 0.22s | 4,442 |
+
+Larger batches = fewer kernel launches = higher throughput. Auto-sizing (default) picks the largest batch that fits in free memory.
 
 ### Clustering (Enamine REAL subset, Apple M3 Max)
 
