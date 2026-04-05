@@ -55,6 +55,10 @@ class ElementParams:
     # Derived: electron heat of formation (kcal/mol)
     eheat: float = 0.0
 
+    # Isolated atom electronic energy (eV) — from MOPAC
+    # E_isol = Uss * n_s + Upp * n_p + one-center integrals
+    eisol: float = 0.0
+
 
 # RM1 parameters from MOPAC (Apache 2.0)
 # Atomic number → ElementParams

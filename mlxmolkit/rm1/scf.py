@@ -372,9 +372,31 @@ def rm1_energy(
     # Total energy
     E_total = E_elec + E_nuc
 
-    # Heat of formation (approximate)
-    E_isolated = sum(RM1_PARAMS[z].Uss * RM1_PARAMS[z].n_valence for z in atoms)
-    E_hof_eV = E_total - E_isolated
+    # Heat of formation:
+    # ΔHf = E_total - Σ E_isol(atom) + Σ ΔHf_atom(experimental)
+    E_isol_total = 0.0
+    eheat_total = 0.0
+    for z in atoms:
+        p = RM1_PARAMS[z]
+        # Compute isolated atom energy from one-center integrals
+        nv = p.n_valence
+        if p.n_basis == 1:
+            eisol = p.Uss
+        else:
+            ns = min(nv, 2)
+            np_el = nv - ns
+            eisol = ns * p.Uss + np_el * p.Upp
+            if ns == 2:
+                eisol += p.gss
+            eisol += ns * np_el * (p.gsp - p.hsp / 2.0)
+            if np_el >= 2:
+                n_pairs = np_el * (np_el - 1) / 2
+                eisol += n_pairs * (p.gp2 + (p.gpp - p.gp2) / 3.0)
+        E_isol_total += eisol
+        eheat_total += p.eheat  # experimental ΔHf of atom (kcal/mol)
+
+    E_binding_eV = E_total - E_isol_total
+    E_hof_eV = E_binding_eV + eheat_total / EV_TO_KCAL
 
     return {
         'energy_eV': E_total,
