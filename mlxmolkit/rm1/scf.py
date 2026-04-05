@@ -418,3 +418,177 @@ def rm1_energy(
         'density': P,
         'n_basis': n_basis,
     }
+
+
+def rm1_energy_batch(
+    molecules: list[tuple[list[int], np.ndarray]],
+    max_iter: int = 100,
+    conv_tol: float = 1e-6,
+    use_metal: bool = True,
+    verbose: bool = False,
+) -> list[dict]:
+    """Compute RM1 energies for N molecules simultaneously.
+
+    Args:
+        molecules: list of (atoms, coords) tuples
+        max_iter: max SCF iterations
+        conv_tol: density matrix convergence threshold
+        use_metal: True for Metal GPU Fock build, False for CPU
+        verbose: print convergence info
+
+    Returns:
+        list of result dicts (same format as rm1_energy)
+    """
+    from .batch import prepare_batch
+    from .fock_metal import build_fock_batch_metal, build_fock_batch_cpu
+
+    N = len(molecules)
+    if N == 0:
+        return []
+
+    # Pre-compute all integrals (CPU, done once)
+    batch = prepare_batch(molecules)
+    MB = batch.max_basis
+
+    # Initialize density matrices from core Hamiltonian eigendecomposition
+    batch.P = np.zeros((N, MB, MB), dtype=np.float64)
+    for mol_idx in range(N):
+        nb = batch.n_basis_arr[mol_idx]
+        nocc = batch.n_occ_arr[mol_idx]
+        H = batch.H_core[mol_idx, :nb, :nb]
+        eigvals, C = np.linalg.eigh(H)
+        batch.P[mol_idx, :nb, :nb] = 2.0 * C[:, :nocc] @ C[:, :nocc].T
+
+    # DIIS state per molecule
+    diis_size = 6
+    diis_F_hist = [[] for _ in range(N)]
+    diis_E_hist = [[] for _ in range(N)]
+
+    # Convergence tracking
+    converged_arr = np.zeros(N, dtype=bool)
+    n_iter_arr = np.zeros(N, dtype=np.int32)
+    P_prev = batch.P.copy()
+
+    # Build Fock function
+    build_fock = build_fock_batch_metal if use_metal else build_fock_batch_cpu
+
+    for iteration in range(max_iter):
+        # Build Fock matrices for all molecules
+        F_all = build_fock(batch)
+
+        # Per-molecule: diagonalize, update density, check convergence
+        for mol_idx in range(N):
+            if converged_arr[mol_idx]:
+                continue
+
+            nb = batch.n_basis_arr[mol_idx]
+            nocc = batch.n_occ_arr[mol_idx]
+            F = F_all[mol_idx, :nb, :nb]
+            P = batch.P[mol_idx, :nb, :nb]
+            H = batch.H_core[mol_idx, :nb, :nb]
+
+            # Symmetrize F
+            F = 0.5 * (F + F.T)
+
+            # DIIS extrapolation
+            if iteration >= 2:
+                # Error matrix: FPS - SPF (with S=I in NDDO)
+                E_diis = F @ P - P @ F
+                diis_F_hist[mol_idx].append(F.copy())
+                diis_E_hist[mol_idx].append(E_diis)
+
+                if len(diis_F_hist[mol_idx]) > diis_size:
+                    diis_F_hist[mol_idx].pop(0)
+                    diis_E_hist[mol_idx].pop(0)
+
+                nd = len(diis_F_hist[mol_idx])
+                if nd >= 2:
+                    B = np.zeros((nd + 1, nd + 1))
+                    for ii in range(nd):
+                        for jj in range(nd):
+                            B[ii, jj] = np.sum(diis_E_hist[mol_idx][ii] *
+                                              diis_E_hist[mol_idx][jj])
+                    B[:nd, nd] = -1.0
+                    B[nd, :nd] = -1.0
+                    rhs = np.zeros(nd + 1)
+                    rhs[nd] = -1.0
+
+                    try:
+                        c = np.linalg.solve(B, rhs)
+                        F = sum(c[ii] * diis_F_hist[mol_idx][ii] for ii in range(nd))
+                    except np.linalg.LinAlgError:
+                        pass
+
+            # Diagonalize
+            eigvals, C = np.linalg.eigh(F)
+            P_new = 2.0 * C[:, :nocc] @ C[:, :nocc].T
+
+            # Check convergence
+            dP = np.max(np.abs(P_new - P))
+            if dP < conv_tol:
+                converged_arr[mol_idx] = True
+                n_iter_arr[mol_idx] = iteration + 1
+
+            # Update density
+            if iteration < 2:
+                P_mixed = 0.5 * P_new + 0.5 * P
+            else:
+                P_mixed = P_new
+
+            batch.P[mol_idx, :nb, :nb] = P_mixed
+
+        if verbose and (iteration % 5 == 0 or np.all(converged_arr)):
+            n_conv = np.sum(converged_arr)
+            print(f"  SCF iter {iteration+1}: {n_conv}/{N} converged")
+
+        if np.all(converged_arr):
+            break
+
+    # Mark unconverged
+    for mol_idx in range(N):
+        if not converged_arr[mol_idx]:
+            n_iter_arr[mol_idx] = max_iter
+
+    # Final Fock + energies
+    F_final = build_fock(batch)
+    results = []
+
+    for mol_idx in range(N):
+        nb = batch.n_basis_arr[mol_idx]
+        atoms = batch.atoms_list[mol_idx]
+        P = batch.P[mol_idx, :nb, :nb]
+        F = F_final[mol_idx, :nb, :nb]
+        H = batch.H_core[mol_idx, :nb, :nb]
+
+        # Symmetrize
+        F = 0.5 * (F + F.T)
+
+        # Electronic energy
+        E_elec = 0.5 * np.sum(P * (H + F))
+        E_nuc = batch.E_nuc[mol_idx]
+        E_total = E_elec + E_nuc
+
+        # Heat of formation
+        E_isol = sum(RM1_PARAMS[z].eisol for z in atoms)
+        eheat = sum(RM1_PARAMS[z].eheat for z in atoms)
+        E_binding = E_total - E_isol
+        E_hof = E_binding + eheat / EV_TO_KCAL
+
+        # Eigenvalues
+        eigvals, _ = np.linalg.eigh(F)
+
+        results.append({
+            'energy_eV': E_total,
+            'energy_kcal': E_total * EV_TO_KCAL,
+            'electronic_eV': E_elec,
+            'nuclear_eV': E_nuc,
+            'heat_of_formation_eV': E_hof,
+            'heat_of_formation_kcal': E_hof * EV_TO_KCAL,
+            'converged': bool(converged_arr[mol_idx]),
+            'n_iter': int(n_iter_arr[mol_idx]),
+            'eigenvalues': eigvals,
+            'density': P,
+            'n_basis': int(nb),
+        })
+
+    return results

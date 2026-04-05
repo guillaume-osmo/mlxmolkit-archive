@@ -14,5 +14,5 @@ Usage:
 """
 
 from .params import RM1_PARAMS
-from .scf import rm1_energy
+from .scf import rm1_energy, rm1_energy_batch
 from .gradient import rm1_gradient, rm1_optimize
