@@ -63,14 +63,16 @@ result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
 
 GPU memory stays constant regardless of total conformers thanks to divide-and-conquer batching.
 
-### Scale Test: 1000 Molecules x 10 Conformers = 10,000 Total
+### Scale Tests
 
-| Pipeline | Time | Throughput | Convergence | Batches |
-|----------|------|-----------|-------------|---------|
-| DG + ETK | 3.1s | **3,210 conf/s** | 99.8% | 1 |
-| DG + ETK + MMFF | 6.5s | **1,536 conf/s** | 99.8% | 1 |
+| Scale | Pipeline | Time | Throughput | Convergence |
+|-------|----------|------|-----------|-------------|
+| N=1000, k=10 | DG + ETK | 5.0s | **2,017 conf/s** | 99.7% |
+| N=1000, k=10 | DG + ETK + MMFF | 8.0s | **1,250 conf/s** | 99.7% |
+| N=10000, k=1 | DG + ETK | 17.7s | **565 conf/s** | 99.6% |
+| N=10000, k=1 | DG + ETK + MMFF | 37.9s | **264 conf/s** | 99.6% |
 
-1000 drug-like molecules with explicit H (6-33 atoms, mean 14.2). All 10,000 conformers in a single GPU batch. 100% valid 3D coordinates.
+All stages run on Metal GPU (including MMFF94 — zero RDKit post-processing). Single GPU batch, divide-and-conquer for larger workloads.
 
 ### Batch Size Impact (N=20, k=50, C=1000)
 
