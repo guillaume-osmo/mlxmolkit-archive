@@ -22,6 +22,7 @@ from .integrals import (
 )
 from .two_center_integrals import two_center_integrals
 from .rotation import rotate_integrals_to_molecular_frame
+from .overlap import overlap_molecular_frame
 
 
 def _build_basis_info(atoms: list[int]):
@@ -107,17 +108,17 @@ def _build_core_hamiltonian(atoms, coords, info):
         else:
             H[mu, mu] = p.Upp
 
-    # Off-diagonal: resonance integrals
+    # Off-diagonal: resonance integrals using proper Slater overlap
     # H_μν = 0.5 * (beta_μ + beta_ν) * S_μν  (Wolfsberg-Helmholz)
     n_atoms = len(atoms)
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
             pA = params[i]
             pB = params[j]
-            R = np.linalg.norm(coords[i] - coords[j])
-            R_bohr = R * ANG_TO_BOHR
 
-            # Compute overlap and resonance for each basis pair
+            # Proper Slater overlap in molecular frame
+            S_ij = overlap_molecular_frame(pA, pB, coords[i], coords[j])
+
             for mu_off in range(pA.n_basis):
                 mu = starts[i] + mu_off
                 beta_mu = pA.beta_s if btype[mu] == 0 else pA.beta_p
@@ -126,27 +127,7 @@ def _build_core_hamiltonian(atoms, coords, info):
                     nu = starts[j] + nu_off
                     beta_nu = pB.beta_s if btype[nu] == 0 else pB.beta_p
 
-                    # Overlap (simplified — only s-s for now)
-                    if btype[mu] == 0 and btype[nu] == 0:
-                        qnA = 1 if pA.Z <= 2 else 2
-                        qnB = 1 if pB.Z <= 2 else 2
-                        S = _overlap_ss(pA.zeta_s, pB.zeta_s, R_bohr, qnA, qnB)
-                    else:
-                        # s-p and p-p overlaps: approximate
-                        zeta_mu = pA.zeta_s if btype[mu] == 0 else pA.zeta_p
-                        zeta_nu = pB.zeta_s if btype[nu] == 0 else pB.zeta_p
-                        rho = 0.5 * (zeta_mu + zeta_nu) * R_bohr
-                        S = np.exp(-rho) * (1.0 + rho) if rho < 20 else 0.0
-                        # Directional factor for p orbitals
-                        if btype[mu] > 0 or btype[nu] > 0:
-                            dx = (coords[j] - coords[i]) / max(R, 1e-10)
-                            # p orbital direction: 1=x, 2=y, 3=z
-                            if btype[mu] > 0:
-                                S *= dx[btype[mu] - 1]
-                            if btype[nu] > 0:
-                                S *= dx[btype[nu] - 1]
-
-                    H[mu, nu] = 0.5 * (beta_mu + beta_nu) * S
+                    H[mu, nu] = 0.5 * (beta_mu + beta_nu) * S_ij[mu_off, nu_off]
                     H[nu, mu] = H[mu, nu]
 
     # Add electron-nuclear attraction (simplified)
