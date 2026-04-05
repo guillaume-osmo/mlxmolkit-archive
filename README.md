@@ -5,6 +5,36 @@ Port of [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to App
 1. **Molecular Clustering** — Morgan FP → Tanimoto similarity → Butina clustering
 2. **3D Conformer Generation** — DG (4D) → ETK (3D) → MMFF94 optimization
 
+## Installation
+
+```bash
+pip install mlxmolkit-rdkit
+```
+
+Requires macOS with Apple Silicon (M1/M2/M3/M4). RDKit is needed for molecular input:
+
+```bash
+conda install -c conda-forge rdkit
+pip install mlxmolkit-rdkit
+```
+
+## Quick Start
+
+```python
+from mlxmolkit import generate_conformers_nk, butina_tanimoto_mlx
+
+# 3D conformers: 100 molecules x 10 conformers each
+result = generate_conformers_nk(
+    smiles_list=["c1ccccc1", "CC(=O)O", "CC(=O)Oc1ccccc1C(=O)O"],
+    n_confs_per_mol=10,
+    run_mmff=True,
+)
+
+# Clustering: 150k+ molecules
+import mlx.core as mx
+result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
+```
+
 ## Features
 
 - **Conformer Generation** — Drop-in replacement for RDKit's ETKDG (`EmbedMolecules`). Supports ETKDG, ETKDGv2, ETKDGv3, srETKDGv3, KDG, ETDG, and pure DG.
@@ -301,6 +331,20 @@ result = butina_from_neighbor_list_csr(offsets, indices, N, cutoff=0.4)
 pip install -e .
 pytest tests/ -v
 ```
+
+## Conformer Quality vs RDKit
+
+mlxmolkit conformers rescored by RDKit's MMFF94 for fair comparison (k=20, ETKDGv2):
+
+| Molecule | Atoms | Bond Error | RMSD | E (RDKit) | E (mlxmolkit) |
+|----------|------:|-----------:|-----:|----------:|--------------:|
+| Benzene | 12 | 0.009 A | 0.26 A | 16.2 | 21.8 |
+| Acetic acid | 8 | 0.029 A | 0.35 A | -26.4 | -18.8 |
+| Aspirin | 21 | 0.021 A | 1.19 A | 18.9 | 76.6 |
+| Ibuprofen | 33 | 0.017 A | 2.51 A | 23.8 | 82.5 |
+| Caffeine | 24 | 0.023 A | — | -122.5 | -94.8 |
+
+Bond lengths match RDKit within 0.03 A. Small molecules (benzene, acetic acid) have RMSD <0.5 A. Larger molecules show higher RMSD due to different torsion sampling — the geometries are valid but explore different conformational space.
 
 ## References
 
