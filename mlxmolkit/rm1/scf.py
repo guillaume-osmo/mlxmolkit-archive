@@ -265,6 +265,7 @@ def rm1_energy(
     max_iter: int = 100,
     conv_tol: float = 1e-6,
     verbose: bool = False,
+    use_metal: bool = False,
 ) -> dict:
     """Compute RM1 single-point energy.
 
@@ -285,11 +286,45 @@ def rm1_energy(
     if verbose:
         print(f"RM1: {len(atoms)} atoms, {n_basis} basis functions, {info['n_elec']} electrons, {n_occ} occupied")
 
+    # Precompute (ss|ss) integrals between all atom pairs (used in Fock build)
+    n_atoms = len(atoms)
+    params = info['params']
+    ssss = np.zeros((n_atoms, n_atoms))
+    for i in range(n_atoms):
+        for j in range(n_atoms):
+            if i == j:
+                continue
+            R = np.linalg.norm(coords[i] - coords[j]) * ANG_TO_BOHR
+            rho0A = 0.5 * EV / params[i].gss if params[i].gss > 0 else 0.0
+            rho0B = 0.5 * EV / params[j].gss if params[j].gss > 0 else 0.0
+            aee = (rho0A + rho0B) ** 2
+            ssss[i, j] = EV / np.sqrt(R ** 2 + aee)
+
     # Core Hamiltonian
     H = _build_core_hamiltonian(atoms, coords, info)
 
     # Initial density: zero
     P = np.zeros((n_basis, n_basis))
+
+    # Prepare Metal Fock kernel inputs (precompute once)
+    if use_metal:
+        from .fock_metal import build_fock_metal
+        atom_params_metal = np.zeros((n_atoms, 5), dtype=np.float32)
+        for i, p in enumerate(params):
+            atom_params_metal[i] = [p.gss, p.gsp, p.gpp, p.gp2, p.hsp]
+        atom_starts_metal = np.zeros(n_atoms + 1, dtype=np.int32)
+        for i, p in enumerate(params):
+            atom_starts_metal[i + 1] = atom_starts_metal[i] + p.n_basis
+
+    def _fock(H, P):
+        if use_metal:
+            return build_fock_metal(
+                H, P, atom_params_metal,
+                info['basis_to_atom'], info['basis_type'],
+                atom_starts_metal, ssss.astype(np.float32),
+                n_basis, n_atoms,
+            )
+        return _build_fock(H, P, info, atoms, coords)
 
     # DIIS (Direct Inversion in the Iterative Subspace) storage
     diis_max = 6
@@ -300,7 +335,7 @@ def rm1_energy(
     converged = False
     for iteration in range(max_iter):
         # Build Fock matrix
-        F = _build_fock(H, P, info, atoms, coords)
+        F = _fock(H, P)
 
         # DIIS extrapolation (after first few iterations)
         if iteration >= 2:
@@ -361,7 +396,7 @@ def rm1_energy(
             P = P_new
 
     # Final Fock with converged density
-    F = _build_fock(H, P, info, atoms, coords)
+    F = _fock(H, P)
 
     # Electronic energy
     E_elec = 0.5 * np.sum(P * (H + F))
