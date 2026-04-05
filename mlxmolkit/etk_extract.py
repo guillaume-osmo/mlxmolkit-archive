@@ -33,6 +33,20 @@ class ETKParams:
     improper_idx: np.ndarray     # (n_improper, 4) int32 — center,n1,n2,n3
     improper_weight: np.ndarray  # (n_improper,) float32
 
+    # 1-2 distance constraints (bonds): flat-bottom harmonic
+    dist12_idx1: np.ndarray      # (n_dist12,) int32
+    dist12_idx2: np.ndarray      # (n_dist12,) int32
+    dist12_lb: np.ndarray        # (n_dist12,) float32
+    dist12_ub: np.ndarray        # (n_dist12,) float32
+    dist12_weight: np.ndarray    # (n_dist12,) float32
+
+    # 1-3 distance constraints (angles): flat-bottom harmonic
+    dist13_idx1: np.ndarray      # (n_dist13,) int32
+    dist13_idx2: np.ndarray      # (n_dist13,) int32
+    dist13_lb: np.ndarray        # (n_dist13,) float32
+    dist13_ub: np.ndarray        # (n_dist13,) float32
+    dist13_weight: np.ndarray    # (n_dist13,) float32
+
     # 1-4 distance constraints: E = w * (d - target)² if violated
     dist14_idx1: np.ndarray      # (n_dist14,) int32
     dist14_idx2: np.ndarray      # (n_dist14,) int32
@@ -184,6 +198,51 @@ def extract_etk_params(
         imp_idx = np.zeros((0, 4), dtype=np.int32)
         imp_w = np.zeros(0, dtype=np.float32)
 
+    # --- 1-2 distance constraints (bonds) ---
+    # Enforce correct bond lengths in 3D. Uses bounds matrix midpoint ± tolerance.
+    BOND_TOL = 0.01  # A
+    BOND_FC = 100.0
+    d12_i1, d12_i2, d12_lb, d12_ub, d12_w = [], [], [], [], []
+    if use_basic_knowledge:
+        for bond in mol.GetBonds():
+            a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            lo, hi = min(a, b), max(a, b)
+            lb_val = bounds_mat[hi, lo]
+            ub_val = bounds_mat[lo, hi]
+            if lb_val > 0 and ub_val > 0:
+                mid = (lb_val + ub_val) / 2.0
+                d12_i1.append(a)
+                d12_i2.append(b)
+                d12_lb.append(mid - BOND_TOL)
+                d12_ub.append(mid + BOND_TOL)
+                d12_w.append(BOND_FC)
+
+    n_d12 = len(d12_i1)
+
+    # --- 1-3 distance constraints (angles) ---
+    # Enforce correct angles via 1-3 distance bounds. Critical for geometry quality.
+    ANGLE_FC = 100.0
+    d13_i1, d13_i2, d13_lb, d13_ub, d13_w = [], [], [], [], []
+    if use_basic_knowledge:
+        for atom in mol.GetAtoms():
+            center = atom.GetIdx()
+            neighbors = sorted([n.GetIdx() for n in atom.GetNeighbors()])
+            for i in range(len(neighbors)):
+                for j in range(i + 1, len(neighbors)):
+                    a, b = neighbors[i], neighbors[j]
+                    lo, hi = min(a, b), max(a, b)
+                    lb_val = bounds_mat[hi, lo]
+                    ub_val = bounds_mat[lo, hi]
+                    if lb_val > 0 and ub_val > 0:
+                        mid = (lb_val + ub_val) / 2.0
+                        d13_i1.append(a)
+                        d13_i2.append(b)
+                        d13_lb.append(mid - BOND_TOL)
+                        d13_ub.append(mid + BOND_TOL)
+                        d13_w.append(ANGLE_FC)
+
+    n_d13 = len(d13_i1)
+
     # --- 1-4 distance constraints ---
     d14_i1, d14_i2, d14_lb, d14_ub, d14_w = [], [], [], [], []
 
@@ -226,6 +285,9 @@ def extract_etk_params(
 
     n_d14 = len(unique_i1)
 
+    def _a(lst, dt=np.int32):
+        return np.array(lst, dtype=dt) if lst else np.zeros(0, dtype=dt)
+
     return ETKParams(
         n_atoms=n_atoms,
         torsion_idx=torsion_idx,
@@ -233,11 +295,15 @@ def extract_etk_params(
         torsion_signs=torsion_signs,
         improper_idx=imp_idx,
         improper_weight=imp_w,
-        dist14_idx1=np.array(unique_i1, dtype=np.int32) if n_d14 else np.zeros(0, dtype=np.int32),
-        dist14_idx2=np.array(unique_i2, dtype=np.int32) if n_d14 else np.zeros(0, dtype=np.int32),
-        dist14_lb=np.array(unique_lb, dtype=np.float32) if n_d14 else np.zeros(0, dtype=np.float32),
-        dist14_ub=np.array(unique_ub, dtype=np.float32) if n_d14 else np.zeros(0, dtype=np.float32),
-        dist14_weight=np.array(unique_w, dtype=np.float32) if n_d14 else np.zeros(0, dtype=np.float32),
+        dist12_idx1=_a(d12_i1), dist12_idx2=_a(d12_i2),
+        dist12_lb=_a(d12_lb, np.float32), dist12_ub=_a(d12_ub, np.float32),
+        dist12_weight=_a(d12_w, np.float32),
+        dist13_idx1=_a(d13_i1), dist13_idx2=_a(d13_i2),
+        dist13_lb=_a(d13_lb, np.float32), dist13_ub=_a(d13_ub, np.float32),
+        dist13_weight=_a(d13_w, np.float32),
+        dist14_idx1=_a(unique_i1), dist14_idx2=_a(unique_i2),
+        dist14_lb=_a(unique_lb, np.float32), dist14_ub=_a(unique_ub, np.float32),
+        dist14_weight=_a(unique_w, np.float32),
     )
 
 

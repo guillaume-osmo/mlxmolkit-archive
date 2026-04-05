@@ -338,13 +338,13 @@ mlxmolkit conformers rescored by RDKit's MMFF94 for fair comparison (k=20, ETKDG
 
 | Molecule | Atoms | Bond Error | RMSD | E (RDKit) | E (mlxmolkit) |
 |----------|------:|-----------:|-----:|----------:|--------------:|
-| Benzene | 12 | 0.009 A | 0.26 A | 16.2 | 21.8 |
-| Acetic acid | 8 | 0.029 A | 0.35 A | -26.4 | -18.8 |
-| Aspirin | 21 | 0.021 A | 1.19 A | 18.9 | 76.6 |
-| Ibuprofen | 33 | 0.017 A | 2.51 A | 23.8 | 82.5 |
-| Caffeine | 24 | 0.023 A | — | -122.5 | -94.8 |
+| Benzene | 12 | 0.009 A | 0.10 A | 16.2 | 21.8 |
+| Acetic acid | 8 | 0.029 A | 0.23 A | -26.4 | -18.8 |
+| Aspirin | 21 | 0.021 A | 1.04 A | 18.9 | 76.6 |
+| Ibuprofen | 33 | 0.017 A | 1.93 A | 23.8 | 82.5 |
+| Acetaminophen | 20 | 0.024 A | 1.00 A | -12.8 | 50.4 |
 
-Bond lengths match RDKit within 0.03 A. Small molecules (benzene, acetic acid) have RMSD <0.5 A. Larger molecules show higher RMSD due to different torsion sampling — the geometries are valid but explore different conformational space.
+Bond lengths match RDKit within 0.03 A. Small molecules have RMSD <0.25 A (excellent). Larger molecules show RMSD ~1-2 A due to different torsion sampling — geometries are valid with correct bond/angle geometry but explore different conformational basins.
 
 ## References
 

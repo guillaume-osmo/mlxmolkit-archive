@@ -66,6 +66,20 @@ class SharedConstraintBatch:
     etk_improper_weight: Optional[np.ndarray] = None
     etk_improper_term_starts: Optional[np.ndarray] = None
 
+    etk_dist12_idx1: Optional[np.ndarray] = None
+    etk_dist12_idx2: Optional[np.ndarray] = None
+    etk_dist12_lb: Optional[np.ndarray] = None
+    etk_dist12_ub: Optional[np.ndarray] = None
+    etk_dist12_weight: Optional[np.ndarray] = None
+    etk_dist12_term_starts: Optional[np.ndarray] = None
+
+    etk_dist13_idx1: Optional[np.ndarray] = None
+    etk_dist13_idx2: Optional[np.ndarray] = None
+    etk_dist13_lb: Optional[np.ndarray] = None
+    etk_dist13_ub: Optional[np.ndarray] = None
+    etk_dist13_weight: Optional[np.ndarray] = None
+    etk_dist13_term_starts: Optional[np.ndarray] = None
+
     etk_dist14_idx1: Optional[np.ndarray] = None
     etk_dist14_idx2: Optional[np.ndarray] = None
     etk_dist14_lb: Optional[np.ndarray] = None
@@ -204,6 +218,12 @@ def add_etk_to_batch(
     imp_idx, imp_w = [], []
     imp_starts = np.zeros(n_mols + 1, dtype=np.int32)
 
+    d12_i1, d12_i2, d12_lb, d12_ub, d12_w = [], [], [], [], []
+    d12_starts = np.zeros(n_mols + 1, dtype=np.int32)
+
+    d13_i1, d13_i2, d13_lb, d13_ub, d13_w = [], [], [], [], []
+    d13_starts = np.zeros(n_mols + 1, dtype=np.int32)
+
     d14_i1, d14_i2, d14_lb, d14_ub, d14_w = [], [], [], [], []
     d14_starts = np.zeros(n_mols + 1, dtype=np.int32)
 
@@ -212,7 +232,7 @@ def add_etk_to_batch(
         n_t = len(p.torsion_idx) if p.torsion_idx is not None else 0
         tor_starts[m + 1] = tor_starts[m] + n_t
         if n_t > 0:
-            tor_idx.append(p.torsion_idx)      # LOCAL
+            tor_idx.append(p.torsion_idx)
             tor_V.append(p.torsion_V)
             tor_signs.append(p.torsion_signs)
 
@@ -220,18 +240,29 @@ def add_etk_to_batch(
         n_i = len(p.improper_idx) if p.improper_idx is not None else 0
         imp_starts[m + 1] = imp_starts[m] + n_i
         if n_i > 0:
-            imp_idx.append(p.improper_idx)     # LOCAL
+            imp_idx.append(p.improper_idx)
             imp_w.append(p.improper_weight)
+
+        # 1-2 bonds
+        n_d12 = len(p.dist12_idx1) if hasattr(p, 'dist12_idx1') and p.dist12_idx1 is not None else 0
+        d12_starts[m + 1] = d12_starts[m] + n_d12
+        if n_d12 > 0:
+            d12_i1.append(p.dist12_idx1); d12_i2.append(p.dist12_idx2)
+            d12_lb.append(p.dist12_lb); d12_ub.append(p.dist12_ub); d12_w.append(p.dist12_weight)
+
+        # 1-3 angles
+        n_d13 = len(p.dist13_idx1) if hasattr(p, 'dist13_idx1') and p.dist13_idx1 is not None else 0
+        d13_starts[m + 1] = d13_starts[m] + n_d13
+        if n_d13 > 0:
+            d13_i1.append(p.dist13_idx1); d13_i2.append(p.dist13_idx2)
+            d13_lb.append(p.dist13_lb); d13_ub.append(p.dist13_ub); d13_w.append(p.dist13_weight)
 
         # 1-4 distance constraints
         n_d = len(p.dist14_idx1) if p.dist14_idx1 is not None else 0
         d14_starts[m + 1] = d14_starts[m] + n_d
         if n_d > 0:
-            d14_i1.append(p.dist14_idx1)       # LOCAL
-            d14_i2.append(p.dist14_idx2)
-            d14_lb.append(p.dist14_lb)
-            d14_ub.append(p.dist14_ub)
-            d14_w.append(p.dist14_weight)
+            d14_i1.append(p.dist14_idx1); d14_i2.append(p.dist14_idx2)
+            d14_lb.append(p.dist14_lb); d14_ub.append(p.dist14_ub); d14_w.append(p.dist14_weight)
 
     batch.etk_torsion_idx = np.concatenate(tor_idx).astype(np.int32) if tor_idx else np.zeros((0, 4), dtype=np.int32)
     batch.etk_torsion_V = np.concatenate(tor_V).astype(np.float32) if tor_V else np.zeros((0, 6), dtype=np.float32)
@@ -241,6 +272,20 @@ def add_etk_to_batch(
     batch.etk_improper_idx = np.concatenate(imp_idx).astype(np.int32) if imp_idx else np.zeros((0, 4), dtype=np.int32)
     batch.etk_improper_weight = np.concatenate(imp_w).astype(np.float32) if imp_w else np.zeros(0, dtype=np.float32)
     batch.etk_improper_term_starts = imp_starts
+
+    batch.etk_dist12_idx1 = _concat_or_empty(d12_i1, np.int32)
+    batch.etk_dist12_idx2 = _concat_or_empty(d12_i2, np.int32)
+    batch.etk_dist12_lb = _concat_or_empty(d12_lb, np.float32)
+    batch.etk_dist12_ub = _concat_or_empty(d12_ub, np.float32)
+    batch.etk_dist12_weight = _concat_or_empty(d12_w, np.float32)
+    batch.etk_dist12_term_starts = d12_starts
+
+    batch.etk_dist13_idx1 = _concat_or_empty(d13_i1, np.int32)
+    batch.etk_dist13_idx2 = _concat_or_empty(d13_i2, np.int32)
+    batch.etk_dist13_lb = _concat_or_empty(d13_lb, np.float32)
+    batch.etk_dist13_ub = _concat_or_empty(d13_ub, np.float32)
+    batch.etk_dist13_weight = _concat_or_empty(d13_w, np.float32)
+    batch.etk_dist13_term_starts = d13_starts
 
     batch.etk_dist14_idx1 = _concat_or_empty(d14_i1, np.int32)
     batch.etk_dist14_idx2 = _concat_or_empty(d14_i2, np.int32)

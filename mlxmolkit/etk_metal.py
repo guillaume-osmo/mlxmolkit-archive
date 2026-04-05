@@ -240,6 +240,8 @@ _ETK_BODY = """
     // Constraint ranges (per molecule — SHARED)
     int tor_s = torsion_starts[mol_idx], tor_e = torsion_starts[mol_idx+1];
     int imp_s = improper_starts[mol_idx], imp_e = improper_starts[mol_idx+1];
+    int d12_s = dist12_starts[mol_idx], d12_e = dist12_starts[mol_idx+1];
+    int d13_s = dist13_starts[mol_idx], d13_e = dist13_starts[mol_idx+1];
     int d14_s = dist14_starts[mol_idx], d14_e = dist14_starts[mol_idx+1];
 
     int lbfgs_start = lbfgs_history_starts[conf_idx];
@@ -275,6 +277,16 @@ _ETK_BODY = """
         int ic=improper_quads[t*4]+atom_off, i0=improper_quads[t*4+1]+atom_off;
         int i1=improper_quads[t*4+2]+atom_off, i2=improper_quads[t*4+3]+atom_off;
         local_e += improper_e(out_pos, ic,i0,i1,i2, improper_w[t], dim);
+    }
+    // 1-2 bond distance energy
+    for (int t=d12_s+(int)tid; t<d12_e; t+=(int)tpm) {
+        int a=d12_pairs[t*2]+atom_off, b=d12_pairs[t*2+1]+atom_off;
+        local_e += dist14_e(out_pos, a,b, d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2], dim);
+    }
+    // 1-3 angle distance energy
+    for (int t=d13_s+(int)tid; t<d13_e; t+=(int)tpm) {
+        int a=d13_pairs[t*2]+atom_off, b=d13_pairs[t*2+1]+atom_off;
+        local_e += dist14_e(out_pos, a,b, d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2], dim);
     }
     // 1-4 distance energy
     for (int t=d14_s+(int)tid; t<d14_e; t+=(int)tpm) {
@@ -338,10 +350,12 @@ _ETK_BODY = """
             int i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
             improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);
         }
-        for (int t=d14_s;t<d14_e;t++) {
-            int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
-            dist14_g(out_pos,work_grad,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);
-        }
+        for (int t=d12_s;t<d12_e;t++) {int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off;
+            dist14_g(out_pos,work_grad,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);}
+        for (int t=d13_s;t<d13_e;t++) {int a=d13_pairs[t*2]+atom_off,b=d13_pairs[t*2+1]+atom_off;
+            dist14_g(out_pos,work_grad,a,b,d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim);}
+        for (int t=d14_s;t<d14_e;t++) {int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
+            dist14_g(out_pos,work_grad,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
     }
     threadgroup_barrier(mem_flags::mem_device);
 #endif
@@ -452,6 +466,10 @@ _ETK_BODY = """
                     torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim);}
             for (int t=imp_s;t<imp_e;t++){int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
                 improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);}
+            for (int t=d12_s;t<d12_e;t++){int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off;
+                dist14_g(out_pos,work_grad,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);}
+            for (int t=d13_s;t<d13_e;t++){int a=d13_pairs[t*2]+atom_off,b=d13_pairs[t*2+1]+atom_off;
+                dist14_g(out_pos,work_grad,a,b,d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim);}
             for (int t=d14_s;t<d14_e;t++){int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
                 dist14_g(out_pos,work_grad,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
         }
@@ -507,6 +525,8 @@ def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, para
                 "conf_to_mol", "conf_atom_starts", "mol_n_atoms",
                 "torsion_starts", "torsion_quads", "torsion_V", "torsion_signs_arr",
                 "improper_starts", "improper_quads", "improper_w",
+                "dist12_starts", "d12_pairs", "d12_bounds",
+                "dist13_starts", "d13_pairs", "d13_bounds",
                 "dist14_starts", "d14_pairs", "d14_bounds",
                 "lbfgs_history_starts",
             ],
@@ -572,14 +592,23 @@ def etk_minimize_shared(
         imp_quads = np.zeros(4, dtype=np.int32)
         imp_w = np.zeros(1, dtype=np.float32)
 
-    # Pack 1-4 distance terms
-    nd = len(batch.etk_dist14_idx1) if batch.etk_dist14_idx1 is not None else 0
-    if nd > 0:
-        d14_pairs = np.stack([batch.etk_dist14_idx1, batch.etk_dist14_idx2], axis=1).flatten().astype(np.int32)
-        d14_bounds = np.stack([batch.etk_dist14_lb, batch.etk_dist14_ub, batch.etk_dist14_weight], axis=1).flatten().astype(np.float32)
-    else:
-        d14_pairs = np.zeros(2, dtype=np.int32)
-        d14_bounds = np.zeros(3, dtype=np.float32)
+    # Pack 1-2 bond distance terms
+    def _pack_dist(idx1, idx2, lb, ub, w):
+        if idx1 is not None and len(idx1) > 0:
+            p = np.stack([idx1, idx2], axis=1).flatten().astype(np.int32)
+            b = np.stack([lb, ub, w], axis=1).flatten().astype(np.float32)
+            return p, b
+        return np.zeros(2, dtype=np.int32), np.zeros(3, dtype=np.float32)
+
+    d12_pairs, d12_bounds = _pack_dist(
+        batch.etk_dist12_idx1, batch.etk_dist12_idx2,
+        batch.etk_dist12_lb, batch.etk_dist12_ub, batch.etk_dist12_weight)
+    d13_pairs, d13_bounds = _pack_dist(
+        batch.etk_dist13_idx1, batch.etk_dist13_idx2,
+        batch.etk_dist13_lb, batch.etk_dist13_ub, batch.etk_dist13_weight)
+    d14_pairs, d14_bounds = _pack_dist(
+        batch.etk_dist14_idx1, batch.etk_dist14_idx2,
+        batch.etk_dist14_lb, batch.etk_dist14_ub, batch.etk_dist14_weight)
 
     # L-BFGS history
     lbfgs_starts = np.zeros(C + 1, dtype=np.int32)
@@ -604,6 +633,12 @@ def etk_minimize_shared(
             mx.array(batch.etk_improper_term_starts if batch.etk_improper_term_starts is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)),
             mx.array(imp_quads),
             mx.array(imp_w),
+            mx.array(batch.etk_dist12_term_starts if batch.etk_dist12_term_starts is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)),
+            mx.array(d12_pairs),
+            mx.array(d12_bounds),
+            mx.array(batch.etk_dist13_term_starts if batch.etk_dist13_term_starts is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)),
+            mx.array(d13_pairs),
+            mx.array(d13_bounds),
             mx.array(batch.etk_dist14_term_starts if batch.etk_dist14_term_starts is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)),
             mx.array(d14_pairs),
             mx.array(d14_bounds),
