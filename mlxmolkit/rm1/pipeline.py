@@ -62,23 +62,25 @@ def rm1_from_smiles(
     max_iter: int = 100,
     conv_tol: float = 1e-6,
     seed: int = 42,
+    method: str = 'RM1',
 ) -> Optional[dict]:
-    """Compute RM1 energy from SMILES string.
+    """Compute NDDO energy from SMILES string.
 
-    Pipeline: SMILES → RDKit AddHs + ETKDG + MMFF → RM1 SCF
+    Pipeline: SMILES → RDKit AddHs + ETKDG + MMFF → SCF
 
     Args:
         smiles: SMILES string
         max_iter: max SCF iterations
         conv_tol: convergence threshold
         seed: random seed for 3D embedding
+        method: 'RM1', 'AM1', or 'AM1_STAR'
 
     Returns:
-        Result dict with RM1 energies, or None if 3D generation fails.
+        Result dict with energies, or None if 3D generation fails.
         Extra keys: 'smiles', 'atoms', 'coords', 'n_atoms'
     """
     from .scf import rm1_energy
-    from .params import RM1_PARAMS
+    from .methods import get_params
 
     result_3d = _smiles_to_3d(smiles, seed=seed)
     if result_3d is None:
@@ -87,11 +89,12 @@ def rm1_from_smiles(
     atoms, coords = result_3d
 
     # Check all elements are supported
+    PARAMS = get_params(method)
     for z in atoms:
-        if z not in RM1_PARAMS:
+        if z not in PARAMS:
             return None  # unsupported element
 
-    result = rm1_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol)
+    result = rm1_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
     result['smiles'] = smiles
     result['atoms'] = atoms
     result['coords'] = coords
@@ -106,10 +109,11 @@ def rm1_from_smiles_batch(
     use_metal: bool = True,
     seed: int = 42,
     verbose: bool = False,
+    method: str = 'RM1',
 ) -> list[Optional[dict]]:
-    """Compute RM1 energies for a batch of SMILES strings.
+    """Compute NDDO energies for a batch of SMILES strings.
 
-    Pipeline: SMILES → RDKit 3D → RM1 batch SCF (Metal GPU)
+    Pipeline: SMILES → RDKit 3D → batch SCF (Metal GPU)
 
     Args:
         smiles_list: list of SMILES strings
@@ -123,7 +127,7 @@ def rm1_from_smiles_batch(
         List of result dicts (None for failed molecules).
     """
     from .scf import rm1_energy_batch
-    from .params import RM1_PARAMS
+    from .methods import get_params
 
     if verbose:
         print(f"RM1 batch: {len(smiles_list)} SMILES")
@@ -140,7 +144,8 @@ def rm1_from_smiles_batch(
             continue
         atoms, coords = result_3d
         # Check elements
-        if any(z not in RM1_PARAMS for z in atoms):
+        PARAMS = get_params(method)
+        if any(z not in PARAMS for z in atoms):
             failed_indices.append(i)
             continue
         mol_data.append((atoms, coords))
@@ -156,7 +161,7 @@ def rm1_from_smiles_batch(
     # Step 2: Batch RM1 SCF
     batch_results = rm1_energy_batch(
         mol_data, max_iter=max_iter, conv_tol=conv_tol,
-        use_metal=use_metal, verbose=verbose,
+        use_metal=use_metal, verbose=verbose, method=method,
     )
 
     # Step 3: Assemble results

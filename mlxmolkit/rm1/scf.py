@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 from .params import RM1_PARAMS, ElementParams, EV_TO_KCAL, ANG_TO_BOHR
+from .methods import get_params, METHOD_PARAMS
 from .integrals import (
     compute_one_center_integrals,
     compute_nuclear_repulsion,
@@ -25,9 +26,11 @@ from .rotation import rotate_integrals_to_molecular_frame
 from .overlap import overlap_molecular_frame
 
 
-def _build_basis_info(atoms: list[int]):
+def _build_basis_info(atoms: list[int], param_dict=None):
     """Build basis function → atom mapping."""
-    params = [RM1_PARAMS[z] for z in atoms]
+    if param_dict is None:
+        param_dict = RM1_PARAMS
+    params = [param_dict[z] for z in atoms]
     n_basis = sum(p.n_basis for p in params)
     n_elec = sum(p.n_valence for p in params)
 
@@ -255,25 +258,28 @@ def rm1_energy(
     conv_tol: float = 1e-6,
     verbose: bool = False,
     use_metal: bool = False,
+    method: str = 'RM1',
 ) -> dict:
-    """Compute RM1 single-point energy.
+    """Compute NDDO semi-empirical single-point energy.
 
     Args:
         atoms: list of atomic numbers [1, 8, 1] for H2O
         coords: (N, 3) coordinates in Angstrom
         max_iter: max SCF iterations
         conv_tol: density matrix convergence threshold
+        method: 'RM1', 'AM1', or 'AM1_STAR'
 
     Returns:
         dict with 'energy_eV', 'energy_kcal', 'converged', 'n_iter'
     """
+    PARAMS = get_params(method)
     coords = np.asarray(coords, dtype=np.float64)
-    info = _build_basis_info(atoms)
+    info = _build_basis_info(atoms, PARAMS)
     n_basis = info['n_basis']
     n_occ = info['n_occ']
 
     if verbose:
-        print(f"RM1: {len(atoms)} atoms, {n_basis} basis functions, {info['n_elec']} electrons, {n_occ} occupied")
+        print(f"{method}: {len(atoms)} atoms, {n_basis} basis functions, {info['n_elec']} electrons, {n_occ} occupied")
 
     # Precompute (ss|ss) integrals between all atom pairs (used in Fock build)
     n_atoms = len(atoms)
@@ -391,7 +397,7 @@ def rm1_energy(
     E_elec = 0.5 * np.sum(P * (H + F))
 
     # Nuclear repulsion
-    E_nuc = compute_nuclear_repulsion(atoms, coords)
+    E_nuc = compute_nuclear_repulsion(atoms, coords, param_dict=PARAMS)
 
     # Total energy
     E_total = E_elec + E_nuc
@@ -399,8 +405,8 @@ def rm1_energy(
     # Heat of formation:
     # ΔHf = E_total - Σ Eisol(atom) + Σ eheat(atom)
     # Eisol computed using PYSEQM/MOPAC coefficients (in params.py)
-    E_isol_total = sum(RM1_PARAMS[z].eisol for z in atoms)
-    eheat_total = sum(RM1_PARAMS[z].eheat for z in atoms)
+    E_isol_total = sum(PARAMS[z].eisol for z in atoms)
+    eheat_total = sum(PARAMS[z].eheat for z in atoms)
 
     E_binding_eV = E_total - E_isol_total
     E_hof_eV = E_binding_eV + eheat_total / EV_TO_KCAL
@@ -417,6 +423,7 @@ def rm1_energy(
         'eigenvalues': eigenvalues,
         'density': P,
         'n_basis': n_basis,
+        'method': method,
     }
 
 
@@ -426,8 +433,9 @@ def rm1_energy_batch(
     conv_tol: float = 1e-6,
     use_metal: bool = True,
     verbose: bool = False,
+    method: str = 'RM1',
 ) -> list[dict]:
-    """Compute RM1 energies for N molecules simultaneously.
+    """Compute NDDO energies for N molecules simultaneously.
 
     Args:
         molecules: list of (atoms, coords) tuples
@@ -435,6 +443,7 @@ def rm1_energy_batch(
         conv_tol: density matrix convergence threshold
         use_metal: True for Metal GPU Fock build, False for CPU
         verbose: print convergence info
+        method: 'RM1', 'AM1', or 'AM1_STAR'
 
     Returns:
         list of result dicts (same format as rm1_energy)
@@ -442,12 +451,14 @@ def rm1_energy_batch(
     from .batch import prepare_batch
     from .fock_metal import build_fock_batch_metal, build_fock_batch_cpu, MetalFockContext
 
+    PARAMS = get_params(method)
+
     N = len(molecules)
     if N == 0:
         return []
 
     # Pre-compute all integrals (CPU, done once)
-    batch = prepare_batch(molecules)
+    batch = prepare_batch(molecules, param_dict=PARAMS)
     MB = batch.max_basis
 
     # Initialize density matrices from core Hamiltonian eigendecomposition
@@ -579,8 +590,8 @@ def rm1_energy_batch(
         E_total = E_elec + E_nuc
 
         # Heat of formation
-        E_isol = sum(RM1_PARAMS[z].eisol for z in atoms)
-        eheat = sum(RM1_PARAMS[z].eheat for z in atoms)
+        E_isol = sum(PARAMS[z].eisol for z in atoms)
+        eheat = sum(PARAMS[z].eheat for z in atoms)
         E_binding = E_total - E_isol
         E_hof = E_binding + eheat / EV_TO_KCAL
 

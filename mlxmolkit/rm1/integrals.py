@@ -254,6 +254,7 @@ def compute_core_hamiltonian(
 def compute_nuclear_repulsion(
     atoms: list[int],
     coords: np.ndarray,
+    param_dict: dict = None,
 ) -> float:
     """Compute core-core (nuclear) repulsion energy.
 
@@ -263,8 +264,10 @@ def compute_nuclear_repulsion(
 
     Returns energy in eV.
     """
+    if param_dict is None:
+        param_dict = RM1_PARAMS
     n_atoms = len(atoms)
-    params = [RM1_PARAMS[z] for z in atoms]
+    params = [param_dict[z] for z in atoms]
     E_nuc = 0.0
 
     for i in range(n_atoms):

@@ -47,6 +47,7 @@ class RM1Batch:
 
 def prepare_batch(
     molecules: list[tuple[list[int], np.ndarray]],
+    param_dict: dict = None,
 ) -> RM1Batch:
     """Pre-compute all integrals for a batch of molecules.
 
@@ -54,17 +55,20 @@ def prepare_batch(
         molecules: list of (atoms, coords) tuples
             atoms: list of atomic numbers
             coords: (n_atoms, 3) array in Angstrom
+        param_dict: parameter dictionary (default: RM1_PARAMS)
 
     Returns:
         RM1Batch with all pre-computed data
     """
+    if param_dict is None:
+        param_dict = RM1_PARAMS
     N = len(molecules)
 
     # Determine max sizes
     max_atoms = max(len(atoms) for atoms, _ in molecules)
     max_basis = 0
     for atoms, _ in molecules:
-        nb = sum(RM1_PARAMS[z].n_basis for z in atoms)
+        nb = sum(param_dict[z].n_basis for z in atoms)
         max_basis = max(max_basis, nb)
 
     MB = max_basis
@@ -89,7 +93,7 @@ def prepare_batch(
     for mol_idx, (atoms, coords) in enumerate(molecules):
         coords = np.array(coords, dtype=np.float64)
         n_at = len(atoms)
-        params = [RM1_PARAMS[z] for z in atoms]
+        params = [param_dict[z] for z in atoms]
         n_bas = sum(p.n_basis for p in params)
         n_elec = sum(p.n_valence for p in params)
         n_occ = n_elec // 2
@@ -174,7 +178,7 @@ def prepare_batch(
         H_core_all[mol_idx, :n_bas, :n_bas] = H
 
         # Nuclear repulsion
-        E_nuc_arr[mol_idx] = compute_nuclear_repulsion(atoms, coords)
+        E_nuc_arr[mol_idx] = compute_nuclear_repulsion(atoms, coords, param_dict=param_dict)
 
     return RM1Batch(
         n_mols=N,
