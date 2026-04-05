@@ -31,6 +31,7 @@ from .conformer_metal import dg_minimize_shared
 from .etk_metal import etk_minimize_shared
 from .mmff_params import MMFFParams, extract_mmff_params
 from .mmff_minimize import mmff_minimize_nk
+from .stereo_checks_metal import run_stereo_checks
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +192,18 @@ def _process_chunk(
                 dg_out[s:e] = dg_out2[s:e]
                 dg_e[c] = dg_e2[c]
                 dg_s[c] = dg_s2[c]
+
+    # ---- Stage 1c: Stereo checks (reject bad chirality) ----
+    if mols_list is not None:
+        stereo_passed = run_stereo_checks(
+            dg_out, dg_params_list, mols_list,
+            batch4.conf_atom_starts, batch4.conf_to_mol,
+            mol_order, C, dim=4,
+        )
+        # Mark failed conformers as not converged
+        for c in range(C):
+            if not stereo_passed[c]:
+                dg_s[c] = 2  # stereo failure
 
     # ---- Stage 2: Extract 3D from 4D ----
     batch3 = pack_shared_dg_batch(chunk_dg, chunk_k, dim=3)
@@ -372,7 +385,7 @@ def generate_conformers_nk(
         chunk_results = _process_chunk(
             chunk, dg_params_list,
             etk_params_list if run_etk else None,
-            mols if run_mmff else None,
+            mols,  # needed for stereo checks + MMFF
             run_mmff,
             seed_offset=chunk_idx * 10000,
             dg_max_iters=dg_max_iters,
