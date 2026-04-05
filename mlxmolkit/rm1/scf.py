@@ -130,24 +130,19 @@ def _build_core_hamiltonian(atoms, coords, info):
                     H[mu, nu] = 0.5 * (beta_mu + beta_nu) * S_ij[mu_off, nu_off]
                     H[nu, mu] = H[mu, nu]
 
-    # Add electron-nuclear attraction (simplified)
+    # Electron-nuclear attraction using properly rotated integrals
     for i in range(n_atoms):
         for j in range(n_atoms):
             if i == j:
                 continue
-            pB = params[j]
-            R = np.linalg.norm(coords[i] - coords[j])
-            R_bohr = R * ANG_TO_BOHR
-
-            rho0A = 0.5 * EV / params[i].gss if params[i].gss > 0 else 0.0
-            rho0B = 0.5 * EV / pB.gss if pB.gss > 0 else 0.0
-            aee = (rho0A + rho0B) ** 2
-            Vss = EV / np.sqrt(R_bohr ** 2 + aee)
-
-            # Subtract nuclear attraction from diagonal
-            mu0 = starts[i]
-            for mu_off in range(params[i].n_basis):
-                H[mu0 + mu_off, mu0 + mu_off] -= pB.n_valence * Vss
+            # e1b[μ_i, ν_i] = attraction of electrons on atom i by nucleus j
+            _, e1b_ij, _ = rotate_integrals_to_molecular_frame(
+                params[i], params[j], coords[i], coords[j],
+            )
+            nA = params[i].n_basis
+            for mu_a in range(nA):
+                for nu_a in range(nA):
+                    H[starts[i] + mu_a, starts[i] + nu_a] += e1b_ij[mu_a, nu_a]
 
     return H
 
@@ -221,9 +216,12 @@ def _build_fock(H, P, info, atoms, coords):
             nA = pA.n_basis
             nB = pB.n_basis
 
-            # Two-electron contribution to Fock matrix:
-            # F[μ_A, ν_A] += Σ_{λ_B, σ_B} P[λ_B, σ_B] * w[μ,ν,λ,σ]
-            # F[μ_A, λ_B] -= 0.5 * Σ_{ν_A, σ_B} P[ν_A, σ_B] * w[μ,ν,λ,σ]
+            # Two-electron contribution to Fock matrix (NDDO):
+            #
+            # Coulomb on A from B:  F[μ_A, ν_A] += Σ_{λσ on B} P[λ,σ] * (μν|λσ)
+            # Coulomb on B from A:  F[λ_B, σ_B] += Σ_{μν on A} P[μ,ν] * (μν|λσ)
+            # Exchange A-B:         F[μ_A, λ_B] -= 0.5 * Σ_{νσ} P[ν_A,σ_B] * (μν|λσ)
+            #
             for mu_a in range(nA):
                 for nu_a in range(nA):
                     mu = sA + mu_a
@@ -233,37 +231,15 @@ def _build_fock(H, P, info, atoms, coords):
                             lam = sB + lam_b
                             sig = sB + sig_b
                             wval = w[mu_a, nu_a, lam_b, sig_b]
-                            # Coulomb on A
+                            # Coulomb on A from B's density
                             F[mu, nu] += P[lam, sig] * wval
-
-            # Same for B orbitals (Coulomb from A's density)
-            for lam_b in range(nB):
-                for sig_b in range(nB):
-                    lam = sB + lam_b
-                    sig = sB + sig_b
-                    for mu_a in range(nA):
-                        for nu_a in range(nA):
-                            mu = sA + mu_a
-                            nu = sA + nu_a
-                            wval = w[mu_a, nu_a, lam_b, sig_b]
+                            # Coulomb on B from A's density
                             F[lam, sig] += P[mu, nu] * wval
+                            # Exchange A-B
+                            F[mu, lam] -= 0.5 * P[nu, sig] * wval
 
-            # Exchange: F[μ_A, λ_B] -= 0.5 * P[ν_A, σ_B] * w[μ_A,ν_A,λ_B,σ_B]
-            # In NDDO: only (μ_A λ_B | ν_A σ_B) survives for exchange
-            for mu_a in range(nA):
-                for lam_b in range(nB):
-                    mu = sA + mu_a
-                    lam = sB + lam_b
-                    for nu_a in range(nA):
-                        for sig_b in range(nB):
-                            nu = sA + nu_a
-                            sig = sB + sig_b
-                            # Exchange integral: (μλ|νσ) in NDDO = w[μ,ν,λ,σ] (same storage)
-                            F[mu, lam] -= 0.5 * P[nu, sig] * w[mu_a, nu_a, lam_b, sig_b]
-
-            F_sym = 0.5 * (F + F.T)
-            np.copyto(F, F_sym)
-
+    # Ensure symmetry
+    F = 0.5 * (F + F.T)
     return F
 
 
@@ -415,28 +391,31 @@ def rm1_energy(
     # Total energy
     E_total = E_elec + E_nuc
 
-    # Heat of formation:
-    # ΔHf = E_total - Σ E_isol(atom) + Σ ΔHf_atom(experimental)
+    # Heat of formation (exact MOPAC formula):
+    # ΔHf = E_total - Σ Eisol(atom) + Σ eheat(atom)
+    # where Eisol uses MOPAC's exact occupation-dependent coefficients
+    _IOS_IOP = {1:(1,0), 6:(2,2), 7:(2,3), 8:(2,4), 9:(2,5),
+                15:(2,3), 16:(2,4), 17:(2,5), 35:(2,5), 53:(2,5)}
+
     E_isol_total = 0.0
     eheat_total = 0.0
     for z in atoms:
         p = RM1_PARAMS[z]
-        # Compute isolated atom energy from one-center integrals
-        nv = p.n_valence
-        if p.n_basis == 1:
-            eisol = p.Uss
-        else:
-            ns = min(nv, 2)
-            np_el = nv - ns
-            eisol = ns * p.Uss + np_el * p.Upp
-            if ns == 2:
-                eisol += p.gss
-            eisol += ns * np_el * (p.gsp - p.hsp / 2.0)
-            if np_el >= 2:
-                n_pairs = np_el * (np_el - 1) / 2
-                eisol += n_pairs * (p.gp2 + (p.gpp - p.gp2) / 3.0)
+        ns, np_ = _IOS_IOP.get(z, (min(p.n_valence, 2), p.n_valence - min(p.n_valence, 2)))
+        # MOPAC Eisol coefficients
+        gssc = max(ns - 1, 0)
+        k = np_
+        gspc = ns * k
+        l = min(k, 6 - k)
+        gp2c = (k * (k - 1)) // 2 + 0.5 * (l * (l - 1)) // 2
+        gppc = -0.5 * (l * (l - 1)) // 2
+        hspc = -k * ns * 0.5
+
+        eisol = (p.Uss * ns + p.Upp * np_
+               + p.gss * gssc + p.gpp * gppc + p.gsp * gspc
+               + p.gp2 * gp2c + p.hsp * hspc)
         E_isol_total += eisol
-        eheat_total += p.eheat  # experimental ΔHf of atom (kcal/mol)
+        eheat_total += p.eheat
 
     E_binding_eV = E_total - E_isol_total
     E_hof_eV = E_binding_eV + eheat_total / EV_TO_KCAL
