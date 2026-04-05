@@ -172,64 +172,89 @@ def _build_core_hamiltonian(atoms, coords, info):
 def _build_fock(H, P, info, atoms, coords):
     """Build Fock matrix F = H + G(P).
 
-    G_μν = Σ_λσ P_λσ * [(μν|λσ) - 0.5*(μλ|νσ)]
+    Two contributions:
+    1. One-center: G_μν (same atom) from Slater-Condon parameters
+    2. Two-center: Coulomb/exchange between atoms via (ss|ss) integrals
 
-    For NDDO: only one-center two-electron integrals contribute.
+    NDDO approximation: only (μμ|λλ)-type integrals survive.
     """
     n_basis = info['n_basis']
+    n_atoms = len(atoms)
     params = info['params']
     b2a = info['basis_to_atom']
     btype = info['basis_type']
+    starts = info['atom_basis_start']
 
     F = H.copy()
 
-    # One-center contributions (NDDO: only same-atom integrals)
+    # === One-center two-electron contributions ===
     for i, p in enumerate(params):
         mask = (b2a == i)
         idx = np.where(mask)[0]
-
         if len(idx) == 0:
             continue
 
-        # Extract sub-density for this atom
-        P_sub = P[np.ix_(idx, idx)]
-
-        # s orbital index
         s = idx[0]
-
-        # Total electron density on this atom
         Pss = P[s, s]
 
         if p.n_basis == 1:
-            # H atom: only (ss|ss)
             F[s, s] += Pss * p.gss * 0.5
         else:
-            # Heavy atom: sp shell
             px, py, pz = idx[1], idx[2], idx[3]
             Ppp_total = P[px, px] + P[py, py] + P[pz, pz]
 
-            # Coulomb on s orbital
             F[s, s] += Pss * p.gss * 0.5 + Ppp_total * (p.gsp - 0.5 * p.hsp)
 
-            # Coulomb on p orbitals
             for k in range(1, 4):
                 pk = idx[k]
                 F[pk, pk] += Pss * (p.gsp - 0.5 * p.hsp) + \
                              P[pk, pk] * p.gpp * 0.5 + \
                              (Ppp_total - P[pk, pk]) * (p.gp2 - 0.5 * (p.gpp - p.gp2))
 
-            # Exchange sp terms
             for k in range(1, 4):
                 pk = idx[k]
                 F[s, pk] += P[s, pk] * (2.0 * p.hsp - 0.5 * p.gsp)
                 F[pk, s] = F[s, pk]
 
-            # Exchange pp' terms
             for k in range(1, 4):
                 for l in range(k + 1, 4):
                     pk, pl = idx[k], idx[l]
                     F[pk, pl] += P[pk, pl] * (0.5 * (p.gpp - p.gp2) - 0.5 * p.gp2)
                     F[pl, pk] = F[pk, pl]
+
+    # === Two-center Coulomb contribution ===
+    # For each atom pair (A,B):
+    #   F[μ_A, μ_A] += Σ_{λ on B} P[λ,λ] * (μ_A μ_A | λ_B λ_B)
+    # Using (ss|ss) as the dominant two-center integral
+    for i in range(n_atoms):
+        for j in range(n_atoms):
+            if i == j:
+                continue
+            pA = params[i]
+            pB = params[j]
+            R = np.linalg.norm(coords[i] - coords[j])
+            R_bohr = R * ANG_TO_BOHR
+
+            rho0A = 0.5 * EV / pA.gss if pA.gss > 0 else 0.0
+            rho0B = 0.5 * EV / pB.gss if pB.gss > 0 else 0.0
+            aee = (rho0A + rho0B) ** 2
+            ssss = EV / np.sqrt(R_bohr ** 2 + aee)
+
+            # Total density on atom B
+            PB_total = 0.0
+            for lb in range(pB.n_basis):
+                PB_total += P[starts[j] + lb, starts[j] + lb]
+
+            # Coulomb: each orbital on A feels density on B
+            for ma in range(pA.n_basis):
+                mu = starts[i] + ma
+                F[mu, mu] += PB_total * ssss
+
+            # Exchange: inter-atom exchange (NDDO: only s-s)
+            s_i = starts[i]
+            s_j = starts[j]
+            # F[s_A, s_B] -= 0.5 * P[s_A, s_B] * (s_A s_A | s_B s_B)
+            F[s_i, s_j] -= 0.5 * P[s_i, s_j] * ssss
 
     return F
 
@@ -266,11 +291,48 @@ def rm1_energy(
     # Initial density: zero
     P = np.zeros((n_basis, n_basis))
 
+    # DIIS (Direct Inversion in the Iterative Subspace) storage
+    diis_max = 6
+    diis_F_list = []  # stored Fock matrices
+    diis_e_list = []  # stored error vectors (FPS - SPF)
+
     # SCF loop
     converged = False
     for iteration in range(max_iter):
         # Build Fock matrix
         F = _build_fock(H, P, info, atoms, coords)
+
+        # DIIS extrapolation (after first few iterations)
+        if iteration >= 2:
+            # Error vector: e = F @ P - P @ F (commutator, should be zero at convergence)
+            e = F @ P - P @ F
+            diis_F_list.append(F.copy())
+            diis_e_list.append(e.copy())
+
+            # Keep only last diis_max entries
+            if len(diis_F_list) > diis_max:
+                diis_F_list.pop(0)
+                diis_e_list.pop(0)
+
+            nd = len(diis_F_list)
+            if nd >= 2:
+                # Build DIIS B matrix: B[i,j] = Tr(e_i @ e_j)
+                B = np.zeros((nd + 1, nd + 1))
+                for i in range(nd):
+                    for j in range(nd):
+                        B[i, j] = np.sum(diis_e_list[i] * diis_e_list[j])
+                B[nd, :nd] = -1.0
+                B[:nd, nd] = -1.0
+                B[nd, nd] = 0.0
+
+                rhs = np.zeros(nd + 1)
+                rhs[nd] = -1.0
+
+                try:
+                    coeffs = np.linalg.solve(B, rhs)
+                    F = sum(coeffs[i] * diis_F_list[i] for i in range(nd))
+                except np.linalg.LinAlgError:
+                    pass  # fall back to un-extrapolated F
 
         # Diagonalize
         eigenvalues, C = np.linalg.eigh(F)
@@ -280,22 +342,26 @@ def rm1_energy(
         for k in range(n_occ):
             P_new += 2.0 * np.outer(C[:, k], C[:, k])
 
-        # Density mixing (damping) for convergence
-        mix = 0.5 if iteration < 5 else 0.3  # mix fraction of new density
-        P_mixed = mix * P_new + (1.0 - mix) * P
-
         # Check convergence
         delta = np.sqrt(np.mean((P_new - P) ** 2))
         if verbose:
-            E_elec = 0.5 * np.sum(P_mixed * (H + F))
+            E_elec = 0.5 * np.sum(P_new * (H + F))
             print(f"  iter {iteration:3d}: dP={delta:.2e}, E_elec={E_elec:.6f} eV")
 
         if delta < conv_tol:
             converged = True
-            P = P_new  # use unmixed for final energy
+            P = P_new
             break
 
-        P = P_mixed
+        # Density mixing (only before DIIS kicks in)
+        if iteration < 2:
+            mix = 0.5
+            P = mix * P_new + (1.0 - mix) * P
+        else:
+            P = P_new
+
+    # Final Fock with converged density
+    F = _build_fock(H, P, info, atoms, coords)
 
     # Electronic energy
     E_elec = 0.5 * np.sum(P * (H + F))
