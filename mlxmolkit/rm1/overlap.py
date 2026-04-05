@@ -35,32 +35,29 @@ def _aintgs(alpha: float, n_max: int = 5) -> np.ndarray:
 def _bintgs(beta: float, n_max: int = 5) -> np.ndarray:
     """B-integrals: b_k(beta).
 
-    For |beta| > 0.5:  b_1 = (exp(beta) - exp(-beta))/beta = 2*sinh(beta)/beta
-                       b_k = (-1)^(k+1) * (exp(beta)+(-1)^k*exp(-beta))/beta + (k-1)*b_{k-1}/beta
-    For |beta| <= 0.5: Taylor series (b_1=2, b_2=0, b_3=2/3, b_4=0, b_5=2/5)
+    b_1 = 2*sinh(beta)/beta
+    b_k = (-1)^(k+1) * 2*cosh_or_sinh/beta + (k-1)*b_{k-1}/beta
+
+    Uses exact recurrence for |beta| > 1e-6, Taylor for smaller.
+    Matches PYSEQM's bintgs() implementation.
     """
     b = np.zeros(n_max)
 
-    if abs(beta) <= 0.5:
-        # Taylor expansion for small beta
+    if abs(beta) < 1e-6:
+        # Exact at beta=0: b_1=2, b_2=0, b_3=2/3, b_4=0, b_5=2/5
         b[0] = 2.0
         b[1] = 0.0
         b[2] = 2.0 / 3.0
         b[3] = 0.0
         b[4] = 2.0 / 5.0
-        # Higher order corrections
-        x2 = beta * beta
-        b[0] += x2 * (1.0 / 3.0 + x2 * (1.0 / 30.0 + x2 / 630.0))
-        b[1] += beta * (2.0 / 3.0 + x2 * (2.0 / 30.0 + x2 * 2.0 / 630.0))
-        b[2] += x2 * (2.0 / 15.0 + x2 * (2.0 / 210.0 + x2 * 2.0 / 5040.0))
-        b[3] += beta * (2.0 / 15.0 + x2 * (2.0 / 105.0 + x2 * 2.0 / 2520.0))
-        b[4] += x2 * (2.0 / 35.0 + x2 * (2.0 / 630.0 + x2 * 2.0 / 17325.0))
         return b
 
     tx = np.exp(beta) / beta
     tmx = -np.exp(-beta) / beta
-    b[0] = tx + tmx
-    b[1] = -tx + tmx + b[0] / beta
+    b[0] = tx + tmx                         # 2*cosh(beta)/beta... wait
+    # Actually: tx = exp(x)/x, tmx = -exp(-x)/x
+    # b1 = tx + tmx = (exp(x) - exp(-x))/x = 2*sinh(x)/x
+    b[1] = -tx + tmx + b[0] / beta          # b2 = -exp(x)/x - exp(-x)/x + b1/x
     b[2] = tx + tmx + 2.0 * b[1] / beta
     b[3] = -tx + tmx + 3.0 * b[2] / beta
     b[4] = tx + tmx + 4.0 * b[3] / beta
@@ -89,8 +86,11 @@ def overlap_local_frame(
     qnB = 1 if pB.Z <= 2 else 2
 
     # s-s overlap
-    alpha_ss = 0.5 * R_bohr * (pA.zeta_s + pB.zeta_s)
-    beta_ss = 0.5 * R_bohr * (pA.zeta_s - pB.zeta_s)
+    # MOPAC/PYSEQM convention: z1 = zeta_B (lighter/second), z2 = zeta_A (heavier/first)
+    # alpha = 0.5*R*(z1+z2), beta = 0.5*R*(z1-z2)
+    # This means beta = 0.5*R*(zeta_B - zeta_A) — OPPOSITE sign from natural order
+    alpha_ss = 0.5 * R_bohr * (pB.zeta_s + pA.zeta_s)  # same either way
+    beta_ss = 0.5 * R_bohr * (pB.zeta_s - pA.zeta_s)   # PYSEQM: z1-z2 = zetaB-zetaA
     A_ss = _aintgs(alpha_ss)
     B_ss = _bintgs(beta_ss)
 
@@ -108,8 +108,8 @@ def overlap_local_frame(
 
         # (2pσ|1s): PYSEQM S211 jcall==3, divisor = 8
         if nA > 1:
-            alpha_ps = 0.5 * R_bohr * (pA.zeta_p + pB.zeta_s)
-            beta_ps = 0.5 * R_bohr * (pA.zeta_p - pB.zeta_s)
+            alpha_ps = 0.5 * R_bohr * (pB.zeta_s + pA.zeta_p)
+            beta_ps = 0.5 * R_bohr * (pB.zeta_s - pA.zeta_p)
             A_ps = _aintgs(alpha_ps)
             B_ps = _bintgs(beta_ps)
 
@@ -134,8 +134,8 @@ def overlap_local_frame(
 
         if nA > 1 and nB > 1:
             # (2pσ|2s): PYSEQM S211 jcall==4, divisor = 16*sqrt(3)
-            alpha_ps = 0.5 * R_bohr * (pA.zeta_p + pB.zeta_s)
-            beta_ps = 0.5 * R_bohr * (pA.zeta_p - pB.zeta_s)
+            alpha_ps = 0.5 * R_bohr * (pB.zeta_s + pA.zeta_p)
+            beta_ps = 0.5 * R_bohr * (pB.zeta_s - pA.zeta_p)
             A_ps = _aintgs(alpha_ps)
             B_ps = _bintgs(beta_ps)
 
@@ -147,8 +147,8 @@ def overlap_local_frame(
                       / (16.0 * np.sqrt(3.0)))
 
             # (2s|2pσ): PYSEQM S121 jcall==4
-            alpha_sp = 0.5 * R_bohr * (pA.zeta_s + pB.zeta_p)
-            beta_sp = 0.5 * R_bohr * (pA.zeta_s - pB.zeta_p)
+            alpha_sp = 0.5 * R_bohr * (pB.zeta_p + pA.zeta_s)
+            beta_sp = 0.5 * R_bohr * (pB.zeta_p - pA.zeta_s)
             A_sp = _aintgs(alpha_sp)
             B_sp = _bintgs(beta_sp)
 
@@ -160,8 +160,8 @@ def overlap_local_frame(
                        / (16.0 * np.sqrt(3.0)))
 
             # (2pσ|2pσ): PYSEQM S221 jcall==4, divisor = 48
-            alpha_pp = 0.5 * R_bohr * (pA.zeta_p + pB.zeta_p)
-            beta_pp = 0.5 * R_bohr * (pA.zeta_p - pB.zeta_p)
+            alpha_pp = 0.5 * R_bohr * (pB.zeta_p + pA.zeta_p)
+            beta_pp = 0.5 * R_bohr * (pB.zeta_p - pA.zeta_p)
             A_pp = _aintgs(alpha_pp)
             B_pp = _bintgs(beta_pp)
 
