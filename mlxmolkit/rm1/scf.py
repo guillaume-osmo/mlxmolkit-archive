@@ -235,11 +235,10 @@ def _build_fock(H, P, info, atoms, coords):
                             F[mu, nu] += P[lam, sig] * wval
                             # Coulomb on B from A's density
                             F[lam, sig] += P[mu, nu] * wval
-                            # Exchange A-B
+                            # Exchange A-B (both triangles)
                             F[mu, lam] -= 0.5 * P[nu, sig] * wval
+                            F[lam, mu] -= 0.5 * P[sig, nu] * wval
 
-    # Ensure symmetry
-    F = 0.5 * (F + F.T)
     return F
 
 
