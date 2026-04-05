@@ -71,8 +71,10 @@ GPU memory stays constant regardless of total conformers thanks to divide-and-co
 | N=1000, k=10 | DG + ETK + MMFF | 8.0s | **1,250 conf/s** | 99.7% |
 | N=10000, k=1 | DG + ETK | 17.7s | **565 conf/s** | 99.6% |
 | N=10000, k=1 | DG + ETK + MMFF | 37.9s | **264 conf/s** | 99.6% |
+| **N=10000, k=10** | **DG + ETK** | **38.1s** | **2,625 conf/s** | **99.7%** |
+| **N=10000, k=10** | **DG + ETK + MMFF** | **67.9s** | **1,473 conf/s** | **99.7%** |
 
-All stages run on Metal GPU (including MMFF94 — zero RDKit post-processing). Single GPU batch, divide-and-conquer for larger workloads.
+100,000 conformers in a single GPU batch. All stages on Metal (including MMFF94 — zero RDKit post-processing).
 
 ### Batch Size Impact (N=20, k=50, C=1000)
 
