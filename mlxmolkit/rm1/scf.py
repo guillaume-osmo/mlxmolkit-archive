@@ -467,6 +467,9 @@ def rm1_energy_batch(
         nb = batch.n_basis_arr[mol_idx]
         nocc = batch.n_occ_arr[mol_idx]
         H = batch.H_core[mol_idx, :nb, :nb]
+        if not np.all(np.isfinite(H)):
+            # NaN in Hcore — skip this molecule (will not converge)
+            continue
         eigvals, C = np.linalg.eigh(H)
         batch.P[mol_idx, :nb, :nb] = 2.0 * C[:, :nocc] @ C[:, :nocc].T
 
@@ -540,8 +543,15 @@ def rm1_energy_batch(
                     except np.linalg.LinAlgError:
                         pass
 
-            # Diagonalize
-            eigvals, C = np.linalg.eigh(F)
+            # Diagonalize (guard NaN)
+            if not np.all(np.isfinite(F)):
+                converged_arr[mol_idx] = False
+                continue
+            try:
+                eigvals, C = np.linalg.eigh(F)
+            except np.linalg.LinAlgError:
+                converged_arr[mol_idx] = False
+                continue
             P_new = 2.0 * C[:, :nocc] @ C[:, :nocc].T
 
             # Check convergence

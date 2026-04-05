@@ -78,8 +78,10 @@ def _bintgs(beta: float, n_max: int = 5) -> np.ndarray:
         return b
 
     # Exact recurrence for |beta| > 0.5
-    tx = np.exp(x) / x
-    tmx = -np.exp(-x) / x
+    # Clamp to avoid overflow for very large |beta|
+    x_clamped = np.clip(x, -500.0, 500.0)
+    tx = np.exp(x_clamped) / x
+    tmx = -np.exp(-x_clamped) / x
     b[0] = tx + tmx                          # 2*sinh(beta)/beta
     b[1] = -tx + tmx + b[0] / x
     b[2] = tx + tmx + 2.0 * b[1] / x

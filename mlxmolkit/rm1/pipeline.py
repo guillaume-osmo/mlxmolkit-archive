@@ -63,17 +63,23 @@ def rm1_from_smiles(
     conv_tol: float = 1e-6,
     seed: int = 42,
     method: str = 'RM1',
+    optimize: bool = False,
+    opt_max_iter: int = 50,
+    opt_grad_tol: float = 0.005,
 ) -> Optional[dict]:
     """Compute NDDO energy from SMILES string.
 
-    Pipeline: SMILES → RDKit AddHs + ETKDG + MMFF → SCF
+    Pipeline: SMILES → RDKit AddHs + ETKDG + MMFF → [geometry opt] → SCF
 
     Args:
         smiles: SMILES string
         max_iter: max SCF iterations
         conv_tol: convergence threshold
         seed: random seed for 3D embedding
-        method: 'RM1', 'AM1', or 'AM1_STAR'
+        method: 'RM1', 'AM1', 'AM1_STAR', 'RM1_STAR'
+        optimize: if True, optimize geometry with L-BFGS before final energy
+        opt_max_iter: max geometry optimization steps
+        opt_grad_tol: gradient convergence (eV/Angstrom)
 
     Returns:
         Result dict with energies, or None if 3D generation fails.
@@ -94,7 +100,20 @@ def rm1_from_smiles(
         if z not in PARAMS:
             return None  # unsupported element
 
-    result = rm1_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
+    if optimize:
+        from .gradient import nddo_optimize
+        opt_result = nddo_optimize(
+            atoms, coords, max_iter=opt_max_iter,
+            grad_tol=opt_grad_tol, method=method,
+        )
+        coords = opt_result['coords']
+        result = rm1_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
+        result['opt_converged'] = opt_result['converged']
+        result['opt_n_iter'] = opt_result['n_iter']
+        result['opt_grad_rms'] = opt_result['grad_rms']
+    else:
+        result = rm1_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
+
     result['smiles'] = smiles
     result['atoms'] = atoms
     result['coords'] = coords
