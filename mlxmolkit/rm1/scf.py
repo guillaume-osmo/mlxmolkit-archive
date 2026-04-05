@@ -20,6 +20,7 @@ from .integrals import (
     _charge_separations,
     EV,
 )
+from .two_center_integrals import two_center_integrals
 
 
 def _build_basis_info(atoms: list[int]):
@@ -222,39 +223,134 @@ def _build_fock(H, P, info, atoms, coords):
                     F[pk, pl] += P[pk, pl] * (0.5 * (p.gpp - p.gp2) - 0.5 * p.gp2)
                     F[pl, pk] = F[pk, pl]
 
-    # === Two-center Coulomb contribution ===
-    # For each atom pair (A,B):
-    #   F[μ_A, μ_A] += Σ_{λ on B} P[λ,λ] * (μ_A μ_A | λ_B λ_B)
-    # Using (ss|ss) as the dominant two-center integral
+    # === Two-center contribution using full 22-integral set ===
     for i in range(n_atoms):
-        for j in range(n_atoms):
-            if i == j:
-                continue
+        for j in range(i + 1, n_atoms):
             pA = params[i]
             pB = params[j]
             R = np.linalg.norm(coords[i] - coords[j])
-            R_bohr = R * ANG_TO_BOHR
+            if R < 1e-10:
+                continue
 
-            rho0A = 0.5 * EV / pA.gss if pA.gss > 0 else 0.0
-            rho0B = 0.5 * EV / pB.gss if pB.gss > 0 else 0.0
-            aee = (rho0A + rho0B) ** 2
-            ssss = EV / np.sqrt(R_bohr ** 2 + aee)
+            ri, core, pair_type = two_center_integrals(pA, pB, R)
 
-            # Total density on atom B
-            PB_total = 0.0
-            for lb in range(pB.n_basis):
-                PB_total += P[starts[j] + lb, starts[j] + lb]
+            sA = starts[i]
+            sB = starts[j]
 
-            # Coulomb: each orbital on A feels density on B
-            for ma in range(pA.n_basis):
-                mu = starts[i] + ma
-                F[mu, mu] += PB_total * ssss
+            if pair_type == 'HH':
+                # (ss_A|ss_B)
+                F[sA, sA] += P[sB, sB] * ri[0]
+                F[sB, sB] += P[sA, sA] * ri[0]
+                F[sA, sB] -= 0.5 * P[sA, sB] * ri[0]
+                F[sB, sA] = F[sA, sB]
 
-            # Exchange: inter-atom exchange (NDDO: only s-s)
-            s_i = starts[i]
-            s_j = starts[j]
-            # F[s_A, s_B] -= 0.5 * P[s_A, s_B] * (s_A s_A | s_B s_B)
-            F[s_i, s_j] -= 0.5 * P[s_i, s_j] * ssss
+            elif pair_type == 'XH':
+                # A=heavy, B=H: 4 integrals
+                # ri[0]=(ss|ss), ri[1]=(sσ|ss), ri[2]=(σσ|ss), ri[3]=(ππ|ss)
+                Pss_B = P[sB, sB]
+
+                # Coulomb on A from B's density
+                F[sA, sA] += Pss_B * ri[0]              # s_A feels ss
+                if pA.n_basis > 1:
+                    # Direction cosines for p orbitals
+                    dx = (coords[j] - coords[i]) / R
+                    # σ component (along bond): weighted combination of px,py,pz
+                    for k in range(1, 4):
+                        pk = sA + k
+                        F[pk, pk] += Pss_B * (ri[2] * dx[k-1]**2 + ri[3] * (1.0 - dx[k-1]**2))
+                    # s-σ cross term
+                    for k in range(1, 4):
+                        pk = sA + k
+                        F[sA, pk] += Pss_B * ri[1] * dx[k-1]
+                        F[pk, sA] = F[sA, pk]
+
+                # Coulomb on B from A's density
+                PA_total = sum(P[sA + k, sA + k] for k in range(pA.n_basis))
+                F[sB, sB] += PA_total * ri[0]
+
+                # Exchange s_A-s_B
+                F[sA, sB] -= 0.5 * P[sA, sB] * ri[0]
+                F[sB, sA] = F[sA, sB]
+
+            elif pair_type == 'HX':
+                # A=H, B=heavy — swap and handle
+                ri_swap, core_swap, _ = two_center_integrals(pB, pA, R)
+                Pss_A = P[sA, sA]
+
+                F[sB, sB] += Pss_A * ri_swap[0]
+                if pB.n_basis > 1:
+                    dx = (coords[i] - coords[j]) / R
+                    for k in range(1, 4):
+                        pk = sB + k
+                        F[pk, pk] += Pss_A * (ri_swap[2] * dx[k-1]**2 + ri_swap[3] * (1.0 - dx[k-1]**2))
+                    for k in range(1, 4):
+                        pk = sB + k
+                        F[sB, pk] += Pss_A * ri_swap[1] * dx[k-1]
+                        F[pk, sB] = F[sB, pk]
+
+                PB_total = sum(P[sB + k, sB + k] for k in range(pB.n_basis))
+                F[sA, sA] += PB_total * ri_swap[0]
+
+                F[sA, sB] -= 0.5 * P[sA, sB] * ri_swap[0]
+                F[sB, sA] = F[sA, sB]
+
+            elif pair_type == 'XX':
+                # Heavy-Heavy: full 22 integrals
+                dx = (coords[j] - coords[i]) / R
+                nA = pA.n_basis
+                nB = pB.n_basis
+
+                # Coulomb: F[μ_A,μ_A] += Σ_λ P[λ_B,λ_B] * (μ_A μ_A | λ_B λ_B)
+                # For each orbital type on A and B, use appropriate integral
+                for ma in range(nA):
+                    mu = sA + ma
+                    for lb in range(nB):
+                        lam = sB + lb
+                        # Map (type_mu, type_lam) to integral index
+                        # Simplified: use (ss|ss) for s-s, (pp|ss)/(ss|pp) for s-p, (pp|pp) for p-p
+                        if ma == 0 and lb == 0:
+                            integral = ri[0]   # (SS|SS)
+                        elif ma == 0 and lb > 0:
+                            integral = ri[10] * dx[lb-1]**2 + ri[11] * (1.0 - dx[lb-1]**2)  # (SS|OO)/(SS|PP)
+                        elif ma > 0 and lb == 0:
+                            integral = ri[2] * dx[ma-1]**2 + ri[3] * (1.0 - dx[ma-1]**2)  # (OO|SS)/(PP|SS)
+                        else:
+                            # p-p: use (PP|PP) as average
+                            integral = ri[18] * dx[ma-1]**2 * dx[lb-1]**2 \
+                                     + ri[16] * (dx[ma-1]**2 * (1-dx[lb-1]**2) + (1-dx[ma-1]**2) * dx[lb-1]**2) / 2 \
+                                     + ri[20] * (1-dx[ma-1]**2) * (1-dx[lb-1]**2)
+                        F[mu, mu] += P[lam, lam] * integral
+
+                # Same for B← A
+                for mb in range(nB):
+                    nu = sB + mb
+                    for la in range(nA):
+                        lam = sA + la
+                        if mb == 0 and la == 0:
+                            integral = ri[0]
+                        elif mb == 0 and la > 0:
+                            integral = ri[2] * dx[la-1]**2 + ri[3] * (1.0 - dx[la-1]**2)
+                        elif mb > 0 and la == 0:
+                            integral = ri[10] * dx[mb-1]**2 + ri[11] * (1.0 - dx[mb-1]**2)
+                        else:
+                            integral = ri[18] * dx[mb-1]**2 * dx[la-1]**2 \
+                                     + ri[16] * (dx[mb-1]**2 * (1-dx[la-1]**2) + (1-dx[mb-1]**2) * dx[la-1]**2) / 2 \
+                                     + ri[20] * (1-dx[mb-1]**2) * (1-dx[la-1]**2)
+                        F[nu, nu] += P[lam, lam] * integral
+
+                # Exchange: F[μ_A, λ_B] -= 0.5 * P[μ_A, λ_B] * (μ_A μ_A | λ_B λ_B)
+                for ma in range(nA):
+                    for lb in range(nB):
+                        mu = sA + ma
+                        lam = sB + lb
+                        if ma == 0 and lb == 0:
+                            exch = ri[0]
+                        elif (ma == 0 and lb > 0) or (ma > 0 and lb == 0):
+                            exch = ri[0] * 0.5  # approximate
+                        else:
+                            exch = ri[6]  # (SP|SP) for p-p exchange
+                        F[mu, lam] -= 0.5 * P[mu, lam] * exch
+                        F[lam, mu] = F[mu, lam]
 
     return F
 
