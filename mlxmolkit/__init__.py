@@ -6,7 +6,7 @@ Two pipelines:
   2. Molecular clustering: Morgan FP → Tanimoto → Butina
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # --- Clustering ---
 from mlxmolkit.tanimoto_metal_u32 import tanimoto_matrix_metal_u32

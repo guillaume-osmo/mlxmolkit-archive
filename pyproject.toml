@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlxmolkit-rdkit"
-version = "0.3.0"
+version = "0.4.0"
 description = "GPU-accelerated molecular toolkit on Apple Silicon: conformer generation (ETKDG + MMFF94) and Butina clustering via Metal/MLX"
 readme = "README.md"
 license = {text = "MIT"}
