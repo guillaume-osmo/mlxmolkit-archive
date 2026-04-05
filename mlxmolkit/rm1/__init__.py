@@ -15,4 +15,5 @@ Usage:
 
 from .params import RM1_PARAMS
 from .scf import rm1_energy, rm1_energy_batch
+from .pipeline import rm1_from_smiles, rm1_from_smiles_batch
 from .gradient import rm1_gradient, rm1_optimize
