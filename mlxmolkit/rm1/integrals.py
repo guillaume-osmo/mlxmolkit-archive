@@ -271,7 +271,7 @@ def compute_nuclear_repulsion(
         for j in range(i + 1, n_atoms):
             pA = params[i]
             pB = params[j]
-            R = np.linalg.norm(coords[i] - coords[j])
+            R = np.linalg.norm(coords[i] - coords[j])  # Angstrom
             R_bohr = R * ANG_TO_BOHR
 
             # (ss|ss) integral
@@ -283,17 +283,25 @@ def compute_nuclear_repulsion(
             ZA = pA.n_valence
             ZB = pB.n_valence
 
-            # Core repulsion with alpha scaling
-            scale = np.exp(-pA.alpha * R) + np.exp(-pB.alpha * R)
+            # MOPAC/PYSEQM AM1 convention:
+            # t1 = Z_A * Z_B * (ss|ss)
+            # t2 = exp(-alpha_A * R_angstrom)
+            # t3 = exp(-alpha_B * R_angstrom)
+            # Gaussian: t4 = Z_A * Z_B / R_angstrom (Coulomb-like, NOT ssss)
+            # t5 = Σ K_A * exp(-L_A * (R_ang - M_A)²)
+            # t6 = Σ K_B * exp(-L_B * (R_ang - M_B)²)
+            # E_nuc_pair = t1 * (1 + t2 + t3) + t4 * (t5 + t6)
 
-            # Gaussian corrections
-            gauss_correction = 0.0
-            for k in range(4):
-                if pA.gauss_K[k] != 0:
-                    gauss_correction += pA.gauss_K[k] * np.exp(-pA.gauss_L[k] * (R - pA.gauss_M[k]) ** 2)
-                if pB.gauss_K[k] != 0:
-                    gauss_correction += pB.gauss_K[k] * np.exp(-pB.gauss_L[k] * (R - pB.gauss_M[k]) ** 2)
+            t1 = ZA * ZB * ssss
+            t2 = np.exp(-pA.alpha * R)
+            t3 = np.exp(-pB.alpha * R)
 
-            E_nuc += ZA * ZB * ssss * (1.0 + scale + gauss_correction)
+            t4 = ZA * ZB / R  # Coulomb Z*Z/R in Angstrom (eV·A units from Gaussian terms)
+            t5 = sum(pA.gauss_K[k] * np.exp(-pA.gauss_L[k] * (R - pA.gauss_M[k]) ** 2)
+                    for k in range(4) if pA.gauss_K[k] != 0)
+            t6 = sum(pB.gauss_K[k] * np.exp(-pB.gauss_L[k] * (R - pB.gauss_M[k]) ** 2)
+                    for k in range(4) if pB.gauss_K[k] != 0)
+
+            E_nuc += t1 * (1.0 + t2 + t3) + t4 * (t5 + t6)
 
     return E_nuc
