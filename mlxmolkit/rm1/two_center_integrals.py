@@ -25,31 +25,86 @@ EV = 27.21  # Hartree to eV (MOPAC convention)
 def _compute_multipole_params(p: ElementParams) -> tuple[float, float, float, float, float]:
     """Compute charge separations and additive terms for one atom.
 
+    Exact port of PYSEQM's cal_par.py (dd_qq, additive_term_rho1, rho2).
+
     Returns: da, qa, rho0, rho1, rho2
     """
-    # Additive terms from one-center integrals
-    am = p.gss / EV
-    rho0 = 0.5 / am if am > 1e-10 else 0.0
+    # rho0: monopole additive term = 0.5*ev/gss (PYSEQM line 240)
+    rho0 = 0.5 * EV / p.gss if p.gss > 1e-10 else 0.0
 
     if p.n_basis == 1:
         return 0.0, 0.0, rho0, 0.0, 0.0
 
-    # Dipole charge separation
     qn = 2 if p.Z > 2 else 1
-    n2 = 2 * qn + 1
-    da = n2 * np.sqrt(p.zeta_s * p.zeta_p) / ((p.zeta_s + p.zeta_p) ** 2 * np.sqrt(3.0))
+    zs = p.zeta_s
+    zp = p.zeta_p
 
-    # Quadrupole charge separation
-    qa = np.sqrt(n2 * (n2 - 1)) / (4.0 * p.zeta_p * np.sqrt(5.0))
+    # ================================================================
+    # Charge separations: exact PYSEQM dd_qq formula (cal_par.py)
+    # dd = (2*qn+1) * (4*zs*zp)^(qn+0.5) / (zs+zp)^(2*qn+2) / sqrt(3)
+    # qq = sqrt((4*qn^2 + 6*qn + 2) / 20) / zp
+    # ================================================================
+    da = ((2.0 * qn + 1.0)
+          * (4.0 * zs * zp) ** (qn + 0.5)
+          / (zs + zp) ** (2.0 * qn + 2.0)
+          / np.sqrt(3.0))
+    qa = np.sqrt((4.0 * qn ** 2 + 6.0 * qn + 2.0) / 20.0) / zp
 
-    # Dipole additive term
-    ad = p.hsp / EV if p.hsp > 0 else 1e10
-    rho1 = 0.5 / ad if ad < 1e9 else 0.0
+    # ================================================================
+    # rho1: dipole additive term — Newton solver (PYSEQM additive_term_rho1)
+    # Solves: hsp = ev * (d/2 - 1/2/sqrt(4*D1^2 + 1/d^2))  for d
+    # Then rho1 = 0.5/d
+    # ================================================================
+    if p.hsp > 0:
+        hsp_au = p.hsp / EV  # convert to atomic units
+        D1 = da
+        # Initial guess
+        d1 = abs(hsp_au / D1 ** 2) ** (1.0 / 3.0)
+        if hsp_au < 0:
+            d1 = -d1
+        d2 = d1 + 0.04
+        for _ in range(5):
+            hsp1 = 0.5 * d1 - 0.5 / np.sqrt(4.0 * D1 ** 2 + 1.0 / d1 ** 2)
+            hsp2 = 0.5 * d2 - 0.5 / np.sqrt(4.0 * D1 ** 2 + 1.0 / d2 ** 2)
+            if abs(hsp2 - hsp1) > 1e-16:
+                d3 = d1 + (d2 - d1) * (hsp_au - hsp1) / (hsp2 - hsp1)
+            else:
+                d3 = d2
+            d1, d2 = d2, d3
+        rho1 = 0.5 / d2
+    else:
+        rho1 = 0.0
 
-    # Quadrupole additive term
-    dd = p.gpp - p.gp2
-    aq = dd / EV if dd > 0 else 1e10
-    rho2 = 0.5 / aq if aq < 1e9 else 0.0
+    # ================================================================
+    # rho2: quadrupole additive term — Newton/secant solver
+    # (PYSEQM additive_term_rho2)
+    # hpp = 0.5*(gpp-gp2), clamped to min 0.1
+    # Solves: hpp = ev * (q/4 - 1/2/sqrt(4*D2^2+1/q^2)
+    #                     + 1/4/sqrt(8*D2^2+1/q^2))
+    # rho2 = 0.5/q
+    # ================================================================
+    hpp = 0.5 * (p.gpp - p.gp2)
+    hpp = max(hpp, 0.1)  # clamp_min(0.1) from PYSEQM
+    hpp_au = hpp / EV
+    D2 = qa
+    # Initial guess
+    q1 = abs(hpp_au / 3.0 / D2 ** 4) ** 0.2
+    if hpp_au < 0:
+        q1 = -q1
+    q2 = q1 + 0.04
+    for _ in range(5):
+        hpp1 = (0.25 * q1
+                - 0.5 / np.sqrt(4.0 * D2 ** 2 + 1.0 / q1 ** 2)
+                + 0.25 / np.sqrt(8.0 * D2 ** 2 + 1.0 / q1 ** 2))
+        hpp2 = (0.25 * q2
+                - 0.5 / np.sqrt(4.0 * D2 ** 2 + 1.0 / q2 ** 2)
+                + 0.25 / np.sqrt(8.0 * D2 ** 2 + 1.0 / q2 ** 2))
+        if abs(hpp2 - hpp1) > 1e-16:
+            q3 = q1 + (q2 - q1) * (hpp_au - hpp1) / (hpp2 - hpp1)
+        else:
+            q3 = q2
+        q1, q2 = q2, q3
+    rho2 = 0.5 / q2
 
     return da, qa, rho0, rho1, rho2
 

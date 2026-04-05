@@ -183,22 +183,28 @@ def _build_fock(H, P, info, atoms, coords):
 
             F[s, s] += Pss * p.gss * 0.5 + Ppp_total * (p.gsp - 0.5 * p.hsp)
 
-            for k in range(1, 4):
-                pk = idx[k]
-                F[pk, pk] += Pss * (p.gsp - 0.5 * p.hsp) + \
-                             P[pk, pk] * p.gpp * 0.5 + \
-                             (Ppp_total - P[pk, pk]) * (p.gp2 - 0.5 * (p.gpp - p.gp2))
+            # PYSEQM-verified one-center factors (fock.py _one_center):
+            sp_fac_1 = p.gsp - 0.5 * p.hsp
+            sp_fac_2 = 1.5 * p.hsp - 0.5 * p.gsp
+            pp_fac_d = 1.25 * p.gp2 - 0.25 * p.gpp
+            pp_fac_off = 0.75 * p.gpp - 1.25 * p.gp2
 
             for k in range(1, 4):
                 pk = idx[k]
-                F[s, pk] += P[s, pk] * (2.0 * p.hsp - 0.5 * p.gsp)
-                F[pk, s] = F[s, pk]
+                F[pk, pk] += (Pss * sp_fac_1
+                              + P[pk, pk] * p.gpp * 0.5
+                              + (Ppp_total - P[pk, pk]) * pp_fac_d)
+
+            for k in range(1, 4):
+                pk = idx[k]
+                F[s, pk] += P[s, pk] * sp_fac_2
+                F[pk, s] += P[pk, s] * sp_fac_2
 
             for k in range(1, 4):
                 for l in range(k + 1, 4):
                     pk, pl = idx[k], idx[l]
-                    F[pk, pl] += P[pk, pl] * (0.5 * (p.gpp - p.gp2) - 0.5 * p.gp2)
-                    F[pl, pk] = F[pk, pl]
+                    F[pk, pl] += P[pk, pl] * pp_fac_off
+                    F[pl, pk] += P[pl, pk] * pp_fac_off
 
     # === Two-center contribution with proper rotation ===
     for i in range(n_atoms):
@@ -390,31 +396,11 @@ def rm1_energy(
     # Total energy
     E_total = E_elec + E_nuc
 
-    # Heat of formation (exact MOPAC formula):
+    # Heat of formation:
     # ΔHf = E_total - Σ Eisol(atom) + Σ eheat(atom)
-    # where Eisol uses MOPAC's exact occupation-dependent coefficients
-    _IOS_IOP = {1:(1,0), 6:(2,2), 7:(2,3), 8:(2,4), 9:(2,5),
-                15:(2,3), 16:(2,4), 17:(2,5), 35:(2,5), 53:(2,5)}
-
-    E_isol_total = 0.0
-    eheat_total = 0.0
-    for z in atoms:
-        p = RM1_PARAMS[z]
-        ns, np_ = _IOS_IOP.get(z, (min(p.n_valence, 2), p.n_valence - min(p.n_valence, 2)))
-        # MOPAC Eisol coefficients
-        gssc = max(ns - 1, 0)
-        k = np_
-        gspc = ns * k
-        l = min(k, 6 - k)
-        gp2c = (k * (k - 1)) // 2 + 0.5 * (l * (l - 1)) // 2
-        gppc = -0.5 * (l * (l - 1)) // 2
-        hspc = -k * ns * 0.5
-
-        eisol = (p.Uss * ns + p.Upp * np_
-               + p.gss * gssc + p.gpp * gppc + p.gsp * gspc
-               + p.gp2 * gp2c + p.hsp * hspc)
-        E_isol_total += eisol
-        eheat_total += p.eheat
+    # Eisol computed using PYSEQM/MOPAC coefficients (in params.py)
+    E_isol_total = sum(RM1_PARAMS[z].eisol for z in atoms)
+    eheat_total = sum(RM1_PARAMS[z].eheat for z in atoms)
 
     E_binding_eV = E_total - E_isol_total
     E_hof_eV = E_binding_eV + eheat_total / EV_TO_KCAL

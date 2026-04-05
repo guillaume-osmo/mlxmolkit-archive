@@ -293,8 +293,19 @@ def compute_nuclear_repulsion(
             # E_nuc_pair = t1 * (1 + t2 + t3) + t4 * (t5 + t6)
 
             t1 = ZA * ZB * ssss
+
+            # MOPAC special case: N-H and O-H pairs
+            # exp(-alpha*R) becomes exp(-alpha*R)*R for the heavy atom
+            # PYSEQM: XH = ((ni==7)|(ni==8)) & (nj==1)
+            is_NH_OH_A = (pA.Z in (7, 8)) and (pB.Z == 1)
+            is_NH_OH_B = (pB.Z in (7, 8)) and (pA.Z == 1)
+
             t2 = np.exp(-pA.alpha * R)
+            if is_NH_OH_A:
+                t2 *= R  # special N-H/O-H convention
             t3 = np.exp(-pB.alpha * R)
+            if is_NH_OH_B:
+                t3 *= R  # special N-H/O-H convention
 
             t4 = ZA * ZB / R  # Coulomb Z*Z/R in Angstrom (eV·A units from Gaussian terms)
             t5 = sum(pA.gauss_K[k] * np.exp(-pA.gauss_L[k] * (R - pA.gauss_M[k]) ** 2)

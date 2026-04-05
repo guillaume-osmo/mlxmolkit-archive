@@ -192,3 +192,39 @@ SYMBOL_TO_Z = {p.symbol: p.Z for p in RM1_PARAMS.values()}
 EV_TO_KCAL = 23.061      # 1 eV = 23.061 kcal/mol
 BOHR_TO_ANG = 0.529167   # 1 bohr = 0.529167 Angstrom
 ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
+
+
+# ================================================================
+# Compute Eisol for each element using PYSEQM/MOPAC coefficients
+# Eisol = ussc*Uss + uppc*Upp + gssc*gss + gppc*gpp + gspc*gsp
+#         + gp2c*gp2 + hspc*hsp
+# Coefficients from PYSEQM Constants (calpar.f90):
+# ================================================================
+_EISOL_COEFFICIENTS = {
+    # Z: (ussc, uppc, gssc, gppc, gspc, gp2c, hspc)
+    1:  (1.0,  0.0,  0.0,   0.0,   0.0,  0.0,   0.0),     # H: 1s^1
+    6:  (2.0,  2.0,  1.0,  -0.5,   4.0,  1.5,  -2.0),     # C: 2s^2 2p^2
+    7:  (2.0,  3.0,  1.0,  -1.5,   6.0,  4.5,  -3.0),     # N: 2s^2 2p^3
+    8:  (2.0,  4.0,  1.0,  -0.5,   8.0,  6.5,  -4.0),     # O: 2s^2 2p^4
+    9:  (2.0,  5.0,  1.0,   0.5,  10.0,  9.5,  -5.0),     # F: 2s^2 2p^5
+    15: (2.0,  3.0,  1.0,  -1.5,   6.0,  4.5,  -3.0),     # P: 3s^2 3p^3 (same as N)
+    16: (2.0,  4.0,  1.0,  -0.5,   8.0,  6.5,  -4.0),     # S: 3s^2 3p^4 (same as O)
+    17: (2.0,  5.0,  1.0,   0.5,  10.0,  9.5,  -5.0),     # Cl: 3s^2 3p^5 (same as F)
+    35: (2.0,  5.0,  1.0,   0.5,  10.0,  9.5,  -5.0),     # Br: same as Cl
+    53: (2.0,  5.0,  1.0,   0.5,  10.0,  9.5,  -5.0),     # I: same as Cl
+}
+
+
+def _compute_eisol(p: ElementParams) -> float:
+    """Compute isolated atom electronic energy using MOPAC/PYSEQM coefficients."""
+    if p.Z not in _EISOL_COEFFICIENTS:
+        return 0.0
+    ussc, uppc, gssc, gppc, gspc, gp2c, hspc = _EISOL_COEFFICIENTS[p.Z]
+    return (ussc * p.Uss + uppc * p.Upp
+            + gssc * p.gss + gppc * p.gpp + gspc * p.gsp
+            + gp2c * p.gp2 + hspc * p.hsp)
+
+
+# Set Eisol for all elements
+for _z, _p in RM1_PARAMS.items():
+    _p.eisol = _compute_eisol(_p)
