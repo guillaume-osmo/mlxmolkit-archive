@@ -1,5 +1,14 @@
-__version__ = "0.2.0"
+"""
+mlxmolkit — GPU-accelerated molecular toolkit on Apple Silicon.
 
+Two pipelines:
+  1. Conformer generation: DG (4D) → ETK (3D) → MMFF94 optimization
+  2. Molecular clustering: Morgan FP → Tanimoto → Butina
+"""
+
+__version__ = "0.3.0"
+
+# --- Clustering ---
 from mlxmolkit.tanimoto_metal_u32 import tanimoto_matrix_metal_u32
 from mlxmolkit.fused_tanimoto_nlist import fused_neighbor_list_metal
 from mlxmolkit.tanimoto_blockwise import tanimoto_neighbors_blockwise
@@ -12,7 +21,19 @@ from mlxmolkit.butina import (
 )
 from mlxmolkit.morgan_cpu import morgan_fp_bytes_from_mols, morgan_fp_bytes_from_smiles
 
+# --- Conformer generation ---
+from mlxmolkit.conformer_pipeline_v2 import (
+    generate_conformers_nk,
+    ConformerResult,
+    PipelineResult,
+)
+
 __all__ = [
+    # Conformer generation
+    "generate_conformers_nk",
+    "ConformerResult",
+    "PipelineResult",
+    # Clustering
     "tanimoto_matrix_metal_u32",
     "fused_neighbor_list_metal",
     "tanimoto_neighbors_blockwise",

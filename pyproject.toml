@@ -1,15 +1,54 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlxmolkit"
-version = "0.1.0"
-description = "MLX/Metal-first molecular kernels: Tanimoto + Butina (phase 1 of nvMolKit port)"
+version = "0.3.0"
+description = "GPU-accelerated molecular toolkit on Apple Silicon: conformer generation (ETKDG + MMFF94) and Butina clustering via Metal/MLX"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
-dependencies = ["mlx", "numpy"]
+authors = [
+    {name = "Guillaume Osmo"},
+]
+keywords = ["molecular", "conformer", "ETKDG", "MMFF94", "clustering", "Tanimoto", "Butina", "MLX", "Metal", "Apple Silicon", "GPU"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "mlx>=0.10.0",
+    "numpy>=1.24.0",
+]
+
 [project.optional-dependencies]
+rdkit = ["rdkit"]
 test = ["pytest", "rdkit"]
+all = ["rdkit"]
+
+[project.urls]
+Homepage = "https://github.com/guillaume-osmo/mlxmolkit"
+Repository = "https://github.com/guillaume-osmo/mlxmolkit"
+Issues = "https://github.com/guillaume-osmo/mlxmolkit/issues"
 
 [tool.setuptools.packages.find]
 include = ["mlxmolkit"]
+
+[tool.setuptools.package-data]
+mlxmolkit = ["*.metal"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
