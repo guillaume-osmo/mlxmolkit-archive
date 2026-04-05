@@ -196,44 +196,59 @@ def _get_fock_batch_kernel():
     return _fock_batch_kernel
 
 
+class MetalFockContext:
+    """Pre-allocated GPU buffers for batch Fock kernel.
+
+    Upload static data ONCE, only update P each SCF iteration.
+    """
+    def __init__(self, batch):
+        N = batch.n_mols
+        MB = batch.max_basis
+        MA = batch.max_atoms
+        self.N = N
+        self.MB = MB
+        self.MA = MA
+        self.n_elements = N * MB * MB
+
+        # Static buffers — uploaded ONCE to GPU
+        self._H_core = mx.array(batch.H_core.flatten().astype(np.float32))
+        self._w = mx.array(batch.w.flatten().astype(np.float32))
+        self._atom_params = mx.array(batch.atom_params.flatten().astype(np.float32))
+        self._atom_map = mx.array(batch.atom_map.flatten().astype(np.int32))
+        self._type_map = mx.array(batch.type_map.flatten().astype(np.int32))
+        self._atom_starts = mx.array(batch.atom_starts.flatten().astype(np.int32))
+        self._n_atoms_arr = mx.array(batch.n_atoms_arr.astype(np.int32))
+        self._n_basis_arr = mx.array(batch.n_basis_arr.astype(np.int32))
+        self._config = mx.array(np.array([N, MB, MA], dtype=np.float32))
+        self._kernel = _get_fock_batch_kernel()
+
+    def build_fock(self, P: np.ndarray) -> np.ndarray:
+        """Build Fock from density P. Only P is transferred each call."""
+        P_gpu = mx.array(P.flatten().astype(np.float32))
+        outputs = self._kernel(
+            inputs=[
+                self._H_core, P_gpu, self._w,
+                self._atom_params, self._atom_map, self._type_map,
+                self._atom_starts, self._n_atoms_arr, self._n_basis_arr,
+                self._config,
+            ],
+            output_shapes=[(self.n_elements,)],
+            output_dtypes=[mx.float32],
+            grid=(self.n_elements, 1, 1),
+            threadgroup=(min(256, self.n_elements), 1, 1),
+        )
+        mx.eval(outputs[0])
+        return np.array(outputs[0]).reshape(self.N, self.MB, self.MB).astype(np.float64)
+
+
 def build_fock_batch_metal(batch) -> np.ndarray:
     """Build Fock matrices for all molecules in batch on Metal GPU.
 
-    Args:
-        batch: RM1Batch with pre-computed data and current density P
-
-    Returns:
-        F: (N, MB, MB) Fock matrices
+    NOTE: For SCF loops, use MetalFockContext instead to avoid
+    re-uploading static buffers every iteration.
     """
-    N = batch.n_mols
-    MB = batch.max_basis
-    MA = batch.max_atoms
-    n_elements = N * MB * MB
-
-    config = np.array([N, MB, MA], dtype=np.float32)
-
-    kernel = _get_fock_batch_kernel()
-    outputs = kernel(
-        inputs=[
-            mx.array(batch.H_core.reshape(N, -1).flatten().astype(np.float32)),
-            mx.array(batch.P.reshape(N, -1).flatten().astype(np.float32)),
-            mx.array(batch.w.flatten().astype(np.float32)),
-            mx.array(batch.atom_params.flatten().astype(np.float32)),
-            mx.array(batch.atom_map.flatten().astype(np.int32)),
-            mx.array(batch.type_map.flatten().astype(np.int32)),
-            mx.array(batch.atom_starts.flatten().astype(np.int32)),
-            mx.array(batch.n_atoms_arr.astype(np.int32)),
-            mx.array(batch.n_basis_arr.astype(np.int32)),
-            mx.array(config),
-        ],
-        output_shapes=[(n_elements,)],
-        output_dtypes=[mx.float32],
-        grid=(n_elements, 1, 1),
-        threadgroup=(min(256, n_elements), 1, 1),
-    )
-    mx.eval(outputs[0])
-    F = np.array(outputs[0]).reshape(N, MB, MB).astype(np.float64)
-    return F
+    ctx = MetalFockContext(batch)
+    return ctx.build_fock(batch.P)
 
 
 def build_fock_batch_cpu(batch) -> np.ndarray:

@@ -440,7 +440,7 @@ def rm1_energy_batch(
         list of result dicts (same format as rm1_energy)
     """
     from .batch import prepare_batch
-    from .fock_metal import build_fock_batch_metal, build_fock_batch_cpu
+    from .fock_metal import build_fock_batch_metal, build_fock_batch_cpu, MetalFockContext
 
     N = len(molecules)
     if N == 0:
@@ -469,8 +469,18 @@ def rm1_energy_batch(
     n_iter_arr = np.zeros(N, dtype=np.int32)
     P_prev = batch.P.copy()
 
-    # Build Fock function
-    build_fock = build_fock_batch_metal if use_metal else build_fock_batch_cpu
+    # Build Fock function — pre-allocate GPU context for Metal
+    if use_metal:
+        try:
+            metal_ctx = MetalFockContext(batch)
+            def build_fock(b):
+                return metal_ctx.build_fock(b.P)
+        except RuntimeError:
+            # Fallback to CPU if Metal not available
+            build_fock = build_fock_batch_cpu
+            use_metal = False
+    else:
+        build_fock = build_fock_batch_cpu
 
     for iteration in range(max_iter):
         # Build Fock matrices for all molecules
@@ -549,7 +559,7 @@ def rm1_energy_batch(
         if not converged_arr[mol_idx]:
             n_iter_arr[mol_idx] = max_iter
 
-    # Final Fock + energies
+    # Final Fock with converged density
     F_final = build_fock(batch)
     results = []
 
