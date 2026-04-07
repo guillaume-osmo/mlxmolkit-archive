@@ -44,13 +44,15 @@ result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
 
 ## Performance
 
-### Conformer Generation (99 diverse molecules × k=50 conformers, Apple M3 Max)
+### Conformer Generation (1000 distinct SPICE molecules, Apple M3 Max)
 
-| Pipeline | Time | Throughput | GPU Memory |
-|----------|------|-----------|------------|
-| DG only | 3.9s | 1,283 conf/s | 2.6 MB |
-| DG + ETKDGv2 | 4.4s | 1,133 conf/s | 2.6 MB |
-| DG + ETK + MMFF | 5.5s | 906 conf/s | 5.1 MB |
+Benchmark uses 1000 distinct drug-like molecules from SPICE-2.0.1 (see `data/benchmark_1000_smiles.csv`).
+
+| Scale | Pipeline | Time | Throughput |
+|-------|----------|------|-----------|
+| N=100 × k=50 | DG only | 8.6s | **580 conf/s** |
+| N=100 × k=50 | DG + ETKDGv2 | 9.3s | **536 conf/s** |
+| N=100 × k=50 | DG + ETK + MMFF | 9.5s | **525 conf/s** |
 
 ### Conformer Memory Scaling (DG + ETK + MMFF, batch=500)
 
@@ -63,13 +65,13 @@ result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
 
 GPU memory stays constant regardless of total conformers thanks to divide-and-conquer batching.
 
-### Scale Tests (diverse molecules, Apple M3 Max)
+### Scale Tests (1000 distinct molecules, Apple M3 Max)
 
 | Scale | Pipeline | Time | Throughput |
 |-------|----------|------|-----------|
-| N=1000, k=10 | DG only | 5.3s | **1,878 conf/s** |
-| N=1000, k=10 | DG + ETKDGv2 | 7.2s | **1,380 conf/s** |
-| N=1000, k=10 | DG + ETK + MMFF | 11.3s | **878 conf/s** |
+| N=1000, k=10 | DG only | 17.5s | **573 conf/s** |
+| N=1000, k=10 | DG + ETKDGv2 | 21.1s | **474 conf/s** |
+| N=1000, k=10 | DG + ETK + MMFF | 21.4s | **467 conf/s** |
 
 All stages on Metal (including MMFF94 — zero RDKit post-processing).
 
