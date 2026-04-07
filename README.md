@@ -50,9 +50,9 @@ Benchmark uses 1000 distinct drug-like molecules from SPICE-2.0.1 (see `data/ben
 
 | Scale | Pipeline | Time | Throughput |
 |-------|----------|------|-----------|
-| N=100 × k=50 | DG only | 8.6s | **580 conf/s** |
-| N=100 × k=50 | DG + ETKDGv2 | 9.3s | **536 conf/s** |
-| N=100 × k=50 | DG + ETK + MMFF | 9.5s | **525 conf/s** |
+| N=100 x k=50 | DG only | 5.6s | **900 conf/s** |
+| N=100 x k=50 | DG + ETKDGv2 | 6.6s | **761 conf/s** |
+| N=100 x k=50 | DG + ETK + MMFF | 6.6s | **758 conf/s** |
 
 ### Conformer Memory Scaling (DG + ETK + MMFF, batch=500)
 
@@ -69,9 +69,9 @@ GPU memory stays constant regardless of total conformers thanks to divide-and-co
 
 | Scale | Pipeline | Time | Throughput |
 |-------|----------|------|-----------|
-| N=1000, k=10 | DG only | 17.5s | **573 conf/s** |
-| N=1000, k=10 | DG + ETKDGv2 | 21.1s | **474 conf/s** |
-| N=1000, k=10 | DG + ETK + MMFF | 21.4s | **467 conf/s** |
+| N=1000, k=10 | DG only | 11.5s | **870 conf/s** |
+| N=1000, k=10 | DG + ETKDGv2 | 14.9s | **672 conf/s** |
+| N=1000, k=10 | DG + ETK + MMFF | 15.0s | **664 conf/s** |
 
 All stages on Metal (including MMFF94 — zero RDKit post-processing).
 

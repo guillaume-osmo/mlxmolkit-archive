@@ -30,7 +30,7 @@ from .shared_batch import (
 from .conformer_metal import dg_minimize_shared
 from .etk_metal import etk_minimize_shared
 from .mmff_params import MMFFParams, extract_mmff_params
-from .mmff_minimize import mmff_minimize_nk
+from .mmff_minimize import mmff_minimize_nk, build_precond_blocks_nk
 from .stereo_checks_metal import run_stereo_checks
 
 
@@ -140,6 +140,8 @@ def _process_chunk(
     mmff_variant: str,
     fourth_dim_weight: float,
     chiral_weight: float,
+    mmff_use_pp_lbfgs: bool = False,
+    mmff_use_dirlbfgs: bool = False,
 ) -> List[tuple]:
     """Run DG → 3D → ETK → MMFF on one chunk. Returns per-conformer results."""
 
@@ -177,14 +179,19 @@ def _process_chunk(
         fourth_dim_weight=fourth_dim_weight, chiral_weight=chiral_weight,
     )
 
-    # ---- Stage 1b: Retry non-converged with 2x iterations (warm start) ----
+    # ---- Stage 1b: Retry non-converged (warm start) ----
+    # Only retry if a small fraction failed (<30%). When most conformers
+    # converge, a quick warm-start pass rescues the stragglers cheaply
+    # (converged conformers early-exit immediately). When many fail (>30%),
+    # retrying re-runs the entire batch which is expensive — the
+    # non-converged geometries are still usable for downstream stages.
     n_failed = int(np.sum(dg_s != 0))
-    if n_failed > 0 and n_failed < C:
+    fail_frac = n_failed / max(C, 1)
+    if 0 < fail_frac <= 0.05:
         dg_out2, dg_e2, dg_s2 = dg_minimize_shared(
-            batch4, dg_out, max_iters=dg_max_iters * 2,
+            batch4, dg_out, max_iters=dg_max_iters,
             fourth_dim_weight=fourth_dim_weight, chiral_weight=chiral_weight,
         )
-        # Keep improved results for conformers that were not converged
         for c in range(C):
             if dg_s[c] != 0 and (dg_s2[c] == 0 or dg_e2[c] < dg_e[c]):
                 s = int(batch4.conf_atom_starts[c]) * 4
@@ -305,10 +312,17 @@ def _process_chunk(
 
         if chunk_mmff is not None:
             chunk_mmff_k = [mol_k[m] for m in mol_order]
+            precond = None
+            if mmff_use_pp_lbfgs and mmff_use_lbfgs:
+                precond = build_precond_blocks_nk(
+                    chunk_mmff, chunk_mmff_k, pos3,
+                )
             pos3, mmff_e, _ = mmff_minimize_nk(
                 chunk_mmff, chunk_mmff_k, pos3,
                 max_iters=mmff_max_iters,
                 use_lbfgs=mmff_use_lbfgs,
+                use_dirlbfgs=mmff_use_dirlbfgs,
+                precond_blocks=precond,
             )
 
     # ---- Collect results per conformer ----
@@ -348,6 +362,8 @@ def generate_conformers_nk(
     run_mmff: bool = False,
     mmff_max_iters: int = 0,
     mmff_use_lbfgs: bool | None = None,
+    mmff_use_pp_lbfgs: bool | None = None,
+    mmff_use_dirlbfgs: bool = False,
     mmff_variant: str = "MMFF94",
 ) -> PipelineResult:
     """Generate 3D conformers for N molecules x k conformers each.
@@ -420,11 +436,18 @@ def generate_conformers_nk(
         ConformerResult(n_atoms=dg_params_list[i].n_atoms, positions_3d=[], energies=[], converged=[])
         for i in range(N)
     ]
-    # Auto-select BFGS vs L-BFGS: BFGS is faster for <150 atoms (with H)
-    _LBFGS_ATOM_THRESHOLD = 150
+    # Auto-select optimizer: Full BFGS by default.
+    # In the fused batched kernel (1000 conformers), BFGS is both faster
+    # and better-converging than L-BFGS because:
+    # - Dense Hessian update is cheap at typical molecule sizes (n<200)
+    # - BFGS converges in fewer iterations → less total kernel time
+    # - L-BFGS two-loop recursion has high barrier overhead (18 reductions)
+    # PP-LBFGS remains available for very large molecules where the O(n²)
+    # dense Hessian becomes impractical.
     if mmff_use_lbfgs is None:
-        max_atoms_all = max(p.n_atoms for p in dg_params_list)
-        mmff_use_lbfgs = max_atoms_all >= _LBFGS_ATOM_THRESHOLD
+        mmff_use_lbfgs = False
+    if mmff_use_pp_lbfgs is None:
+        mmff_use_pp_lbfgs = mmff_use_lbfgs
 
     total_confs = 0
     for chunk_idx, chunk in enumerate(chunks):
@@ -441,6 +464,8 @@ def generate_conformers_nk(
             mmff_variant=mmff_variant,
             fourth_dim_weight=fourth_dim_weight,
             chiral_weight=chiral_weight,
+            mmff_use_pp_lbfgs=mmff_use_pp_lbfgs,
+            mmff_use_dirlbfgs=mmff_use_dirlbfgs,
         )
         for mol_idx, pos_3d, energy, converged in chunk_results:
             mol_results[mol_idx].positions_3d.append(pos_3d)
