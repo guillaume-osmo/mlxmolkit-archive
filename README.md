@@ -75,13 +75,7 @@ GPU memory stays constant regardless of total conformers thanks to divide-and-co
 
 All stages on Metal (including MMFF94 — zero RDKit post-processing).
 
-### Batch Size Impact (N=20, k=50, C=1000)
-
-| Batch | Batches | Time | conf/s |
-|------:|--------:|-----:|-------:|
-| 100 | 10 | 0.62s | 1,610 |
-| 500 | 2 | 0.29s | 3,394 |
-| 1000+ | 1 | 0.22s | 4,442 |
+### Batch Size Impact
 
 Larger batches = fewer kernel launches = higher throughput. Auto-sizing (default) picks the largest batch that fits in free memory.
 
@@ -129,7 +123,9 @@ The divide-and-conquer queue automatically splits into multiple batches when tot
 | 100k | 4.87s | 0.97s | **5.84s** | — | 1.3 MB |
 | 150k+ | blockwise | — | scales | — | bounded |
 
-### ETKDG Variant Comparison (N=20, k=50)
+### ETKDG Variant Comparison (N=20, k=50, same molecule)
+
+Throughput for homogeneous batches (all conformers of the same molecule, best case):
 
 | Variant | conf/s | Convergence |
 |---------|--------|-------------|
@@ -140,6 +136,8 @@ The divide-and-conquer queue automatically splits into multiple batches when tot
 | ETKDGv2 | 6,228 | 96.6% |
 | ETKDGv3 | 6,636 | 96.6% |
 | srETKDGv3 | 6,678 | 96.6% |
+
+Note: throughput is lower for diverse molecule batches due to variable atom counts and padding overhead. The Scale Tests section above shows realistic numbers for heterogeneous batches.
 
 ## Architecture
 
