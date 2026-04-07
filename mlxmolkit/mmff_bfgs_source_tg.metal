@@ -87,6 +87,54 @@
         } \
         threadgroup_barrier(mem_flags::mem_device);
 
+    // Parallel energy+gradient: each thread owns a stripe of variables and
+    // gathers gradient contributions from ALL terms. Energy uses partial sums + reduce.
+    #define PAR_COMPUTE_EG(OUT_E) \
+        { \
+            float _local_e = 0.0f; \
+            for (int t = b_s + (int)tid; t < b_e; t += (int)tg_size) \
+                _local_e += bond_stretch_e(out_pos, bond_pairs[t*2], bond_pairs[t*2+1], bond_params[t*2], bond_params[t*2+1]); \
+            for (int t = a_s + (int)tid; t < a_e; t += (int)tg_size) { \
+                bool lin = angle_params[t*3+2] > 0.5f; \
+                _local_e += angle_bend_e(out_pos, angle_trips[t*3], angle_trips[t*3+1], angle_trips[t*3+2], angle_params[t*3], angle_params[t*3+1], lin); \
+            } \
+            for (int t = sb_s + (int)tid; t < sb_e; t += (int)tg_size) \
+                _local_e += stretch_bend_e(out_pos, sb_trips[t*3], sb_trips[t*3+1], sb_trips[t*3+2], sb_params[t*5], sb_params[t*5+1], sb_params[t*5+2], sb_params[t*5+3], sb_params[t*5+4]); \
+            for (int t = o_s + (int)tid; t < o_e; t += (int)tg_size) \
+                _local_e += oop_bend_e(out_pos, oop_quads[t*4], oop_quads[t*4+1], oop_quads[t*4+2], oop_quads[t*4+3], oop_params[t]); \
+            for (int t = t_s + (int)tid; t < t_e; t += (int)tg_size) \
+                _local_e += torsion_e(out_pos, tor_quads[t*4], tor_quads[t*4+1], tor_quads[t*4+2], tor_quads[t*4+3], tor_params[t*3], tor_params[t*3+1], tor_params[t*3+2]); \
+            for (int t = v_s + (int)tid; t < v_e; t += (int)tg_size) \
+                _local_e += vdw_e(out_pos, vdw_pairs[t*2], vdw_pairs[t*2+1], vdw_params[t*2], vdw_params[t*2+1]); \
+            for (int t = e_s + (int)tid; t < e_e; t += (int)tg_size) \
+                _local_e += ele_e(out_pos, ele_pairs[t*2], ele_pairs[t*2+1], ele_params[t*3], (int)ele_params[t*3+1], ele_params[t*3+2]>0.5f); \
+            tg_reduce[tid] = _local_e; \
+            OUT_E = tg_reduce_sum(tg_reduce, tid, tg_size); \
+            /* Gather gradient: each thread computes its owned variables */ \
+            for (int v = (int)tid; v < n_terms; v += (int)tg_size) { \
+                int my_a = atom_start + v / 3, my_c = v % 3; \
+                float g = 0.0f; \
+                for (int t = b_s; t < b_e; t++) \
+                    g += bond_stretch_g_gather(out_pos, bond_pairs[t*2], bond_pairs[t*2+1], bond_params[t*2], bond_params[t*2+1], my_a, my_c); \
+                for (int t = a_s; t < a_e; t++) { \
+                    bool lin = angle_params[t*3+2] > 0.5f; \
+                    g += angle_bend_g_gather(out_pos, angle_trips[t*3], angle_trips[t*3+1], angle_trips[t*3+2], angle_params[t*3], angle_params[t*3+1], lin, my_a, my_c); \
+                } \
+                for (int t = sb_s; t < sb_e; t++) \
+                    g += stretch_bend_g_gather(out_pos, sb_trips[t*3], sb_trips[t*3+1], sb_trips[t*3+2], sb_params[t*5], sb_params[t*5+1], sb_params[t*5+2], sb_params[t*5+3], sb_params[t*5+4], my_a, my_c); \
+                for (int t = o_s; t < o_e; t++) \
+                    g += oop_bend_g_gather(out_pos, oop_quads[t*4], oop_quads[t*4+1], oop_quads[t*4+2], oop_quads[t*4+3], oop_params[t], my_a, my_c); \
+                for (int t = t_s; t < t_e; t++) \
+                    g += torsion_g_gather(out_pos, tor_quads[t*4], tor_quads[t*4+1], tor_quads[t*4+2], tor_quads[t*4+3], tor_params[t*3], tor_params[t*3+1], tor_params[t*3+2], my_a, my_c); \
+                for (int t = v_s; t < v_e; t++) \
+                    g += vdw_g_gather(out_pos, vdw_pairs[t*2], vdw_pairs[t*2+1], vdw_params[t*2], vdw_params[t*2+1], my_a, my_c); \
+                for (int t = e_s; t < e_e; t++) \
+                    g += ele_g_gather(out_pos, ele_pairs[t*2], ele_pairs[t*2+1], ele_params[t*3], (int)ele_params[t*3+1], ele_params[t*3+2]>0.5f, my_a, my_c); \
+                my_grad[v] = g; \
+            } \
+            threadgroup_barrier(mem_flags::mem_device); \
+        }
+
     // Parallel energy-only macro — all threads sum a stripe, then reduce.
     // Replaces serial SEQ_COMPUTE_E. Energy functions are read-only on positions.
     #define PAR_COMPUTE_E(OUT_E) \
@@ -112,17 +160,33 @@
             OUT_E = tg_reduce_sum(tg_reduce, tid, tg_size); \
         }
 
-    // ---- Initial energy + gradient (thread 0 computes, broadcast energy) ----
+    // ---- Initial energy + gradient (all threads parallel) ----
     float energy = 0.0f;
-    SEQ_COMPUTE_EG(energy);
-    if (tid == 0) {
-        float grad_scale = 1.0f;
-        scale_grad_serial(my_grad, n_terms, grad_scale, true);
-        tg_grad_scale_shared = grad_scale;
-        tg_reduce[0] = energy;
+    PAR_COMPUTE_EG(energy);
+    // Parallel gradient scaling: init 0.1x, halve while max > GRAD_CAP
+    {
+        float gs = GRAD_SCALE_INIT;
+        for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_grad[i] *= gs;
+        threadgroup_barrier(mem_flags::mem_device);
+        for (int sc = 0; sc < 20; sc++) {
+            float lmx = 0.0f;
+            for (int i = (int)tid; i < n_terms; i += (int)tg_size) {
+                float a = abs(my_grad[i]); if (a > lmx) lmx = a;
+            }
+            tg_reduce[tid] = lmx;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tg_size/2; s > 0; s >>= 1) {
+                if (tid < s) tg_reduce[tid] = max(tg_reduce[tid], tg_reduce[tid + s]);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tg_reduce[0] <= GRAD_CAP) break;
+            gs *= 0.5f;
+            for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_grad[i] *= 0.5f;
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+        if (tid == 0) tg_grad_scale_shared = gs;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    energy = tg_reduce[0];
 
     // Initial direction = -grad (ALL threads)
     parallel_neg_copy(my_dir, my_grad, n_terms, tid, tg_size);
@@ -268,19 +332,36 @@
             break;
         }
 
-        // Save old grad, compute new energy+gradient (thread 0), broadcast energy
+        // Save old grad, compute new energy+gradient (all threads parallel)
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_dgrad[i] = my_grad[i];
         threadgroup_barrier(mem_flags::mem_device);
         float new_e = 0.0f;
-        SEQ_COMPUTE_EG(new_e);
-        if (tid == 0) {
-            float grad_scale = tg_grad_scale_shared;
-            scale_grad_serial(my_grad, n_terms, grad_scale, false);
-            tg_grad_scale_shared = grad_scale;
-            tg_reduce[0] = new_e;
+        PAR_COMPUTE_EG(new_e);
+        // Parallel gradient scaling with existing scale
+        {
+            float gs = tg_grad_scale_shared;
+            for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_grad[i] *= gs;
+            threadgroup_barrier(mem_flags::mem_device);
+            for (int sc = 0; sc < 20; sc++) {
+                float lmx = 0.0f;
+                for (int i = (int)tid; i < n_terms; i += (int)tg_size) {
+                    float a = abs(my_grad[i]); if (a > lmx) lmx = a;
+                }
+                tg_reduce[tid] = lmx;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tg_size/2; s > 0; s >>= 1) {
+                    if (tid < s) tg_reduce[tid] = max(tg_reduce[tid], tg_reduce[tid + s]);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tg_reduce[0] <= GRAD_CAP) break;
+                gs *= 0.5f;
+                for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_grad[i] *= 0.5f;
+                threadgroup_barrier(mem_flags::mem_device);
+            }
+            if (tid == 0) tg_grad_scale_shared = gs;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        energy = tg_reduce[0];
+        energy = new_e;
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_dgrad[i] = my_grad[i] - my_dgrad[i];
         threadgroup_barrier(mem_flags::mem_device);
 

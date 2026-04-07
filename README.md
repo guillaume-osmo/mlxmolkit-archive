@@ -44,13 +44,15 @@ result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
 
 ## Performance
 
-### Conformer Generation (N=20 molecules, k=50 conformers = 1000 total)
+### Conformer Generation (1000 distinct SPICE molecules, Apple M3 Max)
 
-| Pipeline | Time | Throughput | GPU Memory |
-|----------|------|-----------|------------|
-| DG only | 0.13s | 7,549 conf/s | 2.6 MB |
-| DG + ETK | 0.16s | 6,228 conf/s | 2.6 MB |
-| DG + ETK + MMFF | 0.52s | 1,908 conf/s | 5.1 MB |
+Benchmark uses 1000 distinct drug-like molecules from SPICE-2.0.1 (see `data/benchmark_1000_smiles.csv`).
+
+| Scale | Pipeline | Time | Throughput |
+|-------|----------|------|-----------|
+| N=100 x k=50 | DG only | 5.6s | **900 conf/s** |
+| N=100 x k=50 | DG + ETKDGv2 | 6.6s | **761 conf/s** |
+| N=100 x k=50 | DG + ETK + MMFF | 6.6s | **758 conf/s** |
 
 ### Conformer Memory Scaling (DG + ETK + MMFF, batch=500)
 
@@ -63,18 +65,15 @@ result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
 
 GPU memory stays constant regardless of total conformers thanks to divide-and-conquer batching.
 
-### Scale Tests
+### Scale Tests (1000 distinct molecules, Apple M3 Max)
 
-| Scale | Pipeline | Time | Throughput | Convergence |
-|-------|----------|------|-----------|-------------|
-| N=1000, k=10 | DG + ETK | 5.0s | **2,017 conf/s** | 99.7% |
-| N=1000, k=10 | DG + ETK + MMFF | 8.0s | **1,250 conf/s** | 99.7% |
-| N=10000, k=1 | DG + ETK | 17.7s | **565 conf/s** | 99.6% |
-| N=10000, k=1 | DG + ETK + MMFF | 37.9s | **264 conf/s** | 99.6% |
-| **N=10000, k=10** | **DG + ETK** | **38.1s** | **2,625 conf/s** | **99.7%** |
-| **N=10000, k=10** | **DG + ETK + MMFF** | **67.9s** | **1,473 conf/s** | **99.7%** |
+| Scale | Pipeline | Time | Throughput |
+|-------|----------|------|-----------|
+| N=1000, k=10 | DG only | 11.5s | **870 conf/s** |
+| N=1000, k=10 | DG + ETKDGv2 | 14.9s | **672 conf/s** |
+| N=1000, k=10 | DG + ETK + MMFF | 15.0s | **664 conf/s** |
 
-100,000 conformers in a single GPU batch. All stages on Metal (including MMFF94 — zero RDKit post-processing).
+All stages on Metal (including MMFF94 — zero RDKit post-processing).
 
 ### Batch Size Impact (N=20, k=50, C=1000)
 
