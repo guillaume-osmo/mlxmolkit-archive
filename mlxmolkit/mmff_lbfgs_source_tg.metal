@@ -172,6 +172,26 @@
             if (lam < lambda_min) { parallel_copy(my_pos, my_old_pos, n_terms, tid, tg_size); ls_done = true; break; }
             for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_pos[i] = my_old_pos[i] + lam * my_dir[i];
             threadgroup_barrier(mem_flags::mem_device);
+            // Clash check: reject step if any atom pair < 0.6 A
+            {
+                float _md2 = 1e30f;
+                for (int _a = (int)tid; _a < n_atoms; _a += (int)tg_size) {
+                    for (int _b = _a + 1; _b < n_atoms; _b++) {
+                        float _dx = my_pos[_a*3] - my_pos[_b*3];
+                        float _dy = my_pos[_a*3+1] - my_pos[_b*3+1];
+                        float _dz = my_pos[_a*3+2] - my_pos[_b*3+2];
+                        float _d2 = _dx*_dx + _dy*_dy + _dz*_dz;
+                        if (_d2 < _md2) _md2 = _d2;
+                    }
+                }
+                tg_reduce[tid] = _md2;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tg_size/2; s > 0; s >>= 1) {
+                    if (tid < s) tg_reduce[tid] = min(tg_reduce[tid], tg_reduce[tid + s]);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tg_reduce[0] < 0.36f) { lam *= 0.3f; continue; }
+            }
             float trial_e; PAR_COMPUTE_E(trial_e);
             if (trial_e - old_energy <= FUNCTOL * lam * slope) { energy = trial_e; ls_done = true; }
             else {

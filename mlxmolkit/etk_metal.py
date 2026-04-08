@@ -382,7 +382,23 @@ _ETK_BODY = """
             if (lam<lmin){parallel_copy(my_pos,my_old_pos,n_vars,tid,tpm);ls_done=true;break;}
             for (int i=(int)tid;i<n_vars;i+=(int)tpm) my_pos[i]=my_old_pos[i]+lam*my_dir[i];
             threadgroup_barrier(mem_flags::mem_device);
-
+            // Clash check: reject step if any atom pair < 0.6 A (3D only)
+            {
+                float _md2=1e30f;
+                for (int _a=(int)tid;_a<n_atoms;_a+=(int)tpm){
+                    for (int _b=_a+1;_b<n_atoms;_b++){
+                        float _dx=my_pos[_a*dim]-my_pos[_b*dim];
+                        float _dy=my_pos[_a*dim+1]-my_pos[_b*dim+1];
+                        float _dz=my_pos[_a*dim+2]-my_pos[_b*dim+2];
+                        float _d2=_dx*_dx+_dy*_dy+_dz*_dz;
+                        if(_d2<_md2) _md2=_d2;
+                    }
+                }
+                shared[tid]=_md2;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s=tpm/2;s>0;s>>=1){if(tid<s)shared[tid]=min(shared[tid],shared[tid+s]);threadgroup_barrier(mem_flags::mem_threadgroup);}
+                if (shared[0]<0.36f){lam*=0.3f;continue;}
+            }
             // Trial energy (parallel)
             float lte=0.0f;
             for (int t=tor_s+(int)tid;t<tor_e;t+=(int)tpm){

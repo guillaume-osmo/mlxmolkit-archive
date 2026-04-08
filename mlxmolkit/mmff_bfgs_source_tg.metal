@@ -263,6 +263,28 @@
                 my_pos[i] = my_old_pos[i] + lam * my_dir[i];
             threadgroup_barrier(mem_flags::mem_device);
 
+            // Clash check: reject step if any atom pair < 0.6 A
+            // Prevents optimizer from pushing atoms through VdW repulsive wall
+            {
+                float _md2 = 1e30f;
+                for (int a = (int)tid; a < n_atoms; a += (int)tg_size) {
+                    for (int b = a + 1; b < n_atoms; b++) {
+                        float dx = my_pos[a*3] - my_pos[b*3];
+                        float dy = my_pos[a*3+1] - my_pos[b*3+1];
+                        float dz = my_pos[a*3+2] - my_pos[b*3+2];
+                        float d2 = dx*dx + dy*dy + dz*dz;
+                        if (d2 < _md2) _md2 = d2;
+                    }
+                }
+                tg_reduce[tid] = _md2;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tg_size/2; s > 0; s >>= 1) {
+                    if (tid < s) tg_reduce[tid] = min(tg_reduce[tid], tg_reduce[tid + s]);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tg_reduce[0] < 0.36f) { lam *= 0.3f; continue; }
+            }
+
             // Trial energy (parallel — all threads get same value via reduction)
             float trial_e;
             PAR_COMPUTE_E(trial_e);
