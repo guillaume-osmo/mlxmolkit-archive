@@ -38,7 +38,7 @@ from mlx_addons.linalg import gen_eigh
 
 from .basis import build_basis, basis_summary, overlap_matrix
 from .cn import coordination_number_erf
-from .eeq import eeq_charges
+from .eeq import eeq_charges_and_energy
 from .hcore import build_hcore
 from .params_gfn0 import GFN0_PARAMS
 from .repulsion import compute_repulsion
@@ -80,14 +80,15 @@ def gfn0_energy(atoms: list[int], coords_ang: np.ndarray, *, charge: int = 0) ->
     mx.eval(cn_mx)
     cn = np.asarray(cn_mx).astype(np.float64)
 
-    # 3. EEQ charges.
-    q_mx = eeq_charges(
+    # 3. EEQ charges + EEQ Lagrangian energy (xtb's `ees` term).
+    q_mx, E_eeq_mx = eeq_charges_and_energy(
         mx.array(coords.astype(np.float32)),
         mx.array(np.asarray(atoms_list, dtype=np.int32)),
         total_charge=float(charge),
     )
-    mx.eval(q_mx)
+    mx.eval(q_mx, E_eeq_mx)
     q = np.asarray(q_mx).astype(np.float64)
+    E_eeq_hartree = float(E_eeq_mx)
 
     # 4. Core Hamiltonian (numpy → mx.array boundary cast).
     H_np = build_hcore(atoms_list, coords, basis, S, cn, q)
@@ -125,8 +126,8 @@ def gfn0_energy(atoms: list[int], coords_ang: np.ndarray, *, charge: int = 0) ->
     # Repulsion (Hartree).
     E_rep_hartree = compute_repulsion(atoms_list, coords)
 
-    # Total (Phase A0: omit dispersion + SRB + halogen).
-    E_total_hartree = E_band_hartree + E_rep_hartree
+    # Total: matches xtb's etot = eel + ees + ep + (esrb + ed deferred).
+    E_total_hartree = E_band_hartree + E_eeq_hartree + E_rep_hartree
     E_total_eV = E_total_hartree * _EV_PER_HARTREE
 
     return {
@@ -134,6 +135,7 @@ def gfn0_energy(atoms: list[int], coords_ang: np.ndarray, *, charge: int = 0) ->
         "energy_kcal": E_total_eV * _KCAL_PER_EV,
         "energy_hartree": E_total_hartree,
         "electronic_eV": E_band_hartree * _EV_PER_HARTREE,
+        "eeq_eV": E_eeq_hartree * _EV_PER_HARTREE,
         "repulsion_eV": E_rep_hartree * _EV_PER_HARTREE,
         "dispersion_eV": None,           # TODO Phase A5 (D4)
         "srb_eV": None,                  # TODO Phase A5 (SRB)

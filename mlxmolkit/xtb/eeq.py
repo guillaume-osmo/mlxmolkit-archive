@@ -179,3 +179,96 @@ def eeq_charges(
     if was_2d:
         q = q[0]
     return q
+
+
+def eeq_charges_and_energy(
+    coords: mx.array,
+    atoms: mx.array,
+    n_atoms_arr: mx.array | None = None,
+    *,
+    total_charge: float = 0.0,
+    k_cn: float = KCN_ERF,
+) -> tuple[mx.array, mx.array]:
+    """Like :func:`eeq_charges`, but also returns the EEQ Lagrangian
+    energy ``E^EEQ = Σ_A (χ_A − κ_A √CN_A) q_A + ½ qᵀ J q`` (Hartree).
+
+    Mirrors xtb's ``ees`` term (peeq_module.f90:611-613) which is part of
+    the GFN0 total energy ``etot = eel + ees + ep + exb + esrb + ed``.
+
+    Returns:
+        ``(q, E_eeq)`` — ``q`` shape matches the input, ``E_eeq`` shape
+        ``(B,)`` (or scalar for 2-D input).
+    """
+    was_2d = coords.ndim == 2
+    if was_2d:
+        coords = coords[None]
+        atoms = atoms[None]
+        if n_atoms_arr is None:
+            n_atoms_arr = mx.array([atoms.shape[1]], dtype=mx.int32)
+        elif n_atoms_arr.ndim == 0:
+            n_atoms_arr = n_atoms_arr[None]
+    B, n_max, _ = coords.shape
+
+    atom_eeq = mx.take(_EEQ_PARAMS_TABLE, atoms, axis=0)
+    chi = atom_eeq[..., 0].astype(coords.dtype)
+    eta = atom_eeq[..., 1].astype(coords.dtype)
+    kappa = atom_eeq[..., 2].astype(coords.dtype)
+    alpha = atom_eeq[..., 3].astype(coords.dtype)
+
+    if n_atoms_arr is not None:
+        arange_n = mx.arange(n_max, dtype=mx.int32)
+        valid = (arange_n[None, :] < n_atoms_arr[:, None]).astype(coords.dtype)
+    else:
+        valid = mx.ones((B, n_max), dtype=coords.dtype)
+
+    cn = coordination_number_erf(coords, atoms, n_atoms_arr, k=k_cn)
+    cn_safe = mx.maximum(cn, mx.zeros_like(cn))
+    eps = mx.array(1e-30, dtype=coords.dtype)
+    chi_tilde = -chi + kappa * mx.sqrt(cn_safe + eps)        # = xvec
+
+    coords_bohr = coords * mx.array(_ANG_TO_BOHR, dtype=coords.dtype)
+    diff = coords_bohr[:, :, None, :] - coords_bohr[:, None, :, :]
+    R = mx.sqrt(mx.sum(diff * diff, axis=-1) + eps)
+    alpha_sq = alpha * alpha
+    gamma = 1.0 / mx.sqrt(alpha_sq[:, :, None] + alpha_sq[:, None, :] + eps)
+
+    eye = mx.eye(n_max, dtype=coords.dtype)
+    J_off = mx.erf(R * gamma) / mx.maximum(R, eps)
+    J_off = J_off * (1.0 - eye[None, :, :])
+    diag_vals = eta + mx.array(_SQRT_2_OVER_PI, dtype=coords.dtype) / mx.maximum(alpha, eps)
+    J = J_off + diag_vals[:, :, None] * eye[None, :, :]
+    pair_valid = valid[:, :, None] * valid[:, None, :]
+    invalid_diag = (1.0 - valid)[:, :, None] * eye[None, :, :]
+    J = J * pair_valid + invalid_diag
+
+    cons_col = valid[:, :, None]
+    cons_row = valid[:, None, :]
+    corner = mx.zeros((B, 1, 1), dtype=coords.dtype)
+    A_top = mx.concatenate([J, cons_col], axis=-1)
+    A_bot = mx.concatenate([cons_row, corner], axis=-1)
+    A_aug = mx.concatenate([A_top, A_bot], axis=-2)
+
+    rhs_chi = (chi_tilde * valid)[:, :, None]
+    q_tot_b = mx.full((B, 1, 1), float(total_charge), dtype=coords.dtype)
+    rhs = mx.concatenate([rhs_chi, q_tot_b], axis=-2)
+
+    sol = solve_lu(A_aug, rhs)
+    q = sol[:, :n_max, 0] * valid
+
+    # Energy: E_eeq = -(-χ + κ√CN)·q + ½ qᵀ J q
+    #              = -xvec·q     + ½ qᵀ J q
+    # Wait: the physical Lagrangian is
+    #   E_phys = (χ − κ√CN)·q + ½ qᵀ J q,
+    # and (χ − κ√CN) = -xvec (since xvec = -χ + κ√CN). So:
+    #   E_phys = -xvec·q + ½ qᵀ J q.
+    # At the optimum, J q = xvec - λ·1 (from the augmented system),
+    # so qᵀ J q = q·xvec - λ·q_total. Substituting:
+    #   E_phys = -xvec·q + ½ (q·xvec - λ·q_total)
+    #          = -½ xvec·q  - ½ λ·q_total.
+    # For neutral systems (q_total = 0): E_phys = -½ xvec·q.
+    E_eeq = -0.5 * mx.sum(rhs_chi[:, :, 0] * q, axis=-1)     # (B,)
+
+    if was_2d:
+        q = q[0]
+        E_eeq = E_eeq[0]
+    return q, E_eeq

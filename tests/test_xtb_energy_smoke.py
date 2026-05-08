@@ -86,3 +86,12 @@ def test_dispersion_and_srb_flagged_as_deferred():
     assert res["dispersion_eV"] is None
     assert res["srb_eV"] is None
     assert res["heat_of_formation_eV"] is None
+
+
+def test_eeq_energy_present_and_negative_for_polar_mol():
+    """The EEQ Lagrangian contributes a small negative energy on polar
+    molecules (xtb's `ees` term). For H2O it is ~-1 eV (~-0.04 Ha)."""
+    res = _build([8, 1, 1], [[0, 0, 0.117], [0, 0.757, -0.469], [0, -0.757, -0.469]])
+    assert res["eeq_eV"] is not None
+    assert -3.0 < res["eeq_eV"] < 0.0
+
