@@ -179,9 +179,10 @@ def build_hcore(
             l_nu = s_nu.l
             d_chi = en_atoms[A] - en_atoms[B]
             d_chi2 = d_chi * d_chi
-            # Shell-pair EN scale: average of the two shell ENs (ens/enp/end).
-            avg_en = 0.5 * (_shell_enscale(l_mu) + _shell_enscale(l_nu))
-            enpoly = 1.0 + 0.005 * avg_en * d_chi2 * (1.0 + g.enscale4 * d_chi2)
+            # Shell-pair EN scale, exactly matching xtb gfn0.f90:800-802:
+            #   enScale[i,j] = 0.005 * (en[i] + en[j])   (sum, NOT average)
+            sum_en = _shell_enscale(l_mu) + _shell_enscale(l_nu)
+            enpoly = 1.0 + 0.005 * sum_en * d_chi2 * (1.0 + g.enscale4 * d_chi2)
             kscale = 0.5 * (_shell_kscale(l_mu) + _shell_kscale(l_nu))
             K_AB = kscale * enpoly  # pairParam = 1 for main-group
             # Distance-dependent shell-poly Π
