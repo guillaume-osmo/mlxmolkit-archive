@@ -40,6 +40,7 @@ from .eeq import eeq_charges_and_energy
 from .hcore import build_hcore
 from .params_gfn0 import GFN0_PARAMS
 from .repulsion import compute_repulsion
+from .srb import compute_srb
 
 
 def _per_atom_lowdin(
@@ -175,8 +176,13 @@ def gfn0_energy(atoms: list[int], coords_ang: np.ndarray, *, charge: int = 0) ->
     # Repulsion (Hartree).
     E_rep_hartree = compute_repulsion(atoms_list, coords)
 
-    # Total: matches xtb's etot = eel + ees + ep + (esrb + ed deferred).
-    E_total_hartree = E_band_hartree + E_eeq_hartree + E_rep_hartree
+    # Short-range bond correction (Hartree). Only acts on hetero pairs
+    # in {B, C, N, O, F}; H-containing systems with no C/N/O/F-C/N/O/F
+    # heteros (e.g. H2O alone) yield 0.
+    E_srb_hartree = compute_srb(atoms_list, coords, cn)
+
+    # Total: matches xtb's etot = eel + ees + ep + esrb + (ed deferred).
+    E_total_hartree = E_band_hartree + E_eeq_hartree + E_rep_hartree + E_srb_hartree
     E_total_eV = E_total_hartree * _EV_PER_HARTREE
 
     return {
@@ -187,7 +193,7 @@ def gfn0_energy(atoms: list[int], coords_ang: np.ndarray, *, charge: int = 0) ->
         "eeq_eV": E_eeq_hartree * _EV_PER_HARTREE,
         "repulsion_eV": E_rep_hartree * _EV_PER_HARTREE,
         "dispersion_eV": None,           # TODO Phase A5 (D4)
-        "srb_eV": None,                  # TODO Phase A5 (SRB)
+        "srb_eV": E_srb_hartree * _EV_PER_HARTREE,
         "heat_of_formation_eV": None,    # TODO atomic reference energies
         "heat_of_formation_kcal": None,
         "converged": True,               # GFN0 is non-SCC
