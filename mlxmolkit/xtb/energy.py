@@ -34,14 +34,34 @@ import math
 import mlx.core as mx
 import numpy as np
 
-from mlx_addons.linalg import gen_eigh
-
 from .basis import build_basis, basis_summary, overlap_matrix
 from .cn import coordination_number_erf
 from .eeq import eeq_charges_and_energy
 from .hcore import build_hcore
 from .params_gfn0 import GFN0_PARAMS
 from .repulsion import compute_repulsion
+
+
+def _canonical_eigh(H: np.ndarray, S: np.ndarray, eig_tol: float = 1e-2):
+    """Generalized eigh ``H C = S C diag(w)`` via canonical
+    orthogonalization. Diagonalizes ``S`` first, drops basis directions
+    with eigenvalue below ``eig_tol`` (which would otherwise produce
+    spurious huge eigenvalues), forms ``X = U Λ^{-1/2}`` on the kept
+    block, transforms ``H' = Xᵀ H X`` to the orthonormal subspace,
+    diagonalizes there, and back-transforms ``C = X C'``.
+
+    This is the standard treatment for AO bases with redundancy /
+    near-degeneracy (xtb does the same in its SCF solver).
+    """
+    s_eig, U = np.linalg.eigh(S)
+    keep = s_eig > eig_tol
+    s_kept = s_eig[keep]
+    U_kept = U[:, keep]
+    X = U_kept * (1.0 / np.sqrt(s_kept))[None, :]   # (n, m) with m <= n
+    H_prime = X.T @ H @ X
+    w, Cprime = np.linalg.eigh(H_prime)
+    C = X @ Cprime                                  # (n, m); m occ-able
+    return w, C, X.shape[1]
 
 
 _EV_PER_HARTREE = 27.211386245988
@@ -93,15 +113,9 @@ def gfn0_energy(atoms: list[int], coords_ang: np.ndarray, *, charge: int = 0) ->
     # 4. Core Hamiltonian (numpy → mx.array boundary cast).
     H_np = build_hcore(atoms_list, coords, basis, S, cn, q)
 
-    # 5. Generalized eigh F C = S C diag(w). For GFN0 there is no SCF,
-    # so F == H_core. We use mlx_addons.linalg.gen_eigh on the GPU/CPU
-    # path for parity with the rest of the stack.
-    H_mx = mx.array(H_np.astype(np.float32))
-    S_mx = mx.array(S.astype(np.float32))
-    eigvals_mx, C_mx = gen_eigh(H_mx, S_mx)
-    mx.eval(eigvals_mx, C_mx)
-    eigvals = np.asarray(eigvals_mx).astype(np.float64)
-    C = np.asarray(C_mx).astype(np.float64)
+    # 5. Generalized eigh via canonical orthogonalization (handles the
+    # near-singular S that arises with auxiliary shells included).
+    eigvals, C, n_active = _canonical_eigh(H_np, S, eig_tol=1e-2)
 
     # 6. Closed-shell density: P = 2 * C_occ @ C_occ.T
     n_elec = int(round(sum(GFN0_PARAMS[Z].shells.__len__() == 1 and GFN0_PARAMS[Z].Z or 0 for Z in atoms_list)))

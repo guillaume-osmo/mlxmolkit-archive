@@ -124,9 +124,9 @@ def build_hcore(
         seen_l: set[int] = set()
         for shell in p.shells:
             if shell.l > 1:
-                continue                          # d skipped per Phase A scope
+                continue
             if shell.l in seen_l:
-                continue                          # auxiliary shell skipped
+                continue
             seen_l.add(shell.l)
             n_components = 1 if shell.l == 0 else 3
             for _ in range(n_components):

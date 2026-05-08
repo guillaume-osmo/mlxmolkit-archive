@@ -128,17 +128,17 @@ def build_basis(
         seen_l: set[int] = set()
         for shell in p.shells:
             if shell.l > 1:
-                # Skip d/f for Phase A. The basis would still be valid
-                # without them; energies will deviate from xtb on heavy
-                # elements but H/C/N/O/F are unaffected.
                 continue
             if shell.l in seen_l:
-                # Phase A0 simplification: skip auxiliary shells of the
-                # same l (H's 2s, He's 2p, ...). With our STO-3G fits
-                # they overlap their main shell at ~0.98 on the same
-                # atom and produce a near-singular S. Real GFN0 handles
-                # this via mixed STO-NG (different N per shell) and
-                # canonical orthogonalization; both are deferred.
+                # Phase A0: skip auxiliary shells. With our STO-3G fits
+                # the H 2s aux overlaps H 1s at S=0.98 on the same atom;
+                # neither canonical orthogonalization (drops too much
+                # info) nor naive inclusion (gives -19 Ha spurious eigs)
+                # works without xtb's mixed STO-NG fits or per-atom
+                # Lowdin orthogonalization. Both are substantial follow-
+                # up work; for now we keep the minimal valence basis
+                # which gives chemically-sensible eigenvalues at the
+                # cost of ~50-150 kcal/mol parity to xtb.
                 continue
             seen_l.add(shell.l)
             sto = get_sto3g(shell.n, shell.l)
