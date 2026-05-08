@@ -29,7 +29,6 @@ import numpy as np
 
 from .params_gfn0 import GFN0_PARAMS, GFN0ElementParams, GFN0Shell
 from .sto_ng import (
-    STO3GShell,
     get_sto_ng,
     gfn0_n_gauss,
     primitive_norm_p,
@@ -114,21 +113,19 @@ def build_basis(
     for atom_idx, Z in enumerate(atoms):
         p = params_dict[int(Z)]
         center = coords_bohr[atom_idx]
+        # Track first-shell-of-each-l on this atom to support Gram-Schmidt
+        # orthogonalization of aux s shells against the valence shell.
+        # xtb's basis has same-atom <val|aux> = 0 (verified by reading off
+        # MO coefs from xtb-python on H2). Without this orthogonalization
+        # the overlap matrix is near-singular and the generalized eigh
+        # produces spurious -24 Ha eigenvalues.
+        first_l_alphas: dict[int, np.ndarray] = {}
+        first_l_coeffs: dict[int, np.ndarray] = {}
         seen_l: set[int] = set()
         for shell in p.shells:
             if shell.l > 1:
                 continue
             is_valence = shell.l not in seen_l
-            if not is_valence:
-                # Phase A0: skip aux. Even with STO-2G for the H 2s aux
-                # and per-atom Lowdin orthogonalization, our STO-NG fits
-                # produce a same-atom <1s|2s> ≈ 0.98 — the function
-                # representations are not what xtb uses internally.
-                # Achieving xtb-parity here requires reverse-engineering
-                # xtb's actual aux-shell representation (likely a direct
-                # Slater orbital projected onto an orthogonal complement
-                # of valence on the same atom, NOT a separate STO-NG fit).
-                continue
             seen_l.add(shell.l)
             # Mixed STO-NG per xtb's setGFN0NumberOfPrimitives:
             # H/He valence s = STO-3G, aux s = STO-2G; everything else
@@ -139,14 +136,36 @@ def build_basis(
             alphas = np.array(sto.alphas, dtype=np.float64) * zeta_sq
             raw_coeffs = np.array(sto.coeffs, dtype=np.float64)
             N_contraction = _contraction_norm(alphas, raw_coeffs, shell.l)
-            # Pre-multiply contraction coeffs by primitive norms *and*
-            # by N_contraction so the overlap kernel just sees a single
-            # weighted sum over primitive pairs.
             if shell.l == 0:
                 prim_norms = primitive_norm_s(alphas)
             else:
                 prim_norms = primitive_norm_p(alphas)
             full_coeffs = raw_coeffs * prim_norms * N_contraction
+
+            # Gram-Schmidt: if this is the aux shell, subtract its same-atom
+            # projection onto the valence shell, then renormalize. Only s
+            # shells in this Phase A0 (no aux p), so we only handle l == 0.
+            if (not is_valence) and shell.l == 0:
+                v_alphas = first_l_alphas[shell.l]
+                v_coeffs = first_l_coeffs[shell.l]
+                # <val|aux> with both shells fully normalized & contracted.
+                s_va = 0.0
+                for i in range(len(v_alphas)):
+                    for j in range(len(alphas)):
+                        p_ij = v_alphas[i] + alphas[j]
+                        s_va += v_coeffs[i] * full_coeffs[j] * (np.pi / p_ij) ** 1.5
+                # 2s_orth = (2s - s · 1s) / sqrt(1 - s²); store as union.
+                denom = float(np.sqrt(max(1.0 - s_va * s_va, 1e-12)))
+                aux_alphas = np.concatenate([alphas, v_alphas])
+                aux_coeffs = np.concatenate([
+                    full_coeffs / denom,
+                    -s_va * v_coeffs / denom,
+                ])
+                alphas = aux_alphas
+                full_coeffs = aux_coeffs
+            elif is_valence:
+                first_l_alphas[shell.l] = alphas.copy()
+                first_l_coeffs[shell.l] = full_coeffs.copy()
 
             if shell.l == 0:
                 out.append(BasisFunction(

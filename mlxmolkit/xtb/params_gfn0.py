@@ -149,7 +149,11 @@ def _shells_from_raw(raw: GFN0RawElement) -> tuple[GFN0Shell, ...]:
             h=raw.lev[shell_idx],
             zeta=raw.exp[shell_idx],
             k_poly=float(polys[l] if polys[l] is not None else 0.0),
-            k_cn=float(kcns[l] if kcns[l] is not None else 0.0),
+            # KCNS/P/D in the txt file are 10× the runtime values used
+            # in xtb (cf. gfn0.f90:361 hardcoded `kCN` table vs the
+            # `param_gfn0-xtb.txt` `KCNS=0.7116904` line for H, where
+            # the runtime value is 0.07116904). Apply the 0.1 scale here.
+            k_cn=float(kcns[l] if kcns[l] is not None else 0.0) * 0.1,
             k_q1=float(kqs[l] if kqs[l] is not None else 0.0),
         ))
     return tuple(out)
