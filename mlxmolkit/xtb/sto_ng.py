@@ -37,6 +37,31 @@ import numpy as np
 # Each entry: (alpha_i, coeff_i) for the 3 primitives.
 # Source: J. Chem. Phys. 52, 431 (1970), Tables I-III.
 
+_STO_2G_TABLES = {
+    # Stewart 1969 STO-2G fits, unit ζ.
+    (1, 0): [   # 1s
+        (0.151623, 0.678914),
+        (0.851819, 0.430129),
+    ],
+    (2, 0): [   # 2s
+        (0.0974545, 0.963782),
+        (0.384244, 0.0494718),
+    ],
+    (2, 1): [   # 2p
+        (0.0974545, 0.612820),
+        (0.384244, 0.448070),
+    ],
+    (3, 0): [   # 3s
+        (0.0407755, 0.794530),
+        (0.190771, 0.213907),
+    ],
+    (3, 1): [   # 3p
+        (0.0407755, 0.413000),
+        (0.190771, 0.624658),
+    ],
+}
+
+
 _STO_3G_TABLES = {
     # (n, l): [(alpha, coeff), ...]
     (1, 0): [   # 1s
@@ -102,25 +127,59 @@ class STO3GShell:
 
 
 def get_sto3g(n: int, l: int) -> STO3GShell:
-    """Look up the STO-3G expansion for principal quantum n and angular l.
-
-    Args:
-        n: 1..5
-        l: 0=s, 1=p, 2=d
-
-    Returns:
-        :class:`STO3GShell` with three primitives.
-
-    Raises:
-        KeyError: if ``(n, l)`` is not in the table.
-    """
+    """Look up the STO-3G expansion for principal quantum n and angular l."""
     key = (n, l)
     if key not in _STO_3G_TABLES:
         raise KeyError(f"No STO-3G expansion for (n={n}, l={l})")
     rows = _STO_3G_TABLES[key]
-    alphas = tuple(r[0] for r in rows)
-    coeffs = tuple(r[1] for r in rows)
-    return STO3GShell(n=n, l=l, alphas=alphas, coeffs=coeffs)
+    return STO3GShell(
+        n=n, l=l,
+        alphas=tuple(r[0] for r in rows),
+        coeffs=tuple(r[1] for r in rows),
+    )
+
+
+def get_sto_ng(n: int, l: int, n_gauss: int) -> STO3GShell:
+    """Look up the STO-NG expansion for ``(n, l)`` with ``n_gauss``
+    primitives. Currently supports ``n_gauss in {2, 3}``.
+    """
+    if n_gauss == 2:
+        table = _STO_2G_TABLES
+    elif n_gauss == 3:
+        table = _STO_3G_TABLES
+    else:
+        # STO-4G / -6G could be added; for Phase A0 (CHNO + heavy aux 2s)
+        # we only need STO-2G (H aux) and STO-3G (everything else).
+        raise NotImplementedError(f"STO-{n_gauss}G not yet vendored")
+    key = (n, l)
+    if key not in table:
+        raise KeyError(f"No STO-{n_gauss}G expansion for (n={n}, l={l})")
+    rows = table[key]
+    return STO3GShell(
+        n=n, l=l,
+        alphas=tuple(r[0] for r in rows),
+        coeffs=tuple(r[1] for r in rows),
+    )
+
+
+def gfn0_n_gauss(Z: int, l: int, n_principal: int, is_valence: bool) -> int:
+    """xtb's setGFN0NumberOfPrimitives rule (gfn0.f90:847-877).
+
+    H, He: valence s = 3, aux s = 2; p = 3.
+    Z >= 3: s = 4 (n<=5) / 6 (n>5); p = 3 (n<=5) / 6 (n>5); d = 4.
+
+    For Phase A0 we cap at STO-3G (CHNO valence is N=3 always; only
+    H/He aux 2s drops to N=2). Heavier elements would need STO-4G+
+    which is not yet vendored — they currently fall back to STO-3G.
+    """
+    if Z <= 2:
+        if l == 0:
+            return 3 if is_valence else 2
+        return 3
+    # Z >= 3: per Stewart 1969 + xtb the canonical N is >= 3 for valence
+    # s/p. For Phase A0 we use STO-3G; heavier-element parity awaits
+    # STO-4G/-6G vendoring.
+    return 3
 
 
 # ---------------------------------------------------------------------------

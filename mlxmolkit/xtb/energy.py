@@ -42,6 +42,39 @@ from .params_gfn0 import GFN0_PARAMS
 from .repulsion import compute_repulsion
 
 
+def _per_atom_lowdin(
+    S: np.ndarray, basis: list, atoms: list[int]
+) -> np.ndarray:
+    """Per-atom Löwdin orthogonalization: build a transformation matrix
+    that orthogonalizes each atom's own basis-function block against
+    itself, leaving inter-atomic couplings untouched.
+
+    For atoms where multiple shells share the same l (H 2s aux on H
+    1s), this brings the same-atom block from singular toward identity
+    without touching the inter-atom physics. The result is a (n, n)
+    matrix ``T`` such that ``S' = Tᵀ S T`` has same-atom block ≈ I.
+    """
+    n = S.shape[0]
+    T = np.eye(n, dtype=np.float64)
+    # Group basis indices by atom.
+    atom_groups: dict[int, list[int]] = {}
+    for i, bf in enumerate(basis):
+        atom_groups.setdefault(bf.atom_idx, []).append(i)
+    for at_idx, idxs in atom_groups.items():
+        if len(idxs) == 1:
+            continue
+        block = S[np.ix_(idxs, idxs)]
+        # Symmetric Lowdin: T_block = block^(-1/2)
+        w, U = np.linalg.eigh(block)
+        # Tiny eigenvalue safety (avoids 1/sqrt(0) if perfectly redundant).
+        w_safe = np.maximum(w, 1e-12)
+        T_block = U @ np.diag(1.0 / np.sqrt(w_safe)) @ U.T
+        for ii, gi in enumerate(idxs):
+            for jj, gj in enumerate(idxs):
+                T[gi, gj] = T_block[ii, jj]
+    return T
+
+
 def _canonical_eigh(H: np.ndarray, S: np.ndarray, eig_tol: float = 1e-2):
     """Generalized eigh ``H C = S C diag(w)`` via canonical
     orthogonalization. Diagonalizes ``S`` first, drops basis directions
@@ -113,9 +146,11 @@ def gfn0_energy(atoms: list[int], coords_ang: np.ndarray, *, charge: int = 0) ->
     # 4. Core Hamiltonian (numpy → mx.array boundary cast).
     H_np = build_hcore(atoms_list, coords, basis, S, cn, q)
 
-    # 5. Generalized eigh via canonical orthogonalization (handles the
-    # near-singular S that arises with auxiliary shells included).
-    eigvals, C, n_active = _canonical_eigh(H_np, S, eig_tol=1e-2)
+    # 5. Generalized eigh on the (H, S) pair. With aux shells skipped
+    # (see basis.py) S is well-conditioned and standard eigh works.
+    from scipy.linalg import eigh as _scipy_eigh
+    eigvals, C = _scipy_eigh(H_np, S)
+    n_active = len(eigvals)
 
     # 6. Closed-shell density: P = 2 * C_occ @ C_occ.T
     n_elec = int(round(sum(GFN0_PARAMS[Z].shells.__len__() == 1 and GFN0_PARAMS[Z].Z or 0 for Z in atoms_list)))

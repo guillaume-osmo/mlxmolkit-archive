@@ -30,7 +30,8 @@ import numpy as np
 from .params_gfn0 import GFN0_PARAMS, GFN0ElementParams, GFN0Shell
 from .sto_ng import (
     STO3GShell,
-    get_sto3g,
+    get_sto_ng,
+    gfn0_n_gauss,
     primitive_norm_p,
     primitive_norm_s,
 )
@@ -43,24 +44,17 @@ _ANG_TO_BOHR = 1.8897259886
 class BasisFunction:
     """One Cartesian basis function in the molecular AO basis.
 
-    Attributes:
-        atom_idx: index of the atom this BF lives on
-        l_total: angular momentum (0 = s, 1 = p)
-        l_xyz: ``(lx, ly, lz)`` Cartesian decomposition; for s = (0,0,0),
-            for p_x = (1,0,0), p_y = (0,1,0), p_z = (0,0,1).
-        center: ``(3,)`` position in Bohr (the convention used by the
-            primitive overlap formulas).
-        alphas: primitive Gaussian exponents (Bohr^-2), 3 values for STO-3G.
-        coeffs: contraction coefficients × primitive normalizations × the
-            outer contraction normalization, so that ``Σ_i Σ_j c_i c_j
-            <g_i|g_j> = 1`` for this contracted basis function.
+    The ``is_valence`` flag matches xtb's ``valenceShell`` flag and
+    determines which branch of ``h0scal`` (val-val, val-aux, aux-aux)
+    builds the off-diagonal Hcore element with this BF.
     """
     atom_idx: int
     l_total: int
     l_xyz: tuple[int, int, int]
-    center: np.ndarray             # (3,) Bohr
-    alphas: np.ndarray             # (3,)
-    coeffs: np.ndarray             # (3,) including primitive + contraction norms
+    center: np.ndarray
+    alphas: np.ndarray
+    coeffs: np.ndarray
+    is_valence: bool = True
 
 
 def _contraction_norm(
@@ -68,14 +62,10 @@ def _contraction_norm(
     raw_coeffs: np.ndarray,
     l_total: int,
 ) -> float:
-    """Compute 1/sqrt(self-overlap) for a contracted Cartesian Gaussian
-    on a specific Cartesian component (e.g. p_x). All components of a
-    given l have the same self-overlap.
+    """Compute 1/sqrt(self-overlap) for a contracted Cartesian Gaussian.
+
+    Works for any number of primitives ``len(alphas) == len(raw_coeffs)``.
     """
-    # self-overlap = Σ_i Σ_j c_i c_j N_i N_j <prim_i | prim_j> at R=0
-    # For two primitives at the same center with same Cartesian quantum:
-    #   <prim_i | prim_j>_0 = (π / (α_i + α_j))^(3/2) * angular_factor(l_total)
-    # where the angular factor for s is 1, for p is 1/(2(α_i+α_j)).
     n = len(alphas)
     ov = 0.0
     for i in range(n):
@@ -87,7 +77,6 @@ def _contraction_norm(
                 norm_i = primitive_norm_s(alphas[i])
                 norm_j = primitive_norm_s(alphas[j])
             elif l_total == 1:
-                # For p_x p_x: angular = 1/(2p)
                 ang = 1.0 / (2.0 * p)
                 norm_i = primitive_norm_p(alphas[i])
                 norm_j = primitive_norm_p(alphas[j])
@@ -129,19 +118,23 @@ def build_basis(
         for shell in p.shells:
             if shell.l > 1:
                 continue
-            if shell.l in seen_l:
-                # Phase A0: skip auxiliary shells. With our STO-3G fits
-                # the H 2s aux overlaps H 1s at S=0.98 on the same atom;
-                # neither canonical orthogonalization (drops too much
-                # info) nor naive inclusion (gives -19 Ha spurious eigs)
-                # works without xtb's mixed STO-NG fits or per-atom
-                # Lowdin orthogonalization. Both are substantial follow-
-                # up work; for now we keep the minimal valence basis
-                # which gives chemically-sensible eigenvalues at the
-                # cost of ~50-150 kcal/mol parity to xtb.
+            is_valence = shell.l not in seen_l
+            if not is_valence:
+                # Phase A0: skip aux. Even with STO-2G for the H 2s aux
+                # and per-atom Lowdin orthogonalization, our STO-NG fits
+                # produce a same-atom <1s|2s> ≈ 0.98 — the function
+                # representations are not what xtb uses internally.
+                # Achieving xtb-parity here requires reverse-engineering
+                # xtb's actual aux-shell representation (likely a direct
+                # Slater orbital projected onto an orthogonal complement
+                # of valence on the same atom, NOT a separate STO-NG fit).
                 continue
             seen_l.add(shell.l)
-            sto = get_sto3g(shell.n, shell.l)
+            # Mixed STO-NG per xtb's setGFN0NumberOfPrimitives:
+            # H/He valence s = STO-3G, aux s = STO-2G; everything else
+            # we have vendored = STO-3G (heavier-element STO-4G+ TBD).
+            n_gauss = gfn0_n_gauss(int(Z), shell.l, shell.n, is_valence)
+            sto = get_sto_ng(shell.n, shell.l, n_gauss)
             zeta_sq = shell.zeta * shell.zeta
             alphas = np.array(sto.alphas, dtype=np.float64) * zeta_sq
             raw_coeffs = np.array(sto.coeffs, dtype=np.float64)
@@ -159,6 +152,7 @@ def build_basis(
                 out.append(BasisFunction(
                     atom_idx=atom_idx, l_total=0, l_xyz=(0, 0, 0),
                     center=center, alphas=alphas, coeffs=full_coeffs,
+                    is_valence=is_valence,
                 ))
             else:  # l == 1: p_x, p_y, p_z
                 for axis in range(3):
@@ -167,6 +161,7 @@ def build_basis(
                     out.append(BasisFunction(
                         atom_idx=atom_idx, l_total=1, l_xyz=tuple(l_xyz),
                         center=center, alphas=alphas, coeffs=full_coeffs,
+                        is_valence=is_valence,
                     ))
     return out
 

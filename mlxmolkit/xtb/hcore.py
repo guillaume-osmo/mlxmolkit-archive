@@ -126,7 +126,7 @@ def build_hcore(
             if shell.l > 1:
                 continue
             if shell.l in seen_l:
-                continue
+                continue                          # aux shell skipped (matches basis.py)
             seen_l.add(shell.l)
             n_components = 1 if shell.l == 0 else 3
             for _ in range(n_components):
@@ -163,28 +163,34 @@ def build_hcore(
         bm = basis[mu]
         s_mu = bf_shells[mu]
         A = bm.atom_idx
+        val_mu = bm.is_valence
         for nu in range(mu + 1, n_basis):
             bn = basis[nu]
             s_nu = bf_shells[nu]
             B = bn.atom_idx
-            # Same-atom off-diagonals are a special case in xtb (different
-            # treatment for orthogonality of shells on same center). For
-            # Phase A0, leave H_μν = 0 for same-atom different-shell pairs.
-            # The diagonal already carries the shell-resolved h. xtb actually
-            # has a small same-atom coupling but skipping it is an O(0.1 eV)
-            # error at worst.
+            val_nu = bn.is_valence
             if A == B:
-                continue
+                continue                       # same-atom: H_μν = 0 here
             l_mu = s_mu.l
             l_nu = s_nu.l
-            d_chi = en_atoms[A] - en_atoms[B]
-            d_chi2 = d_chi * d_chi
-            # Shell-pair EN scale, exactly matching xtb gfn0.f90:800-802:
-            #   enScale[i,j] = 0.005 * (en[i] + en[j])   (sum, NOT average)
-            sum_en = _shell_enscale(l_mu) + _shell_enscale(l_nu)
-            enpoly = 1.0 + 0.005 * sum_en * d_chi2 * (1.0 + g.enscale4 * d_chi2)
-            kscale = 0.5 * (_shell_kscale(l_mu) + _shell_kscale(l_nu))
-            K_AB = kscale * enpoly  # pairParam = 1 for main-group
+            # h0scal — xtb scc.f90:644-680. Three branches:
+            if val_mu and val_nu:
+                # valence-valence: full EN-modulated product
+                d_chi = en_atoms[A] - en_atoms[B]
+                d_chi2 = d_chi * d_chi
+                sum_en = _shell_enscale(l_mu) + _shell_enscale(l_nu)
+                enpoly = 1.0 + 0.005 * sum_en * d_chi2 * (1.0 + g.enscale4 * d_chi2)
+                kscale = 0.5 * (_shell_kscale(l_mu) + _shell_kscale(l_nu))
+                K_AB = kscale * enpoly  # pairParam = 1 (main group)
+            elif (not val_mu) and (not val_nu):
+                # aux-aux: km = kDiff (the "DZ" scale)
+                K_AB = g.kdiff
+            elif val_mu and not val_nu:
+                # val-aux: km = ½(kScale[lν,lν] + kDiff)
+                K_AB = 0.5 * (_shell_kscale(l_nu) + g.kdiff)
+            else:
+                # aux-val: km = ½(kScale[lμ,lμ] + kDiff)
+                K_AB = 0.5 * (_shell_kscale(l_mu) + g.kdiff)
             # Distance-dependent shell-poly Π
             R_AB_bohr = float(np.linalg.norm(coords[A] - coords[B]))
             r_sum_bohr = r_A_bohr[A] + r_A_bohr[B]
