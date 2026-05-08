@@ -125,12 +125,22 @@ def build_basis(
     for atom_idx, Z in enumerate(atoms):
         p = params_dict[int(Z)]
         center = coords_bohr[atom_idx]
+        seen_l: set[int] = set()
         for shell in p.shells:
             if shell.l > 1:
                 # Skip d/f for Phase A. The basis would still be valid
                 # without them; energies will deviate from xtb on heavy
                 # elements but H/C/N/O/F are unaffected.
                 continue
+            if shell.l in seen_l:
+                # Phase A0 simplification: skip auxiliary shells of the
+                # same l (H's 2s, He's 2p, ...). With our STO-3G fits
+                # they overlap their main shell at ~0.98 on the same
+                # atom and produce a near-singular S. Real GFN0 handles
+                # this via mixed STO-NG (different N per shell) and
+                # canonical orthogonalization; both are deferred.
+                continue
+            seen_l.add(shell.l)
             sto = get_sto3g(shell.n, shell.l)
             zeta_sq = shell.zeta * shell.zeta
             alphas = np.array(sto.alphas, dtype=np.float64) * zeta_sq

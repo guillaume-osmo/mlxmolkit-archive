@@ -121,9 +121,13 @@ def build_hcore(
     cursor = 0
     for at_idx, Z in enumerate(atoms):
         p = GFN0_PARAMS[int(Z)]
+        seen_l: set[int] = set()
         for shell in p.shells:
             if shell.l > 1:
                 continue                          # d skipped per Phase A scope
+            if shell.l in seen_l:
+                continue                          # auxiliary shell skipped
+            seen_l.add(shell.l)
             n_components = 1 if shell.l == 0 else 3
             for _ in range(n_components):
                 bf_shells[cursor] = shell
