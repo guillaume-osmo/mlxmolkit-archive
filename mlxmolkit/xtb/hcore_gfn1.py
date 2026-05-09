@@ -58,6 +58,45 @@ def _shell_kscale(l1: int, l2: int) -> float:
     return 0.5 * (k[l1] + k[l2])
 
 
+# Per-element-pair scaling on the val-val H0 off-diagonal (gfn1.f90:680-696
+# + setGFN1PairParam at gfn1.f90:774). Default = 1.0 for non-listed pairs.
+# Transition-metal block: kp = [1.1, 1.2, 1.2] for rows (Sc-Cu, Y-Ag, La-Au).
+_GFN1_PAIRPARAM_OVERRIDES: dict[tuple[int, int], float] = {
+    (1, 1):   0.96,
+    (5, 1):   0.95, (1, 5):   0.95,
+    (7, 1):   1.04, (1, 7):   1.04,
+    (28, 1):  0.90, (1, 28):  0.90,
+    (75, 1):  0.80, (1, 75):  0.80,
+    (78, 1):  0.80, (1, 78):  0.80,
+    (15, 5):  0.97, (5, 15):  0.97,
+    (14, 7):  1.01, (7, 14):  1.01,
+}
+
+
+def _dblock_row(Z: int) -> int:
+    """Map Z to xtb's transition-metal row index (1-3) or 0 if not in d-block."""
+    if 21 <= Z <= 29:
+        return 1
+    if 39 <= Z <= 47:
+        return 2
+    if 57 <= Z <= 79:
+        return 3
+    return 0
+
+
+def _gfn1_pair_param(Zi: int, Zj: int) -> float:
+    """``pairParam(izp, jzp)`` per gfn1.f90:680-696 + setGFN1PairParam."""
+    key = (int(Zi), int(Zj))
+    if key in _GFN1_PAIRPARAM_OVERRIDES:
+        return _GFN1_PAIRPARAM_OVERRIDES[key]
+    iTr = _dblock_row(int(Zi))
+    jTr = _dblock_row(int(Zj))
+    if iTr > 0 and jTr > 0:
+        kp = (1.1, 1.2, 1.2)
+        return 0.5 * (kp[iTr - 1] + kp[jTr - 1])
+    return 1.0
+
+
 def _set_gfn1_kcn(Z: int, l: int) -> float:
     """GFN1's per-shell CN-shift coefficient. From setGFN1kCN
     (gfn1.f90:765+) — for GFN1 it depends on selfEnergy and a
@@ -175,7 +214,8 @@ def build_hcore_gfn1(
                 # GFN1: enscale[i,j] = 0.005·(enshell+enshell), enscale4=0.
                 enscale_ij = 0.005 * (g.enshell + g.enshell)
                 enpoly = 1.0 + enscale_ij * den2
-                K_AB = _shell_kscale(l_mu, l_nu) * enpoly
+                pair_p = _gfn1_pair_param(atoms[A], atoms[B])
+                K_AB = _shell_kscale(l_mu, l_nu) * enpoly * pair_p
             elif (not val_mu) and (not val_nu):
                 K_AB = g.kdiff
             elif val_mu and not val_nu:
