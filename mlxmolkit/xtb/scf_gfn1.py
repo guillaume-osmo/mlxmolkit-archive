@@ -37,7 +37,12 @@ from __future__ import annotations
 import numpy as np
 import mlx.core as mx
 
-from .basis import build_basis, overlap_matrix, BasisFunction
+from .basis import (
+    build_basis,
+    overlap_matrix,
+    sao_basis_metadata,
+    BasisFunction,
+)
 from .cn import coordination_number_erf
 from .dispersion_d3 import d3bj_dispersion_gfn1
 from .eeq import eeq_charges_and_energy
@@ -106,9 +111,19 @@ def _build_shell_layout(
         z_val = float(int(Z) - _ncore(int(Z)))
         ntot = -1.0e-6
         for shell in p.shells:
-            if shell.l > 1:
+            if shell.l > 2:
+                # f shells deferred — nothing in GFN1/GFN2 needs them
                 continue
-            n_components = 1 if shell.l == 0 else 3
+            # n_components in *the basis we're indexing* (SAO):
+            #   l=0 → 1 (s)
+            #   l=1 → 3 (px, py, pz)
+            #   l=2 → 5 (pure d: x²-y², z², xy, xz, yz — after dtrf2)
+            if shell.l == 0:
+                n_components = 1
+            elif shell.l == 1:
+                n_components = 3
+            else:
+                n_components = 5
             occ = float(_GFN1_REFERENCEOCC[int(Z)][shell.l])
             ntot += occ
             if ntot > z_val:
@@ -116,8 +131,6 @@ def _build_shell_layout(
             shell_atom.append(at_idx)
             shell_l.append(shell.l)
             shell_zref_per_shell.append(occ)
-            # Per-shell hardness: chemicalHardness * (1 + shellHardness[l]).
-            # Matches xtb's setGFN1ShellHardness (gfn1.f90:732+).
             sh_hard = p.chemical_hardness * (1.0 + shell.shell_hardness)
             shell_hard.append(sh_hard)
             for _ in range(n_components):
@@ -168,6 +181,37 @@ def _coulomb_matrix(
                 jmat[i, j] = rterm
             jmat[j, i] = jmat[i, j]
     return jmat
+
+
+def _cao_bf_shells(
+    atoms: list[int],
+    cao_basis: list[BasisFunction],
+) -> list[GFN1Shell]:
+    """Return the per-CAO-BF :class:`GFN1Shell` tag list.
+
+    ``build_hcore_gfn1`` was originally written for an SAO-shaped basis;
+    we still need the per-BF shell tag for the CAO basis so the diagonal
+    self-energy and the off-diagonal K_AB (h0scal) lookups are correct
+    in the CAO matrix elements. The transform to SAO is applied
+    afterwards.
+    """
+    out: list[GFN1Shell] = []
+    cursor = 0
+    for at_idx, Z in enumerate(atoms):
+        p = GFN1_PARAMS[int(Z)]
+        for shell in p.shells:
+            if shell.l > 2:
+                continue
+            n_comp = 1 if shell.l == 0 else (3 if shell.l == 1 else 6)
+            for _ in range(n_comp):
+                # Sanity check: this BF's shell really points at this atom.
+                assert cao_basis[cursor].atom_idx == at_idx
+                out.append(shell)
+                cursor += 1
+    assert cursor == len(cao_basis), (
+        f"_cao_bf_shells exhausted {cursor} BFs, expected {len(cao_basis)}"
+    )
+    return out
 
 
 def _pulay_diis_numpy(
@@ -257,20 +301,26 @@ def gfn1_energy(
     coords_bohr = coords * _ANG_TO_BOHR
     n_atoms = len(atoms_list)
 
-    # 1. Basis + overlap (Gram-Schmidt aux 2s on H atoms).
-    basis = build_basis(
+    # 1. Basis (Cartesian, with 6 components per d-shell). Build the
+    # 6×6 d-blocks in CAO and apply xtb's dtrf2 (CAO→SAO) reduction
+    # *after* building S/H0, so SCF runs in the 5-pure-d SAO basis.
+    cao_basis = build_basis(
         atoms_list, coords, params_dict=GFN1_PARAMS, n_gauss_fn=gfn1_n_gauss,
     )
-    S = overlap_matrix(basis)
-    n_basis = S.shape[0]
+    S_cao = overlap_matrix(cao_basis)
 
-    # 2. Shell layout.
+    # 2. CAO→SAO transform (drops the spurious xx+yy+zz s-component
+    # from each d-shell). For systems with no d-shells, T = I.
+    sao_basis, T = sao_basis_metadata(cao_basis)
+    n_basis = T.shape[0]
+
+    # 3. Shell layout (in SAO terms — 1/3/5 BFs per s/p/d shell).
     (bf_shells, bf_to_shell, shell_atom, shell_l, z_ref, shell_hard) = (
-        _build_shell_layout(atoms_list, basis)
+        _build_shell_layout(atoms_list, sao_basis)
     )
     n_shell = len(shell_atom)
 
-    # 3. CN (same erf-CN as GFN0 — k=7.5).
+    # 4. CN (same erf-CN as GFN0 — k=7.5).
     cn_mx = coordination_number_erf(
         mx.array(coords.astype(np.float32)),
         mx.array(np.asarray(atoms_list, dtype=np.int32)),
@@ -278,8 +328,39 @@ def gfn1_energy(
     mx.eval(cn_mx)
     cn = np.asarray(cn_mx).astype(np.float64)
 
-    # 4. H0 (with GFN1's CN-shifted diagonal).
-    H0, selfE_eV = build_hcore_gfn1(atoms_list, coords, basis, S, cn, bf_shells)
+    # 5. H0 build — xtb-faithful (hamiltonian.F90:307-369):
+    #    • SAO diagonal H0[μ, μ] = selfE_sao[μ] is set DIRECTLY, NOT
+    #      via the T·H0_cao·T^T transform (otherwise the d-shell
+    #      diagonal gets the wrong scaling because S_cao d-block has
+    #      off-diag 1/3 between xx/yy/zz that bleeds into the SAO
+    #      diagonal).
+    #    • Off-diagonal H0[μ, ν] for μ on atom A ≠ B for ν is built in
+    #      CAO and projected via T (= dtrf2 in xtb).
+    cao_bf_shells = _cao_bf_shells(atoms_list, cao_basis)
+    H0_cao_offdiag, selfE_eV_cao = build_hcore_gfn1(
+        atoms_list, coords, cao_basis, S_cao, cn, cao_bf_shells,
+    )
+    # Strip the CAO diagonal — we only want inter-atomic off-diagonal
+    # contributions to be T-projected.
+    np.fill_diagonal(H0_cao_offdiag, 0.0)
+
+    S = T @ S_cao @ T.T
+    H0 = T @ H0_cao_offdiag @ T.T
+    # Build per-SAO-BF self-energy by mapping back through the SAO
+    # basis: each SAO BF inherits its underlying CAO shell's selfE.
+    # (For s/p, T is identity, so selfE_sao[μ] = selfE_cao[μ]. For d,
+    # all 5 SAO BFs of one d-shell share the same shell selfE — we
+    # pick any one of the 6 CAO BFs in that shell.)
+    selfE_eV = np.zeros(n_basis, dtype=np.float64)
+    for mu_sao, b in enumerate(sao_basis):
+        # Find any CAO BF with matching shell_id (or atom + same l_total
+        # for the s/p case where shell_id matches).
+        for mu_cao, bc in enumerate(cao_basis):
+            if bc.shell_id == b.shell_id:
+                selfE_eV[mu_sao] = selfE_eV_cao[mu_cao]
+                break
+    # Add the diagonal (selfE in Hartree) on the SAO side.
+    H0 = H0 + np.diag(selfE_eV * _HARTREE_PER_EV)
 
     # 5. Coulomb matrix γ(R, η).
     jmat = _coulomb_matrix(coords_bohr, shell_atom, shell_hard, g_exp=GFN1_GLOBALS.alphaj)

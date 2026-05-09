@@ -151,6 +151,9 @@ _PALPHA4 = (
     (1.853180239e+0, 1.915075719e-1, 8.655487938e-2, 4.184253862e-2),    # 3p
     (1.492607880e+0, 4.327619272e-1, 7.553156064e-2, 3.706272183e-2),    # 4p
     (3.962838833e-1, 1.838858552e-1, 4.943555157e-2, 2.750222273e-2),    # 5p
+    (9.185846715e-1, 2.920461109e-1, 1.187568890e-1, 5.286755896e-2),    # 3d
+    (1.995825422e+0, 1.823461280e-1, 8.197240896e-2, 4.000634951e-2),    # 4d
+    (4.230617826e-1, 8.293863702e-2, 4.590326388e-2, 2.628744797e-2),    # 5d
 )
 
 _PCOEFF4 = (
@@ -163,6 +166,9 @@ _PCOEFF4 = (
     (-1.434249391e-2, 2.755177589e-1, 5.846750879e-1, 2.144986514e-1),   # 3p
     (-6.035216774e-3, -6.013310874e-2, 6.451518200e-1, 4.117923820e-1),  # 4p
     (-1.801459207e-2, -1.360777372e-1, 7.533973719e-1, 3.409304859e-1),  # 5p
+    (5.799057705e-2, 3.045581349e-1, 5.601358038e-1, 2.432423313e-1),    # 3d
+    (-2.816702620e-3, 2.177095871e-1, 6.058047348e-1, 2.717811257e-1),   # 4d
+    (-2.421626009e-2, 3.937644956e-1, 5.489520286e-1, 1.190436963e-1),   # 5d
 )
 
 # ---------------------------------------------------------------------------
@@ -297,6 +303,20 @@ def primitive_norm_p(alpha) -> np.ndarray:
     """
     a = np.asarray(alpha)
     return (2.0 * a / np.pi) ** 0.75 * np.sqrt(4.0 * a)
+
+
+def primitive_norm_d(alpha) -> np.ndarray:
+    """Cartesian d-Gaussian normalization: ``(2α/π)^(3/4) · (4α) / sqrt(3)``.
+
+    For l=2, ``sqrt(4α)^l = 4α``; the angular factor
+    ``1/sqrt(dfactorial(l+1))`` is ``1/sqrt(3)`` (xtb dfactorial(3)=3).
+    Note: this norm is for the bare Cartesian primitive (e.g. xx, yy,
+    zz, xy, xz, yz). The pure-d shell is built by linearly combining
+    six such Cartesian functions and then applying xtb's dtrf2 (CAO→SAO)
+    transform — see :func:`mlxmolkit.xtb.basis.cao_to_sao_transform`.
+    """
+    a = np.asarray(alpha)
+    return (2.0 * a / np.pi) ** 0.75 * (4.0 * a) / np.sqrt(3.0)
 
 
 def gfn0_n_gauss(Z: int, l: int, n_principal: int, is_valence: bool) -> int:

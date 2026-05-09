@@ -204,6 +204,13 @@ def build_hcore_gfn1(
             B = bn.atom_idx
             val_nu = bn.is_valence
             if A == B:
+                # xtb's hamiltonian.F90:307-369 only sets the SAO
+                # diagonal on same-atom shells (selfE per shell), and
+                # accumulates dipole/quadrupole integrals — NOT H0
+                # off-diagonals. Same-atom off-diag H0 is zero in the
+                # CAO basis; the d-shell diagonal-energy correction
+                # is handled afterwards by the SAO-side diagonal patch
+                # (see scf_gfn1.gfn1_energy).
                 continue
             l_mu = s_mu.l
             l_nu = s_nu.l
