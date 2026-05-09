@@ -89,7 +89,8 @@ _R4R2 = _D4["r4r2"]                  # (118,) — sqrt(0.5·r4_over_r2·sqrt(Z))
 
 _ANG_TO_BOHR = 1.8897259886
 
-# D4 globals for GFN2-xTB (read_gfn_param.f90:177-179)
+# D4 globals for GFN2-xTB (xtb/src/xtb/gfn2.f90:66 — s6=1, s8=2.7, a1=0.52,
+# a2=5, s9=5; default par%alp=16 from xtb/src/type/param.f90:92)
 GFN2_D4 = {
     "g_a": 3.0,
     "g_c": 2.0,
@@ -98,6 +99,8 @@ GFN2_D4 = {
     "s8":  2.7,
     "a1":  0.52,
     "a2":  5.0,
+    "s9":  5.0,
+    "alp": 16,
 }
 
 # D4 CN constants (ncoord.f90:55-59)
@@ -287,6 +290,7 @@ def d4_dispersion_native(
     g_a: float | None = None,
     g_c: float | None = None,
     wf: float | None = None,
+    s9: float | None = None,
 ) -> float:
     """D4 dispersion energy in Hartree (BJ damping, no ATM yet).
 
@@ -309,6 +313,7 @@ def d4_dispersion_native(
     if g_a is None: g_a = GFN2_D4["g_a"]
     if g_c is None: g_c = GFN2_D4["g_c"]
     if wf is None:  wf  = GFN2_D4["wf"]
+    if s9 is None:  s9  = GFN2_D4["s9"]
 
     atoms_arr = np.asarray(atoms, dtype=np.int64)
     coords = np.asarray(coords_ang, dtype=np.float64) * _ANG_TO_BOHR
@@ -364,6 +369,44 @@ def d4_dispersion_native(
             t8 = 1.0 / (R2 ** 4 + r0 ** 8)
             disp = s6 * t6 + s8 * r4r2ij * t8
             e += -float(c6[i, j]) * disp
+
+    # ATM (s9) three-body term — verbatim port of deriv_atm_triple
+    # (energy only) at xtb/src/disp/dftd4.F90:2354-2386. For GFN2,
+    # s9 = 5.0 and alp = 16 (par%alp default).
+    if s9 > 0.0:
+        alp = GFN2_D4.get("alp", 16)
+        for i in range(n):
+            for j in range(i + 1, n):
+                rij_v = coords[j] - coords[i]
+                r2_ij = float(np.dot(rij_v, rij_v))
+                cij = a1 * np.sqrt(3.0 * r4r2_per[i] * r4r2_per[j]) + a2
+                for k in range(j + 1, n):
+                    rik_v = coords[k] - coords[i]
+                    rjk_v = coords[k] - coords[j]
+                    r2_ik = float(np.dot(rik_v, rik_v))
+                    r2_jk = float(np.dot(rjk_v, rjk_v))
+                    cik = a1 * np.sqrt(3.0 * r4r2_per[i] * r4r2_per[k]) + a2
+                    cjk = a1 * np.sqrt(3.0 * r4r2_per[j] * r4r2_per[k]) + a2
+                    c6ij = float(c6[i, j])
+                    c6ik = float(c6[i, k])
+                    c6jk = float(c6[j, k])
+                    c9 = -float(np.sqrt(c6ij * c6ik * c6jk))
+                    rrr2 = r2_ij * r2_jk * r2_ik
+                    rrr1 = float(np.sqrt(rrr2))
+                    rrr3 = rrr1 * rrr2
+                    ang_fact = 0.375 / (rrr2 * rrr3)
+                    ang = (
+                        ang_fact
+                        * (r2_ij + r2_jk - r2_ik)
+                        * (r2_ij - r2_jk + r2_ik)
+                        * (-r2_ij + r2_jk + r2_ik)
+                        + 1.0 / rrr3
+                    )
+                    ccc1 = cij * cjk * cik
+                    cralp = (ccc1 / rrr1) ** (alp / 3.0)
+                    fdmp = 1.0 / (1.0 + 6.0 * cralp)
+                    # All triple_scale values are 1.0 for i<j<k distinct.
+                    e += s9 * (-fdmp * ang * c9)
     return e
 
 
