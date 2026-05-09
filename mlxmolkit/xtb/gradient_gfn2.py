@@ -138,13 +138,16 @@ def _fd_grad_scalar(
     return g
 
 
-def _aes_full_energy_at(
-    atoms_list, coords_ang, P_sao, qsh, shell_atom,
-):
-    """Compute E_aes at perturbed coords with frozen P, qsh — but
-    everything downstream of P (Mulliken multipoles dipm, qp; gab3,
-    gab5 via radCN) recomputed from the new geometry. Used as the FD
-    energy-side AES contribution.
+def _aes_full_energy_at(atoms_list, coords_ang, P_sao, qsh, shell_atom):
+    """E_aes at perturbed coords with frozen P and qsh; everything
+    downstream (dipm/qp via Mulliken from perturbed dpint/qpint;
+    gab3/gab5 via radcn(CN); rij directly) recomputed.
+
+    Captures ∂E_aes/∂R through every path *implicitly* — including the
+    Mulliken multipole chain that the analytical band-piece would need
+    an origin-shifted multipole-integral derivative kernel to do
+    explicitly. Used as the AES FD piece in the GFN2 analytical
+    gradient assembler.
     """
     from .aes import aniso_electro, get_radcn, mmomgabzero, mmompop
     from .basis import build_basis, sao_basis_metadata
@@ -316,14 +319,11 @@ def gfn2_gradient_analytical(
     # ----- 5. Repulsion (analytical) -----
     g_rep_a = _gfn2_repulsion_gradient(atoms, coords)
 
-    # ----- 6/7. AES + D4 (FD on closed-form energies) -----
-    # Full E_aes derivative — recomputes dipm/qp from perturbed
-    # dpint/qpint and gab3/gab5 from radCN(CN). Captures the AES band
-    # contribution implicitly through the Mulliken multipole
-    # construction. Cleaner derivation (separating band-via-F_aes vs
-    # explicit-via-E_aes without double-count) is the natural follow-up
-    # to enable swapping in the FD-verified analytical kernels in
-    # :mod:`multipole_grad`.
+    # ----- 6/7. AES + D4 (FD on full E_aes recompute) -----
+    # FD recomputes everything downstream of P (Mulliken multipoles
+    # dipm/qp from perturbed dpint/qpint, gab3/gab5 from radcn(CN),
+    # rij directly). Captures ∂E_aes/∂R fully — at the cost of being
+    # a 2N+1 closed-form integral build (no SCF).
     g_aes_a = _fd_grad_scalar(
         atoms, coords,
         lambda c: _aes_full_energy_at(atoms, c, P_sao, qsh, shell_atom),
@@ -335,16 +335,19 @@ def gfn2_gradient_analytical(
         h=fd_h_aux,
     )
 
-    # NOTE: the analytical multipole-derivative kernels (∂dpint/∂r,
-    # ∂qpint/∂r in :mod:`multipole_grad`) are FD-verified to 5e-12 in
-    # isolation. The naive plug-in via xtb-style band-piece accounting
-    # (trace(P · ∂F_aes/∂R) with vs/vd/vq held fixed) double-counts the
-    # AES FD path and overshoots — the variational relationship between
-    # fockelectro's F_aes and aniso_electro's E_aes for GFN2 is more
-    # subtle than "trace(P·F_aes) = 2·E_aes". A clean derivation is
-    # needed before wiring; deferred so we ship today's strategic-
-    # purity multipole-derivative tooling without breaking the
-    # gradient. Empirical residual stays at ~6e-3 Ha/Å on H2O.
+    # NOTE: the analytical ∂F_aes/∂R band piece (xtb's dtmp/qtmp at
+    # build_dSDQH0_gpu.f90:995-1002) needs the *origin-shifted* multipole
+    # derivative (xtb's `sdqg2`, computed by `shiftintg_gpu` from the
+    # frame-origin `sdqg`). Our :mod:`multipole_grad` kernel computes
+    # the frame-origin form correctly (FD-verified to 5e-12) but the
+    # origin shift to atom-iat-centered multipoles needed for the AES
+    # variational derivative is one transformation away. Deriving and
+    # verifying that transformation is the natural follow-up; for now
+    # gradient_gfn2 keeps a zero band-aes piece and falls back to the
+    # full-E_aes FD path. Empirical residual at H2O stays ~6e-3 Ha/Å
+    # — above ANCopt's gtol, so the production opt path
+    # (gfn2_alpb_water_optimize) keeps using tblite's analytical
+    # gradient (which has the correct shift).
     g_band_aes_b = np.zeros((n_atoms, 3), dtype=np.float64)
 
     # Total: convert Ha/Bohr pieces to Ha/Å.
