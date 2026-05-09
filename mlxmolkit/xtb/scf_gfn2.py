@@ -208,9 +208,16 @@ def _gfn2_repulsion(atoms, coords_ang) -> float:
         E_rep = Σ_{i<j} (Z*_i Z*_j / R_ij^rExp)
                        · exp(-sqrt(α_i α_j) · R_ij^kExp_eff)
 
-    with ``kExp_eff = kExp = 1.5`` if both atoms have Z > 2, else
-    ``kExpLight = 1.0`` (gfn2.f90:88-92 — the light-element override).
-    rExp = 1.0 (just R, no extra power).
+    with ``kExp_eff`` selected per xtb/src/xtb/repulsion.F90:98-102:
+
+        if Z_i > 2 .or. Z_j > 2:    kExp_eff = kExp = 1.5
+        else:                       kExp_eff = kExpLight = 1.0
+
+    i.e. ``kExpLight = 1.0`` is used **only when BOTH atoms are light**
+    (Z ≤ 2). Otherwise — including all H-X with X heavier — the
+    standard ``kExp = 1.5`` is used. Earlier we had this inverted
+    (``min(Zi, Zj) ≤ 2``) which gave H-X repulsion that was too soft
+    by ~30 kcal/mol per X-H bond.
     """
     g = GFN2_GLOBALS
     coords = np.asarray(coords_ang, dtype=np.float64) * _ANG_TO_BOHR
@@ -225,7 +232,7 @@ def _gfn2_repulsion(atoms, coords_ang) -> float:
             Zj = atoms[j]
             pj = GFN2_PARAMS[Zj]
             R = float(np.linalg.norm(coords[i] - coords[j]))
-            kexp = g.kexp_light if min(Zi, Zj) <= 2 else g.kexp
+            kexp = g.kexp if (Zi > 2 or Zj > 2) else g.kexp_light
             alpha = float(np.sqrt(pi.rep_alpha * pj.rep_alpha))
             zeff = pi.rep_zeff * pj.rep_zeff
             e += zeff / (R ** g.rexp) * float(np.exp(-alpha * R ** kexp))
