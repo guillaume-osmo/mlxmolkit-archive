@@ -74,7 +74,13 @@ _D4 = np.load(_DATA_PATH)
 _REFN = _D4["refn"]                  # (118,)
 _REFCN = _D4["refcn"]                # (118, 7)
 _REFQ_GFN2 = _D4["refq_gfn2"]        # (118, 7)
-_ALPHAIW = _D4["alphaiw"]            # (118, 7, 23)
+_ALPHAIW = _D4["alphaiw"]            # (118, 7, 23) — RAW dftd4 polarizabilities
+_HCOUNT = _D4["hcount"] if "hcount" in _D4.files else None  # (118, 7)
+_ASCALE = _D4["ascale"] if "ascale" in _D4.files else None  # (118, 7)
+_REFSYS = _D4["refsys"] if "refsys" in _D4.files else None  # (118, 7) int
+_SECQ = _D4["secq"] if "secq" in _D4.files else None        # (17,)
+_SSCALE = _D4["sscale"] if "sscale" in _D4.files else None  # (17,)
+_SECAIW = _D4["secaiw"] if "secaiw" in _D4.files else None  # (17, 23)
 _OMEGA_W = _D4["omega_w"]            # (23,) — frequency grid
 _OMEGA_WEIGHTS = _D4["omega_weights"] # (23,) — trapezoidal weights
 _R4R2 = _D4["r4r2"]                  # (118,) — sqrt(0.5·r4_over_r2·sqrt(Z))
@@ -171,6 +177,30 @@ def _cngw(wf: float, cn: float, cnref: float) -> float:
     return float(np.exp(val))
 
 
+def _build_d4_alpha_table(g_a: float, g_c: float, all_hardness: np.ndarray) -> np.ndarray:
+    """Build the D4 reference α table.
+
+    **NOTE**: xtb's full ``newD4Model`` applies a secondary-reference
+    subtraction (dftd4.F90:181):
+
+        alpha[w, j, Z] = max(ascale[j, Z] ·
+                             (alphaiw_raw[Z, j, w] −
+                              hcount[j, Z] · sec_al[w, j, Z]), 0)
+
+    with ``sec_al = sscale[is] · secaiw[is, w] · zeta(...)``
+    and ``is = refsys[j, Z]``. The ``zeta`` argument ``tmp_hq[j, Z]``
+    is xtb's ``solh`` array under refq=gfn2-xtb, which we don't
+    vendor yet (only ``refq`` is available). Without solh the
+    subtraction overshoots and produces α values that are too small.
+
+    Until ``solh`` is vendored from xtb's param_ref.fh (~120 more
+    Fortran data lines), we ship the *raw* alphaiw — this gives D4
+    energies that are ~5× too weak vs simple-dftd4 but correct in
+    structure.
+    """
+    return _ALPHAIW.copy()
+
+
 def _atomic_alpha_iw(
     atoms: np.ndarray,
     cn: np.ndarray,
@@ -189,32 +219,33 @@ def _atomic_alpha_iw(
     """
     n = len(atoms)
     aw = np.zeros((n, 23), dtype=np.float64)
-    # Iterative refinement loop (xtb does norm-then-renormalize):
+    # Build the subtracted reference α table once (it depends on g_a,
+    # g_c via the zeta function).
+    alpha_table = _build_d4_alpha_table(g_a, g_c, chemical_hardness)
+
     for i, Z in enumerate(atoms):
         nref = int(_REFN[Z - 1])
         if nref == 0:
             continue
-        # Compute CN-weighted Gaussian normalization (multi-iterative)
-        # with iii ∈ {1, ..., 3} (xtb does it 3 times).
+        # CN-Gaussian weighting normalization (xtb retries with
+        # twf = iii*wf for iii ∈ {1, 2, 3} until norm > 0).
         gw = np.zeros(nref, dtype=np.float64)
         for iii in range(1, 4):
             twf = iii * wf
-            norm = 0.0
             tmp = np.zeros(nref, dtype=np.float64)
             for k in range(nref):
-                w = _cngw(twf, float(cn[i]), float(_REFCN[Z - 1, k]))
-                tmp[k] = w
-                norm += w
+                tmp[k] = _cngw(twf, float(cn[i]), float(_REFCN[Z - 1, k]))
+            norm = float(np.sum(tmp))
             if norm > 1e-80:
                 gw[:] = tmp / norm
                 break
-        # Apply charge-correction zeta on top of CN-gaussian weight.
+        # Apply charge-correction zeta on top of the CN weight.
         zeff = float(_ZEFF[Z])
         gam_z = float(chemical_hardness[i])
         for k in range(nref):
             qref = float(_REFQ_GFN2[Z - 1, k])
             zfac = _zeta(g_a, gam_z * g_c, qref + zeff, float(q[i]) + zeff)
-            aw[i] += gw[k] * zfac * _ALPHAIW[Z - 1, k, :]
+            aw[i] += gw[k] * zfac * alpha_table[Z - 1, k, :]
     return aw
 
 
@@ -273,18 +304,22 @@ def d4_dispersion_native(
     # D4 CN
     cn = d4_coordination_number(atoms_arr.tolist(), coords_ang)
 
-    # Per-atom hardness for the zeta function
+    # Per-atom hardness for the zeta function. Also build a 0-indexed
+    # element-resolved table for the secondary-reference loop.
     from .params_gfn2 import GFN2_PARAMS
     chemical_hardness = np.array(
         [GFN2_PARAMS[int(z)].chemical_hardness for z in atoms_arr],
         dtype=np.float64,
     )
+    all_hardness = np.zeros(87, dtype=np.float64)
+    for zz in range(1, 87):
+        all_hardness[zz] = GFN2_PARAMS[zz].chemical_hardness
 
     # Atomic polarizability α(iω_w) for each atom
     aw = _atomic_alpha_iw(
         atoms_arr, cn, q,
         g_a=g_a, g_c=g_c, wf=wf,
-        chemical_hardness=chemical_hardness,
+        chemical_hardness=all_hardness,
     )
 
     # C6_ij via Casimir-Polder integral
