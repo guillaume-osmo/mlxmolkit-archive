@@ -129,3 +129,90 @@ def gfn2_energy_alpb_water(
     r["energy_kcal"] = r["energy_hartree"] * 627.5094740631
     r["energy_eV"] = r["energy_hartree"] * 27.211386245988
     return r
+
+
+def _tblite_alpb_water_calc(method: str = "GFN2-xTB"):
+    """Build a closure that evaluates ``(E_hartree, grad_Ha_per_Ang)``
+    at a given geometry using tblite's GFN2-xTB + ALPB(water) backend.
+    Matches the ``ancopt`` calc signature.
+    """
+    try:
+        from tblite.interface import Calculator
+    except ImportError as e:
+        raise ImportError(
+            "tblite-python required for the ALPB(water) optimizer. "
+            "Install via 'conda install -c conda-forge tblite-python'."
+        ) from e
+
+    def _calc(atoms, coords_ang, charge: int = 0):
+        nums = np.asarray(atoms, dtype=np.int32)
+        pos_b = np.asarray(coords_ang, dtype=np.float64) * _ANG_TO_BOHR
+        c = Calculator(method, nums, pos_b, charge=float(charge))
+        c.set("verbosity", 0)
+        c.add("alpb-solvation", "water")
+        r = c.singlepoint()
+        e = float(r.get("energy"))
+        g_b = np.asarray(r.get("gradient"), dtype=np.float64)
+        return e, g_b * _ANG_TO_BOHR  # Ha/Bohr → Ha/Å for ANCopt
+
+    return _calc
+
+
+def gfn2_alpb_water_optimize(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    charge: int = 0,
+    max_iter: int = 200,
+    gtol_bohr: float = 1e-3,
+    etol: float = 5e-6,
+    stol_bohr: float = 1e-3,
+    verbose: bool = False,
+) -> dict:
+    """ANCopt geometry optimization with GFN2-xTB + ALPB(water).
+
+    Production entry point for the openCOSMO-RS conformer pipeline —
+    replaces external ``xtb --opt --alpb water`` calls with an
+    in-process ANCopt loop driven by tblite's analytical gradient.
+
+    Args:
+        atoms: atomic numbers.
+        coords_ang: ``(n, 3)`` initial Angstrom coordinates.
+        charge: integer net charge.
+        max_iter / gtol_bohr / etol / stol_bohr: ANCopt convergence
+            knobs (defaults match xtb ``opt_level=normal``).
+        verbose: per-iter diagnostics from ANCopt.
+
+    Returns:
+        Dict from :func:`mlxmolkit.xtb.optimizer.ancopt`. Key fields:
+        ``coords`` (Å), ``energy`` (Ha, including ALPB), ``converged``,
+        ``n_iter``, ``trajectory``.
+
+    Notes:
+        Each ANCopt micro-iter calls tblite once for ``(E, ∇E)``. The
+        tblite path is used because (1) ALPB analytical gradient
+        already exists upstream, (2) it's the canonical reference for
+        the openCOSMO-RS pipeline. The pure-MLX SCF (faithfully
+        reproducing tblite's GFN2 to sub-3 kcal/mol) is exposed
+        separately via :func:`gfn2_energy_alpb_water` for analysis,
+        and a fully MLX-native opt path will land alongside the
+        analytical multipole-derivative kernels and a pure-MLX ALPB.
+    """
+    from .optimizer import ancopt
+
+    coords = np.asarray(coords_ang, dtype=np.float64).copy()
+    calc = _tblite_alpb_water_calc(method="GFN2-xTB")
+
+    def _calc_charged(atoms_, coords_):
+        return calc(atoms_, coords_, charge=charge)
+
+    return ancopt(
+        atoms,
+        coords,
+        _calc_charged,
+        max_iter=max_iter,
+        gtol_bohr=gtol_bohr,
+        etol=etol,
+        stol_bohr=stol_bohr,
+        verbose=verbose,
+    )
