@@ -39,6 +39,7 @@ import mlx.core as mx
 
 from .basis import build_basis, overlap_matrix, BasisFunction
 from .cn import coordination_number_erf
+from .dispersion_d3 import d3bj_dispersion_gfn1
 from .eeq import eeq_charges_and_energy
 from .hcore_gfn1 import build_hcore_gfn1
 from .params_gfn1 import GFN1_GLOBALS, GFN1_PARAMS, GFN1Shell
@@ -386,7 +387,9 @@ def gfn1_energy(
     # because it's the q³·Γ/3 = atomicShift_energy).
     # Matches scf_module.F90:891 form via algebraic equivalence.
     # eel ≡ Σ P·H0 + ½ qsh·J·qsh + ⅓ qat³·Γ. xtb prints H0 + ees + e3 here.
-    E_total_h = PH0_h + E_es_h + E_3rd_h + E_rep_h
+    # D3(BJ) dispersion (uses the same erf-CN we built above)
+    E_d3_h = d3bj_dispersion_gfn1(atoms_list, coords, cn=cn)
+    E_total_h = PH0_h + E_es_h + E_3rd_h + E_rep_h + E_d3_h
     atomization_h = E_atoms_h - E_total_h
 
     return {
@@ -396,7 +399,7 @@ def gfn1_energy(
         "electronic_eV": (PH0_h + E_es_h + E_3rd_h) * _EV_PER_HARTREE,
         "eeq_eV": None,                    # GFN1 absorbs ES into SCF
         "repulsion_eV": E_rep_h * _EV_PER_HARTREE,
-        "dispersion_eV": None,             # TODO D3
+        "dispersion_eV": E_d3_h * _EV_PER_HARTREE,
         "halogen_bond_eV": None,           # TODO halogen-bond term
         "third_order_eV": E_3rd_h * _EV_PER_HARTREE,
         "heat_of_formation_eV": atomization_h * _EV_PER_HARTREE,
