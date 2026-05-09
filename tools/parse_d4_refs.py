@@ -103,6 +103,7 @@ def _parse_2d_scalar(name, dtype):
 
 refcn = _parse_2d_scalar("refcn", np.float64)
 refq_gfn2 = _parse_2d_scalar("refq", np.float64)
+refh = _parse_2d_scalar("refh", np.float64)        # tmp_hq under default refq mode
 hcount = _parse_2d_scalar("hcount", np.float64)
 ascale = _parse_2d_scalar("ascale", np.float64)
 refsys = _parse_2d_scalar("refsys", np.int32)
@@ -213,6 +214,7 @@ np.savez(
     refn=refn,
     refcn=refcn,
     refq_gfn2=refq_gfn2,
+    refh=refh,
     alphaiw=alphaiw,
     hcount=hcount,
     ascale=ascale,

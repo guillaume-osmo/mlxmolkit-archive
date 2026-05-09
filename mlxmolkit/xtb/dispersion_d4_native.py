@@ -78,6 +78,7 @@ _ALPHAIW = _D4["alphaiw"]            # (118, 7, 23) — RAW dftd4 polarizabiliti
 _HCOUNT = _D4["hcount"] if "hcount" in _D4.files else None  # (118, 7)
 _ASCALE = _D4["ascale"] if "ascale" in _D4.files else None  # (118, 7)
 _REFSYS = _D4["refsys"] if "refsys" in _D4.files else None  # (118, 7) int
+_REFH = _D4["refh"] if "refh" in _D4.files else None        # (118, 7) — tmp_hq under default refq mode
 _SECQ = _D4["secq"] if "secq" in _D4.files else None        # (17,)
 _SSCALE = _D4["sscale"] if "sscale" in _D4.files else None  # (17,)
 _SECAIW = _D4["secaiw"] if "secaiw" in _D4.files else None  # (17, 23)
@@ -178,27 +179,45 @@ def _cngw(wf: float, cn: float, cnref: float) -> float:
 
 
 def _build_d4_alpha_table(g_a: float, g_c: float, all_hardness: np.ndarray) -> np.ndarray:
-    """Build the D4 reference α table.
+    """Build the D4 reference α table per xtb's ``newD4Model``
+    (dftd4.F90:169-202):
 
-    **NOTE**: xtb's full ``newD4Model`` applies a secondary-reference
-    subtraction (dftd4.F90:181):
+        sec_al[w, j, Z] = sscale[is] · secaiw[is, w] ·
+                          zeta(g_a, gam[is]·g_c, secq[is]+zeff[is],
+                               refh[Z, j]+zeff[is])
+        alpha[w, j, Z]  = max(ascale[j, Z] ·
+                              (alphaiw_raw[Z, j, w] −
+                               hcount[j, Z] · sec_al[w, j, Z]), 0)
 
-        alpha[w, j, Z] = max(ascale[j, Z] ·
-                             (alphaiw_raw[Z, j, w] −
-                              hcount[j, Z] · sec_al[w, j, Z]), 0)
+    with ``is = refsys[j, Z]``. For the default GFN2-xTB refq mode
+    (which is what xtb runs without solvation), ``tmp_hq = refh``
+    (dftd4.F90:163-164 — the ``case default`` branch).
 
-    with ``sec_al = sscale[is] · secaiw[is, w] · zeta(...)``
-    and ``is = refsys[j, Z]``. The ``zeta`` argument ``tmp_hq[j, Z]``
-    is xtb's ``solh`` array under refq=gfn2-xtb, which we don't
-    vendor yet (only ``refq`` is available). Without solh the
-    subtraction overshoots and produces α values that are too small.
-
-    Until ``solh`` is vendored from xtb's param_ref.fh (~120 more
-    Fortran data lines), we ship the *raw* alphaiw — this gives D4
-    energies that are ~5× too weak vs simple-dftd4 but correct in
-    structure.
+    Returns an ``(118, 7, 23)`` table of subtracted polarizabilities.
     """
-    return _ALPHAIW.copy()
+    if (_HCOUNT is None or _ASCALE is None or _REFSYS is None
+            or _REFH is None or _SECQ is None or _SSCALE is None
+            or _SECAIW is None):
+        return _ALPHAIW.copy()
+    out = np.zeros_like(_ALPHAIW)
+    for Z in range(1, 119):
+        nref = int(_REFN[Z - 1])
+        for j in range(nref):
+            is_idx = int(_REFSYS[Z - 1, j])
+            ascale_zj = float(_ASCALE[Z - 1, j])
+            if is_idx < 1 or is_idx > 17:
+                out[Z - 1, j, :] = ascale_zj * _ALPHAIW[Z - 1, j, :]
+                continue
+            iz = float(_ZEFF[is_idx])
+            gam_is = float(all_hardness[is_idx]) if is_idx < len(all_hardness) else 0.4
+            tmp_hq = float(_REFH[Z - 1, j])
+            zfac = _zeta(g_a, gam_is * g_c, _SECQ[is_idx - 1] + iz, tmp_hq + iz)
+            sec_al = _SSCALE[is_idx - 1] * _SECAIW[is_idx - 1, :] * zfac
+            scaled = ascale_zj * (
+                _ALPHAIW[Z - 1, j, :] - _HCOUNT[Z - 1, j] * sec_al
+            )
+            out[Z - 1, j, :] = np.maximum(scaled, 0.0)
+    return out
 
 
 def _atomic_alpha_iw(
