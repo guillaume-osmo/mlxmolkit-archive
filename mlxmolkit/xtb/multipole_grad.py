@@ -142,6 +142,74 @@ def _multipole_primitive_grad(
     return dD_dA, dD_dB, dQ_dA, dQ_dB
 
 
+def shift_multipole_grad(
+    dS_d: np.ndarray, dD_d: np.ndarray, dQ_d: np.ndarray,
+    S: np.ndarray, D: np.ndarray, Q: np.ndarray,
+    r: np.ndarray, is_deriv_atom: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Shift the origin of multipole-integral derivatives from 0 to r.
+
+    Verbatim port of xtb's ``shiftintg`` (intgrad.f90:703-728). Given
+    frame-origin (origin=0) derivatives, returns derivatives at the
+    new origin = r.
+
+    For ``is_deriv_atom=True``, ``r`` is itself the position of the
+    atom whose coordinate we're differentiating w.r.t. — additional
+    ``δ_αβ`` correction terms fire because ``∂r_α/∂R_β = δ_αβ``. For
+    ``is_deriv_atom=False`` (e.g., shifting the bra-side derivative
+    by the ket atom's position), those correction terms vanish.
+
+    Args:
+        dS_d: ``(3, n, n)`` ∂S/∂R_β, frame origin.
+        dD_d: ``(3, 3, n, n)`` ∂dpint_α/∂R_β, frame origin
+            (axes ``[β, α, μ, ν]``).
+        dQ_d: ``(3, 6, n, n)`` ∂qpint_k/∂R_β, frame origin
+            (xtb k-order: xx, yy, zz, xy, xz, yz).
+        S: ``(n, n)`` overlap, frame origin.
+        D: ``(3, n, n)`` dpint_α, frame origin.
+        Q: ``(6, n, n)`` qpint_k, frame origin.
+        r: ``(3,)`` shift vector (typically an atom position in Bohr).
+        is_deriv_atom: see above.
+
+    Returns:
+        ``(shifted_dD, shifted_dQ)`` at origin = r.
+    """
+    shifted_dD = dD_d.copy()
+    shifted_dQ = dQ_d.copy()
+
+    # Dipole shift: shifted_dpint_α = dpint_α - r_α · S
+    # ⇒ ∂(...)/∂R_β = ∂dpint_α/∂R_β - r_α · ∂S/∂R_β
+    # plus -δ_αβ · S if r is the deriv atom's position.
+    for alpha in range(3):
+        shifted_dD[:, alpha] -= r[alpha] * dS_d
+    if is_deriv_atom:
+        for ax in range(3):
+            shifted_dD[ax, ax] -= S
+
+    # Quadrupole diagonal shift: shifted_qpint_αα = qpint_αα - 2 r_α · dpint_α + r_α² · S
+    # k-slot for diagonal αα is just α (xtb order: 0=xx, 1=yy, 2=zz)
+    for alpha in range(3):
+        shifted_dQ[:, alpha] -= 2.0 * r[alpha] * dD_d[:, alpha]
+        shifted_dQ[:, alpha] += (r[alpha] ** 2) * dS_d
+        if is_deriv_atom:
+            shifted_dQ[alpha, alpha] -= 2.0 * D[alpha]
+            shifted_dQ[alpha, alpha] += 2.0 * r[alpha] * S
+
+    # Quadrupole off-diagonal (xy=3, xz=4, yz=5):
+    # shifted_qpint_αβ = qpint_αβ - r_α · dpint_β - r_β · dpint_α + r_α·r_β · S
+    for a, b, kk in [(0, 1, 3), (0, 2, 4), (1, 2, 5)]:
+        shifted_dQ[:, kk] -= r[a] * dD_d[:, b]
+        shifted_dQ[:, kk] -= r[b] * dD_d[:, a]
+        shifted_dQ[:, kk] += r[a] * r[b] * dS_d
+        if is_deriv_atom:
+            shifted_dQ[a, kk] -= D[b]
+            shifted_dQ[a, kk] += r[b] * S
+            shifted_dQ[b, kk] -= D[a]
+            shifted_dQ[b, kk] += r[a] * S
+
+    return shifted_dD, shifted_dQ
+
+
 def multipole_gradient(
     basis: list[BasisFunction],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
