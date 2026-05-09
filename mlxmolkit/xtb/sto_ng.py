@@ -165,6 +165,73 @@ _PCOEFF4 = (
     (-1.801459207e-2, -1.360777372e-1, 7.533973719e-1, 3.409304859e-1),  # 5p
 )
 
+# ---------------------------------------------------------------------------
+# pAlpha6 / pCoeff6 — STO-6G fits. Verbatim from slater.f90:279-352.
+# Note: xtb's slater.f90 has BOTH a "current" 4s/4p block and a commented-out
+# (newer) one. The active uncommented block (the "old" one) is what xtb
+# actually uses for GFN1/GFN2; we vendor that.
+# ---------------------------------------------------------------------------
+
+_PALPHA6 = (
+    # 1s
+    (2.310303149e+1, 4.235915534e+0, 1.185056519e+0,
+     4.070988982e-1, 1.580884151e-1, 6.510953954e-2),
+    # 2s
+    (2.768496241e+1, 5.077140627e+0, 1.426786050e+0,
+     2.040335729e-1, 9.260298399e-2, 4.416183978e-2),
+    # 3s
+    (3.273031938e+0, 9.200611311e-1, 3.593349765e-1,
+     8.636686991e-2, 4.797373812e-2, 2.724741144e-2),
+    # 4s (the "(old)" block — what xtb actually uses)
+    (1.365346e+00,   4.393213e-01,   1.877069e-01,
+     9.360270e-02,   5.052263e-02,   2.809354e-02),
+    # 5s
+    (1.410128298e+0, 5.077878915e-1, 1.847926858e-1,
+     1.061070594e-1, 3.669584901e-2, 2.213558430e-2),
+    # 2p
+    (5.868285913e+0, 1.530329631e+0, 5.475665231e-1,
+     2.288932733e-1, 1.046655969e-1, 4.948220127e-2),
+    # 3p
+    (5.077973607e+0, 1.340786940e+0, 2.248434849e-1,
+     1.131741848e-1, 6.076408893e-2, 3.315424265e-2),
+    # 4p (the "(old)" block)
+    (1.365346e+00,   4.393213e-01,   1.877069e-01,
+     9.360270e-02,   5.052263e-02,   2.809354e-02),
+    # 5p
+    (3.778623374e+0, 3.499121109e-1, 1.683175469e-1,
+     5.404070736e-2, 3.328911801e-2, 2.063815019e-2),
+)
+
+_PCOEFF6 = (
+    # 1s
+    (9.163596280e-3, 4.936149294e-2, 1.685383049e-1,
+     3.705627997e-1, 4.164915298e-1, 1.303340841e-1),
+    # 2s
+    (-4.151277819e-3, -2.067024148e-2, -5.150303337e-2,
+     3.346271174e-1, 5.621061301e-1, 1.712994697e-1),
+    # 3s
+    (-6.775596947e-3, -5.639325779e-2, -1.587856086e-1,
+     5.534527651e-1, 5.015351020e-1, 7.223633674e-2),
+    # 4s
+    (3.775056e-03,  -5.585965e-02,  -3.192946e-01,
+     -2.764780e-02,  9.049199e-01,   3.406258e-01),
+    # 5s
+    (2.695439582e-3, 1.850157487e-2, -9.588628125e-2,
+     -5.200673560e-1, 1.087619490e+0, 3.103964343e-1),
+    # 2p
+    (7.924233646e-3, 5.144104825e-2, 1.898400060e-1,
+     4.049863191e-1, 4.012362861e-1, 1.051855189e-1),
+    # 3p
+    (-3.329929840e-3, -1.419488340e-2, 1.639395770e-1,
+     4.485358256e-1, 3.908813050e-1, 7.411456232e-2),
+    # 4p
+    (-7.052075e-03,  -5.259505e-02,  -3.773450e-02,
+     3.874773e-01,   5.791672e-01,   1.221817e-01),
+    # 5p
+    (1.163246387e-4, -2.920771322e-2, -1.381051233e-1,
+     5.706134877e-1, 4.768808140e-1, 6.021665516e-2),
+)
+
 
 @dataclass(frozen=True)
 class STONGShell:
@@ -200,6 +267,8 @@ def get_sto_ng(n: int, l: int, n_gauss: int) -> STONGShell:
         a, c = _table_lookup(_PALPHA3, _PCOEFF3, n, l)
     elif n_gauss == 4:
         a, c = _table_lookup(_PALPHA4, _PCOEFF4, n, l)
+    elif n_gauss == 6:
+        a, c = _table_lookup(_PALPHA6, _PCOEFF6, n, l)
     else:
         raise NotImplementedError(
             f"STO-{n_gauss}G not yet vendored (port from slater.f90 if needed)"
@@ -253,3 +322,39 @@ def gfn0_n_gauss(Z: int, l: int, n_principal: int, is_valence: bool) -> int:
     if l == 2:
         return 4
     return 4   # f, g — fallback
+
+
+def gfn1_n_gauss(Z: int, l: int, n_principal: int, is_valence: bool) -> int:
+    """xtb's setGFN1NumberOfPrimitives rule (gfn1.f90:725-771).
+
+    H, He (Z<=2): s valence = 4, s aux = 3; p = 3.
+    Z >= 3:
+        l=0 valence: STO-6G
+        l=0 aux:    STO-6G if n>5 else STO-3G
+        l=1: STO-6G
+        l=2,3: STO-4G
+    """
+    if Z <= 2:
+        if l == 0:
+            return 4 if is_valence else 3
+        if l == 1:
+            return 3
+        return 4
+    if l == 0:
+        if is_valence:
+            return 6
+        return 6 if n_principal > 5 else 3
+    if l == 1:
+        return 6
+    return 4   # d, f
+
+
+def gfn2_n_gauss(Z: int, l: int, n_principal: int, is_valence: bool) -> int:
+    """xtb's setGFN2NumberOfPrimitives rule (gfn2.f90 setGFN2NumberOfPrimitives).
+
+    All valence: STO-6G; d, f: STO-4G; H/He no aux 2s — only one valence
+    s shell. (Differs from GFN0/GFN1, which add an aux 2s on H.)
+    """
+    if l == 2 or l == 3:
+        return 4
+    return 6

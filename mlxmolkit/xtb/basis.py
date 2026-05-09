@@ -88,14 +88,20 @@ def _contraction_norm(
 def build_basis(
     atoms: list[int],
     coords_ang: np.ndarray,
-    params_dict: dict[int, GFN0ElementParams] | None = None,
+    params_dict=None,
+    n_gauss_fn=None,
 ) -> list[BasisFunction]:
-    """Build the AO basis for one molecule (Cartesian, STO-3G, s+p only).
+    """Build the AO basis for one molecule (Cartesian, STO-NG, s+p only).
 
     Args:
         atoms: list of atomic numbers.
         coords_ang: ``(n_atoms, 3)`` coordinates in Angstrom.
-        params_dict: GFN0 element-params dict (defaults to ``GFN0_PARAMS``).
+        params_dict: element-params dict; entries must have a ``shells``
+            tuple whose elements expose ``.l``, ``.n``, ``.zeta``.
+            Defaults to :data:`mlxmolkit.xtb.params_gfn0.GFN0_PARAMS`.
+        n_gauss_fn: callable ``(Z, l, n, is_valence) -> int`` returning
+            the STO-NG order to use. Defaults to GFN0's rule
+            (:func:`mlxmolkit.xtb.sto_ng.gfn0_n_gauss`).
 
     Returns:
         A list of :class:`BasisFunction`, ordered (atom-major, then shell,
@@ -107,6 +113,8 @@ def build_basis(
     """
     if params_dict is None:
         params_dict = GFN0_PARAMS
+    if n_gauss_fn is None:
+        n_gauss_fn = gfn0_n_gauss
     coords_bohr = np.asarray(coords_ang, dtype=np.float64) * _ANG_TO_BOHR
 
     out: list[BasisFunction] = []
@@ -130,7 +138,7 @@ def build_basis(
             # Mixed STO-NG per xtb's setGFN0NumberOfPrimitives:
             # H/He valence s = STO-3G, aux s = STO-2G; everything else
             # we have vendored = STO-3G (heavier-element STO-4G+ TBD).
-            n_gauss = gfn0_n_gauss(int(Z), shell.l, shell.n, is_valence)
+            n_gauss = n_gauss_fn(int(Z), shell.l, shell.n, is_valence)
             sto = get_sto_ng(shell.n, shell.l, n_gauss)
             zeta_sq = shell.zeta * shell.zeta
             alphas = np.array(sto.alphas, dtype=np.float64) * zeta_sq
