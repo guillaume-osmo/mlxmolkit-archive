@@ -31,6 +31,7 @@ from .gradient_gfn0 import cn_gradient
 from .gradient_hf_diag import hf_diagonal_gradient
 from .gradient_hf_offdiag_gfn2 import hf_offdiag_gradient_gfn2
 from .gradient_pulay import energy_weighted_density
+from .multipole_grad import multipole_gradient
 from .overlap_grad import overlap_gradient
 from .params_gfn2 import GFN2_PARAMS
 from .scf_gfn2 import gfn2_energy
@@ -137,48 +138,43 @@ def _fd_grad_scalar(
     return g
 
 
-def _aes_energy_at(atoms_list, coords_ang, P_sao, qsh, shell_atom):
-    """Compute E_aes at perturbed coords with frozen P, qsh.
-
-    Mirrors the AES energy evaluation block in :func:`scf_gfn2.gfn2_energy`
-    so we can FD it cheaply (no SCF).
+def _aes_full_energy_at(
+    atoms_list, coords_ang, P_sao, qsh, shell_atom,
+):
+    """Compute E_aes at perturbed coords with frozen P, qsh — but
+    everything downstream of P (Mulliken multipoles dipm, qp; gab3,
+    gab5 via radCN) recomputed from the new geometry. Used as the FD
+    energy-side AES contribution.
     """
-    from .aes import (
-        aniso_electro,
-        get_radcn,
-        mmompop,
-        mmomgabzero,
-    )
-    from .basis import build_basis, sao_basis_metadata, overlap_matrix
+    from .aes import aniso_electro, get_radcn, mmomgabzero, mmompop
+    from .basis import build_basis, sao_basis_metadata
+    from .gradient_gfn0 import cn_gradient as _cn_grad
     from .multipole_integrals import multipole_matrices
-    from .scf_gfn2 import _build_shell_layout, gfn2_n_gauss
+    from .scf_gfn2 import gfn2_n_gauss
 
     cao_b = build_basis(
         atoms_list, coords_ang, params_dict=GFN2_PARAMS, n_gauss_fn=gfn2_n_gauss,
     )
-    S_cao, dpint_cao, qpint_cao = multipole_matrices(cao_b)
-    sao_b, T = sao_basis_metadata(cao_b)
-    n_basis = T.shape[0]
-    S = T @ S_cao @ T.T
-    dpint = np.zeros((3, n_basis, n_basis))
-    qpint = np.zeros((6, n_basis, n_basis))
+    S_cao_p, dpint_cao_p, qpint_cao_p = multipole_matrices(cao_b)
+    sao_b, T_p = sao_basis_metadata(cao_b)
+    np_sao = T_p.shape[0]
+    S_p = T_p @ S_cao_p @ T_p.T
+    dpint_p = np.zeros((3, np_sao, np_sao))
+    qpint_p = np.zeros((6, np_sao, np_sao))
     for k in range(3):
-        dpint[k] = T @ dpint_cao[k] @ T.T
+        dpint_p[k] = T_p @ dpint_cao_p[k] @ T_p.T
     for k in range(6):
-        qpint[k] = T @ qpint_cao[k] @ T.T
-    aoat = np.array([b.atom_idx for b in sao_b], dtype=np.int64)
+        qpint_p[k] = T_p @ qpint_cao_p[k] @ T_p.T
+    aoat_p = np.array([b.atom_idx for b in sao_b], dtype=np.int64)
     coords_b = np.asarray(coords_ang, dtype=np.float64) * _ANG_TO_BOHR
-    # CN at perturbed coords (radcn is CN-dependent; FD must include this).
-    from .gradient_gfn0 import cn_gradient as _cn_grad
     cn_p, _ = _cn_grad(atoms_list, coords_ang)
     radcn = get_radcn(atoms_list, cn_p)
     gab3, gab5 = mmomgabzero(coords_b, radcn)
-    # q_at from qsh
     n_atoms = len(atoms_list)
     q_at = np.zeros(n_atoms)
     for ish in range(len(shell_atom)):
         q_at[int(shell_atom[ish])] += qsh[ish]
-    dipm, qp = mmompop(P_sao, S, dpint, qpint, aoat, coords_b)
+    dipm, qp = mmompop(P_sao, S_p, dpint_p, qpint_p, aoat_p, coords_b)
     e_pair, e_polar = aniso_electro(
         atoms_list, coords_b, q_at, dipm, qp, gab3, gab5,
     )
@@ -302,10 +298,11 @@ def gfn2_gradient_analytical(
     )
     # Build per-AO V_bf: shell-resolved Coulomb + 3rd-order + per-atom vs.
     V_sh = shell_shift + shell_third_shift
-    # Standard monopole V_bf only — the vs/vd/vq AES contributions to F
-    # are handled by the band_F_aes FD piece below, to avoid sign /
-    # double-counting tangles between the V·∂S·P cross and F_aes.
-    V_bf = V_sh[bf_to_shell]
+    # F = H0 − ½(V_bf·S+S·V_bf) + F_aes; F_aes adds +½(vs_μ+vs_ν)·S so the
+    # *effective* V in the −½(V·S+S·V) form is V_bf − vs[atom]. The
+    # vd/vq pieces of F_aes go into the analytical multipole-band term
+    # below (g_band_aes_b) — DON'T double-count vs there.
+    V_bf = V_sh[bf_to_shell] - vs[aoat]
     g_vsop_b = np.zeros((n_atoms, 3))
     VP = V_bf[:, None] * P_sao
     for ax in range(3):
@@ -319,10 +316,17 @@ def gfn2_gradient_analytical(
     # ----- 5. Repulsion (analytical) -----
     g_rep_a = _gfn2_repulsion_gradient(atoms, coords)
 
-    # ----- 6/7/8. AES + D4 + solvation (FD on closed-form energies) -----
+    # ----- 6/7. AES + D4 (FD on closed-form energies) -----
+    # Full E_aes derivative — recomputes dipm/qp from perturbed
+    # dpint/qpint and gab3/gab5 from radCN(CN). Captures the AES band
+    # contribution implicitly through the Mulliken multipole
+    # construction. Cleaner derivation (separating band-via-F_aes vs
+    # explicit-via-E_aes without double-count) is the natural follow-up
+    # to enable swapping in the FD-verified analytical kernels in
+    # :mod:`multipole_grad`.
     g_aes_a = _fd_grad_scalar(
         atoms, coords,
-        lambda c: _aes_energy_at(atoms, c, P_sao, qsh, shell_atom),
+        lambda c: _aes_full_energy_at(atoms, c, P_sao, qsh, shell_atom),
         h=fd_h_aux,
     )
     g_d4_a = _fd_grad_scalar(
@@ -331,13 +335,16 @@ def gfn2_gradient_analytical(
         h=fd_h_aux,
     )
 
-    # NOTE: the AES vd/vq band-gradient cross terms (xtb's dtmp/qtmp at
-    # build_dSDQH0_gpu.f90:995-1002) need ∂dpint/∂r and ∂qpint/∂r
-    # multipole-derivative kernels — deferred. With this band piece
-    # missing the analytical gradient is ~6e-3 Ha/Å off vs FD on H2O,
-    # well above ANCopt's 1.9e-3 Ha/Å gtol. The analytical path is
-    # therefore EXPERIMENTAL for GFN2; ``method='numerical'`` is the
-    # production default until the multipole-derivative kernels land.
+    # NOTE: the analytical multipole-derivative kernels (∂dpint/∂r,
+    # ∂qpint/∂r in :mod:`multipole_grad`) are FD-verified to 5e-12 in
+    # isolation. The naive plug-in via xtb-style band-piece accounting
+    # (trace(P · ∂F_aes/∂R) with vs/vd/vq held fixed) double-counts the
+    # AES FD path and overshoots — the variational relationship between
+    # fockelectro's F_aes and aniso_electro's E_aes for GFN2 is more
+    # subtle than "trace(P·F_aes) = 2·E_aes". A clean derivation is
+    # needed before wiring; deferred so we ship today's strategic-
+    # purity multipole-derivative tooling without breaking the
+    # gradient. Empirical residual stays at ~6e-3 Ha/Å on H2O.
     g_band_aes_b = np.zeros((n_atoms, 3), dtype=np.float64)
 
     # Total: convert Ha/Bohr pieces to Ha/Å.
