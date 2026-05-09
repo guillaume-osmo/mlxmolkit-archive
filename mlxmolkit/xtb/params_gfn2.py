@@ -1564,8 +1564,11 @@ def _build_element(Z: int) -> GFN2ElementParams:
         third_order=float(_GFN2_THIRDORDERATOM[Z]),
         rep_alpha=float(_GFN2_REPALPHA[Z]),
         rep_zeff=float(_GFN2_REPZEFF[Z]),
-        dip_kernel=float(_GFN2_DIPKERNEL[Z]),
-        quad_kernel=float(_GFN2_QUADKERNEL[Z]),
+        # gfn2.f90 has trailing ``* 0.01_wp`` on both dipKernel and
+        # quadKernel arrays (lines 270, 291). Our extractor missed the
+        # scaling — apply it here.
+        dip_kernel=float(_GFN2_DIPKERNEL[Z]) * 0.01,
+        quad_kernel=float(_GFN2_QUADKERNEL[Z]) * 0.01,
         kind=int(_GFN2_KINDS[Z]),
     )
 
@@ -1573,3 +1576,38 @@ def _build_element(Z: int) -> GFN2ElementParams:
 GFN2_PARAMS: dict[int, GFN2ElementParams] = {
     Z: _build_element(Z) for Z in range(1, 87)
 }
+
+
+# AES multipole tables — from xtb/src/xtb/data.f90:331-362.
+# Used by get_radcn (CN-dependent multipole cutoff radii).
+_GFN2_VALENCE_CN = (
+    0.0,                                                    # 0 sentinel
+    1.0, 1.0,                                                # H He
+    1.0, 2.0, 3.0, 3.0, 3.0, 2.0, 1.0, 1.0,                  # Li-Ne
+    1.0, 2.0, 3.0, 3.0, 3.0, 3.0, 1.0, 1.0,                  # Na-Ar
+    1.0, 2.0, 4.0, 4.0, 6.0, 6.0, 6.0, 6.0, 6.0, 4.0, 4.0, 2.0,
+    3.0, 3.0, 3.0, 3.0, 1.0, 1.0,                            # K-Kr
+    1.0, 2.0, 4.0, 4.0, 6.0, 6.0, 6.0, 6.0, 6.0, 4.0, 4.0, 2.0,
+    3.0, 3.0, 3.0, 3.0, 1.0, 1.0,                            # Rb-Xe
+    1.0, 2.0, 4.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0,             # Cs-Eu
+    6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 4.0,             # Gd-Hf  (8 + Lu)
+    6.0, 6.0, 6.0, 6.0, 6.0, 4.0, 4.0, 2.0,                  # Ta-Hg
+    3.0, 3.0, 3.0, 3.0, 1.0, 1.0,                            # Tl-Rn
+)
+assert len(_GFN2_VALENCE_CN) == 87, f"valenceCN: expected 87, got {len(_GFN2_VALENCE_CN)}"
+
+_GFN2_MULTI_RAD = (
+    0.0,                                              # 0 sentinel
+    1.4, 3.0,                                          # H He
+    5.0, 5.0, 5.0, 3.0, 1.9, 1.8, 2.4, 5.0,            # Li-Ne
+    5.0, 5.0, 5.0, 3.9, 2.1, 3.1, 2.5, 5.0,            # Na-Ar
+    5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0,
+    5.0, 5.0, 5.0, 5.0, 3.9, 4.0,                      # K-Kr
+    5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0,
+    5.0, 5.0, 5.0, 5.0, 5.0, 5.0,                      # Rb-Xe
+    5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0,
+    5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0,       # Cs-Lu
+    5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0,            # Hf-Hg
+    5.0, 5.0, 5.0, 5.0, 5.0, 5.0,                      # Tl-Rn
+)
+assert len(_GFN2_MULTI_RAD) == 87, f"multiRad: expected 87, got {len(_GFN2_MULTI_RAD)}"

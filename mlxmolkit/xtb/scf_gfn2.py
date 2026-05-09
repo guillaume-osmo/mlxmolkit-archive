@@ -28,6 +28,14 @@ from __future__ import annotations
 import numpy as np
 import mlx.core as mx
 
+from .aes import (
+    aniso_electro,
+    fockelectro,
+    get_radcn,
+    mmomgabzero,
+    mmompop,
+    setvsdq,
+)
 from .basis import (
     build_basis,
     overlap_matrix,
@@ -37,6 +45,7 @@ from .basis import (
 from .cn import coordination_number_erf
 from .eeq import eeq_charges_and_energy
 from .hcore_gfn2 import build_hcore_gfn2
+from .multipole_integrals import multipole_matrices
 from .params_gfn2 import (
     GFN2_GLOBALS,
     GFN2_PARAMS,
@@ -252,13 +261,21 @@ def gfn2_energy(
     coords_bohr = coords * _ANG_TO_BOHR
     n_atoms = len(atoms_list)
 
-    # 1. Basis (CAO) + S; SAO transform.
+    # 1. Basis (CAO) + multipole integrals (S, dpint, qpint); SAO transform.
+    # The multipole integrals are needed for AES.
     cao_basis = build_basis(
         atoms_list, coords, params_dict=GFN2_PARAMS, n_gauss_fn=gfn2_n_gauss,
     )
-    S_cao = overlap_matrix(cao_basis)
+    S_cao, dpint_cao, qpint_cao = multipole_matrices(cao_basis)
     sao_basis, T = sao_basis_metadata(cao_basis)
     n_basis = T.shape[0]
+    # SAO-projected multipole integrals: dpint_sao[k] = T · dpint_cao[k] · T^T.
+    dpint = np.zeros((3, n_basis, n_basis), dtype=np.float64)
+    qpint = np.zeros((6, n_basis, n_basis), dtype=np.float64)
+    for k in range(3):
+        dpint[k] = T @ dpint_cao[k] @ T.T
+    for k in range(6):
+        qpint[k] = T @ qpint_cao[k] @ T.T
 
     # 2. Shell layout.
     (bf_shells, bf_to_shell, shell_atom, shell_l, z_ref,
@@ -333,20 +350,40 @@ def gfn2_energy(
     diis_max = 6
     diis_warmup = 3
 
+    # Per-AO atom index for AES bookkeeping.
+    aoat = np.array([b.atom_idx for b in sao_basis], dtype=np.int64)
+
+    # AES damping radii — these depend on CN, not on density, so we
+    # build them once outside the SCF loop.
+    radcn = get_radcn(atoms_list, cn)
+    gab3, gab5 = mmomgabzero(coords_bohr, radcn)
+
     for it in range(max_iter):
         # Shell-resolved Coulomb shift.
         shell_shift = jmat @ qsh
         # GFN2 third-order is *shell-resolved*: each shell's energy
-        # gets q_sh^2 · Γ_l. The Fock potential adds 2·q_sh·Γ_l (since
-        # ∂/∂q_sh of q_sh^3·Γ/3 = q_sh²·Γ, and the Fock potential is
-        # ∂E/∂P which carries an extra q_sh of population — net effect
-        # in the V_sh is q_sh^2 · Γ_l).
-        # Reference: scc_core.f90 third-order shell loop.
+        # gets q_sh^2 · Γ_l.
         shell_third_shift = qsh ** 2 * shell_third
         V_sh = shell_shift + shell_third_shift
 
         V_bf = V_sh[bf_to_shell]
         F = H0 - 0.5 * (V_bf[:, None] + V_bf[None, :]) * S
+
+        # AES contribution: build atomic dipoles/quadrupoles from
+        # current P, then derive vs/vd/vq potentials and add to F.
+        # On iter 0, P is zero so dipm = qp = 0 and AES is zero —
+        # consistent with monopole-only initialization.
+        q_at_iter = np.zeros(n_atoms)
+        for ish in range(n_shell):
+            q_at_iter[shell_atom[ish]] += qsh[ish]
+        dipm, qp_aes = mmompop(P, S, dpint, qpint, aoat, coords_bohr)
+        vs, vd, vq = setvsdq(
+            atoms_list, coords_bohr, q_at_iter, dipm, qp_aes, gab3, gab5,
+        )
+        F_aes, _ = fockelectro(P, S, dpint, qpint, aoat, vs, vd, vq)
+        # F_aes is symmetric (constructed by fockelectro for both
+        # orderings of (i, j)); add directly.
+        F = F + F_aes
 
         if it >= diis_warmup:
             e_diis = F @ P @ S - S @ P @ F
@@ -402,21 +439,27 @@ def gfn2_energy(
     V_sh = shell_shift + shell_third_shift
     V_bf = V_sh[bf_to_shell]
     F = H0 - 0.5 * (V_bf[:, None] + V_bf[None, :]) * S
+    # Re-build AES with converged P to get the energy below.
+    q_at = np.zeros(n_atoms)
+    for ish in range(n_shell):
+        q_at[shell_atom[ish]] += qsh[ish]
+    dipm, qp_aes = mmompop(P, S, dpint, qpint, aoat, coords_bohr)
     from scipy.linalg import eigh as _scipy_eigh
     eigvals_h, C = _scipy_eigh(F, S)
     C_occ = C[:, :n_occ]
     P = 2.0 * (C_occ @ C_occ.T)
-
-    # Atom charges for D4 / output.
-    q_at = np.zeros(n_atoms)
-    for ish in range(n_shell):
-        q_at[shell_atom[ish]] += qsh[ish]
 
     # Energy decomposition.
     PH0_h = float(np.sum(P * H0))
     E_es_h = 0.5 * float(qsh @ (jmat @ qsh))
     # Shell-resolved third-order:  E_3rd = Σ_sh q_sh^3 · Γ_l(Z) / 3.
     E_3rd_h = float(np.sum(qsh ** 3 * shell_third) / 3.0)
+    # AES energy (anisotropic electrostatics).
+    dipm, qp_aes = mmompop(P, S, dpint, qpint, aoat, coords_bohr)
+    E_aes_pair, E_aes_polar = aniso_electro(
+        atoms_list, coords_bohr, q_at, dipm, qp_aes, gab3, gab5,
+    )
+    E_aes_h = E_aes_pair + E_aes_polar
 
     E_rep_h = _gfn2_repulsion(atoms_list, coords)
 
@@ -435,7 +478,7 @@ def gfn2_energy(
             E_atoms_eV += shell.h * occ
     E_atoms_h = E_atoms_eV * _HARTREE_PER_EV
 
-    E_total_h = PH0_h + E_es_h + E_3rd_h + E_rep_h + E_d4_h
+    E_total_h = PH0_h + E_es_h + E_3rd_h + E_aes_h + E_rep_h + E_d4_h
     atomization_h = E_atoms_h - E_total_h
 
     return {
@@ -448,7 +491,7 @@ def gfn2_energy(
         "dispersion_eV": E_d4_h * _EV_PER_HARTREE,
         "halogen_bond_eV": None,            # GFN2 doesn't use halogen-bond
         "third_order_eV": E_3rd_h * _EV_PER_HARTREE,
-        "aes_eV": None,                     # TODO Phase C1
+        "aes_eV": E_aes_h * _EV_PER_HARTREE,
         "heat_of_formation_eV": atomization_h * _EV_PER_HARTREE,
         "heat_of_formation_kcal": atomization_h * _KCAL_PER_HARTREE,
         "converged": converged,
