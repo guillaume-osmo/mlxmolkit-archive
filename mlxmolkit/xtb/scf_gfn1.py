@@ -558,6 +558,18 @@ def gfn1_energy(
         "n_elec": n_elec,
         "n_occ": n_occ,
         "method": "GFN1",
+        # ----- intermediate state for analytical-gradient assembly -----
+        "mo_coeffs": C,
+        "S": S,
+        "S_cao": S_cao,
+        "H0": H0,
+        "T_cao_to_sao": T,
+        "cao_basis": cao_basis,
+        "sao_basis": sao_basis,
+        "cao_bf_shells": cao_bf_shells,
+        "bf_to_shell": bf_to_shell,
+        "shell_atom": shell_atom,
+        "shell_hardness": shell_hard,
     }
 
 
