@@ -23,6 +23,10 @@ from .solvation_alpb import (  # noqa: F401
     gfn2_alpb_water_optimize,
     gfn2_energy_alpb_water,
 )
+from .solvation_alpb_native import (  # noqa: F401
+    alpb_water_correction_native,
+    gfn2_alpb_water_native_singlepoint,
+)
 
 # --- Single-point methods ---
 from .energy import gfn0_energy  # noqa: F401
@@ -41,6 +45,8 @@ __all__ = [
     "gfn2_alpb_water_optimize",
     "gfn2_energy_alpb_water",
     "alpb_water_correction",
+    "alpb_water_correction_native",
+    "gfn2_alpb_water_native_singlepoint",
     "gfn0_energy",
     "gfn1_energy",
     "gfn2_energy",
