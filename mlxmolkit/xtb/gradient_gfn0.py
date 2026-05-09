@@ -47,6 +47,86 @@ _HARTREE_PER_EV = 1.0 / 27.211386245988
 # CN gradient — needed by SRB (and later by EEQ + diagonal H_μμ).
 # ---------------------------------------------------------------------------
 
+def eeq_gradient(
+    atoms: list[int],
+    coords_ang: np.ndarray,
+    cn: np.ndarray,
+    dcndr: np.ndarray,
+    q: np.ndarray,
+) -> np.ndarray:
+    """``∇E_eeq`` for the GFN0 EEQ Lagrangian. Hartree / Angstrom.
+
+    The EEQ Lagrangian
+    ``L = (χ − κ√CN)·q + ½·qᵀ·J·q − λ·(Σq − q_total)``
+    is solved at the optimum by the augmented linear system. Because
+    ``∂L/∂q = 0`` and the constraint forces ``∂(Σq)/∂r = 0``, the
+    Hellmann-Feynman theorem gives:
+
+        dE_eeq/dr_K = ∂L/∂r_K |_q
+                    = −(∂xvec/∂r_K)·q + ½·qᵀ·(∂J/∂r_K)·q
+
+    where ``xvec = −χ + κ√CN`` (so ``χ − κ√CN = −xvec``).
+
+    Closed forms used:
+        ∂xvec_A/∂r_K = κ_A · 0.5/√CN_A · ∂CN_A/∂r_K
+        J_AB(R) = erf(R·γ_AB)/R     with γ_AB = 1/√(α_A²+α_B²)
+        dJ_AB/dR = [(2γ_AB R/√π)·exp(−(Rγ_AB)²) − erf(R·γ_AB)] / R²
+        ∂J_AB/∂r_A = (dJ/dR)·rij/R; ∂J_AB/∂r_B = −(dJ/dR)·rij/R
+
+    Args:
+        atoms: list of atomic numbers.
+        coords_ang: ``(n_atoms, 3)`` Angstrom positions.
+        cn: ``(n_atoms,)`` GFN0 erf-CN array.
+        dcndr: ``(n_atoms, n_atoms, 3)`` ``∂CN_i/∂r_k`` in Ang^-1.
+        q: ``(n_atoms,)`` EEQ atomic charges (sign convention as in
+            ``eeq.py`` — physical excess electron charge).
+
+    Returns:
+        ``∇E_eeq`` of shape ``(n_atoms, 3)`` in Hartree / Angstrom.
+    """
+    import math
+
+    coords = np.asarray(coords_ang, dtype=np.float64)
+    coords_b = coords * _ANG_TO_BOHR
+    cn = np.asarray(cn, dtype=np.float64)
+    dcn_b = np.asarray(dcndr, dtype=np.float64) / _ANG_TO_BOHR  # Bohr^-1
+    q = np.asarray(q, dtype=np.float64)
+    n = len(atoms)
+    sqrt_pi = float(np.sqrt(np.pi))
+
+    # Per-atom EEQ params: kappa is the CN coupling, alpha the Gaussian
+    # charge width (both in atomic units).
+    kappa = np.array([GFN0_PARAMS[int(z)].eeq_kappa for z in atoms], dtype=np.float64)
+    alpha = np.array([GFN0_PARAMS[int(z)].eeq_alpha for z in atoms], dtype=np.float64)
+
+    grad_b = np.zeros((n, 3), dtype=np.float64)  # Hartree / Bohr
+
+    # --- xvec / CN-chain term: −Σ_A (κ_A · 0.5 / √CN_A) · q_A · ∂CN_A/∂r_K
+    cn_safe = np.maximum(cn, 1e-30)
+    dxvec_dCN = kappa * 0.5 / np.sqrt(cn_safe)            # (n_atoms,)
+    weight = dxvec_dCN * q                                # (n_atoms,)
+    # ∂E_xvec/∂r_K = -Σ_A weight_A · ∂CN_A/∂r_K
+    # dcn_b shape is (i, k, 3) with i=A, k=K.
+    grad_b -= np.einsum("a,akx->kx", weight, dcn_b)
+
+    # --- J-pair term: ½·qᵀ·(∂J/∂r_K)·q. Off-diagonal only (∂J_AA/∂r = 0).
+    for A in range(n - 1):
+        for B in range(A + 1, n):
+            rij = coords_b[A] - coords_b[B]
+            R = float(np.linalg.norm(rij))
+            gAB = 1.0 / math.sqrt(alpha[A] ** 2 + alpha[B] ** 2)
+            erf_term = math.erf(R * gAB)
+            exp_term = math.exp(-(R * gAB) ** 2)
+            # dJ/dR = [(2γR/√π)·exp(−(Rγ)²) − erf(Rγ)] / R²
+            dJdR = (2.0 * gAB / sqrt_pi * exp_term - erf_term / R) / R
+            # contribution to grad: q_A·q_B·(dJ/dR)·rij/R at A; minus at B.
+            coef = q[A] * q[B] * dJdR / R
+            grad_b[A] += coef * rij
+            grad_b[B] -= coef * rij
+
+    return grad_b * _ANG_TO_BOHR
+
+
 def cn_gradient(
     atoms: list[int],
     coords_ang: np.ndarray,
@@ -103,6 +183,103 @@ def cn_gradient(
             dcn[i, i, :] += dfdR * unit
             dcn[i, j, :] -= dfdR * unit
     return cn, dcn
+
+
+def gfn0_gradient(
+    atoms: list[int],
+    coords_ang: np.ndarray,
+    *,
+    charge: int = 0,
+    band_method: str = "numerical",
+    band_h: float = 1e-3,
+) -> tuple[np.ndarray, dict]:
+    """Total ``∂E_total/∂x`` for GFN0-xTB. Hartree / Angstrom.
+
+    Decomposes into the four energy terms. Three are closed-form
+    (repulsion, EEQ, SRB) and the band-energy gradient is currently
+    finite-differenced on the band component only — ~6N additional
+    energy-piece evaluations per gradient. This is much cheaper than
+    a fully numerical gradient (which redoes basis + overlap + Hcore
+    every step) since the closed-form parts are O(N²) algebra.
+
+    Args:
+        atoms: list of atomic numbers.
+        coords_ang: ``(n_atoms, 3)`` Angstrom positions.
+        charge: integer net charge.
+        band_method: ``"numerical"`` (default — finite difference on
+            the band-energy contribution only) or ``"analytical"``
+            (not yet implemented; raises NotImplementedError).
+        band_h: finite-difference step (Å) for the band-only path.
+
+    Returns:
+        ``(grad, info)`` — ``grad`` is shape ``(n_atoms, 3)`` in
+        Hartree/Å; ``info`` is a dict with the per-term decomposition.
+    """
+    import mlx.core as mx
+    from .energy import gfn0_energy
+
+    coords = np.asarray(coords_ang, dtype=np.float64)
+    cn, dcn = cn_gradient(atoms, coords)
+
+    # EEQ q via the existing MLX-backed solver. Use float64 numpy
+    # rebuild for the gradient to keep precision; EEQ q is needed by
+    # both the EEQ gradient (directly) and by the band gradient
+    # (through the diagonal H).
+    from .eeq import eeq_charges_and_energy
+    q_mx, _ = eeq_charges_and_energy(
+        mx.array(coords.astype(np.float32)),
+        mx.array(np.asarray(atoms, dtype=np.int32)),
+        total_charge=float(charge),
+    )
+    mx.eval(q_mx)
+    q = np.asarray(q_mx).astype(np.float64)
+
+    g_rep = repulsion_gradient(atoms, coords)
+    g_srb = srb_gradient(atoms, coords, cn, dcn)
+    g_eeq = eeq_gradient(atoms, coords, cn, dcn, q)
+
+    if band_method == "analytical":
+        raise NotImplementedError(
+            "Analytical band gradient not yet implemented; "
+            "use band_method='numerical' for now."
+        )
+
+    # Numerical band-energy gradient via central differences on
+    # E_band = E_total - E_rep - E_eeq - E_SRB.
+    n = coords.shape[0]
+    g_band = np.zeros_like(coords)
+    h = band_h
+    for i in range(n):
+        for a in range(3):
+            saved = coords[i, a]
+            coords[i, a] = saved + h
+            r_p = gfn0_energy(atoms, coords, charge=charge)
+            band_p = (
+                r_p["energy_hartree"]
+                - r_p["repulsion_eV"] * _HARTREE_PER_EV
+                - r_p["eeq_eV"] * _HARTREE_PER_EV
+                - (r_p["srb_eV"] or 0.0) * _HARTREE_PER_EV
+            )
+            coords[i, a] = saved - h
+            r_m = gfn0_energy(atoms, coords, charge=charge)
+            band_m = (
+                r_m["energy_hartree"]
+                - r_m["repulsion_eV"] * _HARTREE_PER_EV
+                - r_m["eeq_eV"] * _HARTREE_PER_EV
+                - (r_m["srb_eV"] or 0.0) * _HARTREE_PER_EV
+            )
+            coords[i, a] = saved
+            g_band[i, a] = (band_p - band_m) / (2.0 * h)
+
+    grad_total = g_rep + g_srb + g_eeq + g_band
+    info = {
+        "g_repulsion": g_rep,
+        "g_eeq": g_eeq,
+        "g_srb": g_srb,
+        "g_band": g_band,
+        "method": "rep+srb+eeq analytical, band numerical",
+    }
+    return grad_total, info
 
 
 def numerical_gradient(
