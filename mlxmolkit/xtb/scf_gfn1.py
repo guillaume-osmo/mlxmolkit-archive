@@ -349,16 +349,21 @@ def gfn1_energy(
     P = 2.0 * (C_occ @ C_occ.T)
 
     # Energy decomposition (all Hartree).
-    # E_band (Ha) = 2 · Σ_occ ε
-    E_band_h = 2.0 * float(np.sum(eigvals_h[:n_occ]))
-    # E_es (Coulomb) = ½ qsh^T jmat qsh (Ha)
+    # CORRECT formula (verified empirically against xtb on H2O):
+    #     E_elec = Σ_uv P_uv · H0_uv  +  ½ qsh·J·qsh  +  ⅓ Σ qat³·Γ
+    # which is the Pulay-style decomposition of the SCF energy. The
+    # 2·Σε form (E_band) equals Σ P·F = Σ P·H0 + Σ P·Δ where Δ is the
+    # SCF correction; the relationship between Σ P·Δ and the Coulomb
+    # double-counting is not a simple −E_es as one might guess from
+    # standard HF (because the Mulliken split into shell charges has
+    # an extra z·V offset). Direct trace(P·H0) avoids that subtlety.
+    PH0_h = float(np.sum(P * H0))
     E_es_h = 0.5 * float(qsh @ (jmat @ qsh))
-    # E_3rd (Ha) = Σ_iat qat³ · Γ³_iat / 3
     E_3rd_h = 0.0
     for a in range(n_atoms):
         E_3rd_h += q_at[a] ** 3 * GFN1_PARAMS[atoms_list[a]].third_order / 3.0
+    E_band_h = 2.0 * float(np.sum(eigvals_h[:n_occ]))   # diagnostic only
     # Repulsion (re-uses GFN0's repulsion module with GFN1 params).
-    from .params_gfn1 import GFN1_PARAMS as P1
     E_rep_h = _gfn1_repulsion(atoms_list, coords)
 
     # Atomic reference energy (sum over atoms of selfEnergy · refOcc on
@@ -380,14 +385,15 @@ def gfn1_energy(
     # but their sign convention: E_total = E_band - E_es + E_3rd (3rd is added
     # because it's the q³·Γ/3 = atomicShift_energy).
     # Matches scf_module.F90:891 form via algebraic equivalence.
-    E_total_h = E_band_h - E_es_h + E_3rd_h + E_rep_h
+    # eel ≡ Σ P·H0 + ½ qsh·J·qsh + ⅓ qat³·Γ. xtb prints H0 + ees + e3 here.
+    E_total_h = PH0_h + E_es_h + E_3rd_h + E_rep_h
     atomization_h = E_atoms_h - E_total_h
 
     return {
         "energy_hartree": E_total_h,
         "energy_eV": E_total_h * _EV_PER_HARTREE,
         "energy_kcal": E_total_h * _KCAL_PER_HARTREE,
-        "electronic_eV": (E_band_h - E_es_h + E_3rd_h) * _EV_PER_HARTREE,
+        "electronic_eV": (PH0_h + E_es_h + E_3rd_h) * _EV_PER_HARTREE,
         "eeq_eV": None,                    # GFN1 absorbs ES into SCF
         "repulsion_eV": E_rep_h * _EV_PER_HARTREE,
         "dispersion_eV": None,             # TODO D3
