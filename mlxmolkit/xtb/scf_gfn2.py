@@ -249,19 +249,23 @@ def gfn2_energy(
     mix: float = 0.4,
     verbose: bool = False,
     use_d4: bool = True,
+    alpb_solvent: str | None = None,
 ) -> dict:
-    """GFN2-xTB single-point energy (monopole-only, no AES yet).
+    """GFN2-xTB single-point energy.
 
     Args:
         atoms, coords_ang, charge, max_iter, conv_tol, mix, verbose:
             same shape as :func:`scf_gfn1.gfn1_energy`.
-        use_d4: include D4 dispersion (default True). D4 needs EEQ
-            charges, which we already compute as the SCF initial
-            guess.
+        use_d4: include D4 dispersion (default True).
+        alpb_solvent: optional string. If ``'water'``, couples a pure-
+            numpy ALPB(water) Born potential into the SCF Fock matrix
+            so charges re-equilibrate in the implicit solvent. Off by
+            default — pure-vacuum SCF.
 
     Returns:
         Dict matching the GFN1 result shape, with ``method='GFN2'``.
-        ``aes_eV`` is None (placeholder until Phase C1).
+        When ``alpb_solvent`` is set, additional keys
+        ``alpb_water_native_eV`` and ``alpb_brad_bohr`` are populated.
     """
     atoms_list = [int(a) for a in atoms]
     coords = np.asarray(coords_ang, dtype=np.float64)
@@ -365,6 +369,42 @@ def gfn2_energy(
     radcn = get_radcn(atoms_list, cn)
     gab3, gab5 = mmomgabzero(coords_bohr, radcn)
 
+    # Optional ALPB(water) SCF coupling — pre-build Born matrix.
+    alpb_M = None
+    alpb_kEps = 0.0
+    alpb_brad = None
+    alpb_e_shift = 0.0
+    if alpb_solvent is not None:
+        if alpb_solvent.lower() not in ("water", "h2o"):
+            raise NotImplementedError(
+                f"alpb_solvent={alpb_solvent!r}: only 'water' supported in "
+                "the native path; use solvation_alpb.alpb_water_correction "
+                "for other solvents (tblite-backed)."
+            )
+        from .solvation_alpb_native import (
+            _load_alpb_water_params, _VDW_D3_ANG, compute_bornr, gb_matrix,
+        )
+        _alpb_p = _load_alpb_water_params()
+        _epsv = float(_alpb_p["epsv"])
+        _c1 = float(_alpb_p["c1"])
+        _sx = _alpb_p["sx"]
+        _soset = float(_alpb_p["soset"])
+        _born_offset = _soset * 0.1 * _ANG_TO_BOHR
+        alpb_e_shift = float(_alpb_p["gshift"]) / _KCAL_PER_HARTREE
+
+        _vdwr = np.array(
+            [_VDW_D3_ANG[int(z) - 1] * _ANG_TO_BOHR for z in atoms_list],
+            dtype=np.float64,
+        )
+        _descr = np.array([_sx[int(z) - 1] for z in atoms_list], dtype=np.float64)
+        _rho = _vdwr * _descr
+        _svdw = _vdwr - _born_offset
+        alpb_brad = compute_bornr(coords_bohr, _vdwr, _rho, _svdw, _c1)
+        alpb_M = gb_matrix(coords_bohr, alpb_brad, alpha=float(_alpb_p["alpha"]))
+        # kEps = -(1 - 1/eps) so V_born = kEps · M · q gives F-shift
+        # consistent with E_alpb = -½ (1 - 1/eps) q·M·q (variational).
+        alpb_kEps = -(1.0 - 1.0 / _epsv)
+
     for it in range(max_iter):
         # Shell-resolved Coulomb shift.
         shell_shift = jmat @ qsh
@@ -372,6 +412,15 @@ def gfn2_energy(
         # gets q_sh^2 · Γ_l.
         shell_third_shift = qsh ** 2 * shell_third
         V_sh = shell_shift + shell_third_shift
+
+        # Optional ALPB(water) Born potential: V_born_atom[a] = kEps · M·q_at[a]
+        if alpb_M is not None:
+            q_at_iter = np.zeros(n_atoms)
+            for ish in range(n_shell):
+                q_at_iter[shell_atom[ish]] += qsh[ish]
+            V_born_atom = alpb_kEps * (alpb_M @ q_at_iter)
+            # Distribute per-atom Born potential to all shells of that atom.
+            V_sh = V_sh + V_born_atom[shell_atom]
 
         V_bf = V_sh[bf_to_shell]
         F = H0 - 0.5 * (V_bf[:, None] + V_bf[None, :]) * S
@@ -444,6 +493,12 @@ def gfn2_energy(
     shell_shift = jmat @ qsh
     shell_third_shift = qsh ** 2 * shell_third
     V_sh = shell_shift + shell_third_shift
+    if alpb_M is not None:
+        q_at_iter = np.zeros(n_atoms)
+        for ish in range(n_shell):
+            q_at_iter[shell_atom[ish]] += qsh[ish]
+        V_born_atom = alpb_kEps * (alpb_M @ q_at_iter)
+        V_sh = V_sh + V_born_atom[shell_atom]
     V_bf = V_sh[bf_to_shell]
     F = H0 - 0.5 * (V_bf[:, None] + V_bf[None, :]) * S
     # Re-build AES with converged P to get the energy below.
@@ -485,7 +540,19 @@ def gfn2_energy(
             E_atoms_eV += shell.h * occ
     E_atoms_h = E_atoms_eV * _HARTREE_PER_EV
 
-    E_total_h = PH0_h + E_es_h + E_3rd_h + E_aes_h + E_rep_h + E_d4_h
+    # ALPB(water) — variational Born + GB Coulomb with SCF-converged q.
+    # alpb_kEps = -(1 - 1/ε) (negative). E = ½ · kEps · q^T·M·q + gshift.
+    # SASA cavitation is omitted from the SCF energy: xtb computes it
+    # via a smooth angular/radial Lebedev quadrature that needs the
+    # 5080-line grid table. The Fibonacci-sphere SASA in
+    # :func:`solvation_alpb_native.compute_sasa_native` is available
+    # for analysis but not accurate enough to match tblite's SASA
+    # contribution to ≤ 1 kcal/mol.
+    E_alpb_h = 0.0
+    if alpb_M is not None:
+        E_alpb_h = 0.5 * alpb_kEps * float(q_at @ alpb_M @ q_at) + alpb_e_shift
+
+    E_total_h = PH0_h + E_es_h + E_3rd_h + E_aes_h + E_rep_h + E_d4_h + E_alpb_h
     atomization_h = E_atoms_h - E_total_h
 
     return {
@@ -499,6 +566,10 @@ def gfn2_energy(
         "halogen_bond_eV": None,            # GFN2 doesn't use halogen-bond
         "third_order_eV": E_3rd_h * _EV_PER_HARTREE,
         "aes_eV": E_aes_h * _EV_PER_HARTREE,
+        "alpb_water_native_eV": (
+            E_alpb_h * _EV_PER_HARTREE if alpb_M is not None else None
+        ),
+        "alpb_brad_bohr": alpb_brad,
         "heat_of_formation_eV": atomization_h * _EV_PER_HARTREE,
         "heat_of_formation_kcal": atomization_h * _KCAL_PER_HARTREE,
         "converged": converged,

@@ -279,6 +279,84 @@ def alpb_water_correction_native(
     }
 
 
+def fibonacci_sphere_points(n: int) -> np.ndarray:
+    """Approximately uniform spherical grid via Fibonacci sphere.
+    Returns ``(n, 3)`` unit vectors on the sphere."""
+    indices = np.arange(0, n, dtype=np.float64) + 0.5
+    phi = np.arccos(1.0 - 2.0 * indices / n)
+    theta = np.pi * (1.0 + 5.0 ** 0.5) * indices
+    x = np.cos(theta) * np.sin(phi)
+    y = np.sin(theta) * np.sin(phi)
+    z = np.cos(phi)
+    return np.stack([x, y, z], axis=-1)
+
+
+def compute_sasa_native(
+    atoms: list[int] | np.ndarray, coords_ang: np.ndarray,
+    *, n_points: int = 230, probe_radius_bohr: float | None = None,
+) -> tuple[np.ndarray, float]:
+    """Per-atom solvent-accessible surface area + total SASA energy.
+
+    Uses Fibonacci-sphere sampling around each atom (default 230
+    points — accuracy ~ 1 kcal/mol per atom in absolute SASA energy).
+
+    Args:
+        atoms: ``(n,)`` atomic numbers.
+        coords_ang: ``(n, 3)`` Å coordinates.
+        n_points: number of probe points per atom (more = more
+            accurate; 230 is a good default).
+        probe_radius_bohr: solvent probe radius (Bohr). Default reads
+            from the ALPB(water) param table.
+
+    Returns:
+        ``(sasa_per_atom_bohr², e_sasa_hartree)`` — both in atomic
+        units. ``e_sasa = Σ_i γ_i · SASA_i`` with γ_i from the
+        ALPB(water) gamscale × global surface tension.
+    """
+    p = _load_alpb_water_params()
+    if probe_radius_bohr is None:
+        probe_radius_bohr = float(p["rprobe"]) * _ANG_TO_BOHR
+    gamscale = p["gamscale"]
+    # xtb's effective surface tension per atom (model.f90:534):
+    #   self%surfaceTension = param%gamscale · 4π · surfaceTension_const
+    # surfaceTension_const = 1.0e-5 Ha/Bohr² (model.f90:156)
+    fourpi = 4.0 * np.pi
+    surface_tension_const = 1.0e-5
+    gamma_per_atom = np.array(
+        [gamscale[int(z) - 1] * fourpi * surface_tension_const for z in atoms],
+        dtype=np.float64,
+    )
+    coords_b = np.asarray(coords_ang, dtype=np.float64) * _ANG_TO_BOHR
+    n = len(atoms)
+    # Effective per-atom radius for SASA: vdW + probe (the SAS sphere).
+    rvdw = np.array(
+        [_VDW_D3_ANG[int(z) - 1] * _ANG_TO_BOHR for z in atoms],
+        dtype=np.float64,
+    )
+    r_sas = rvdw + probe_radius_bohr  # (n,)
+
+    grid = fibonacci_sphere_points(n_points)  # (n_points, 3)
+
+    sasa_per_atom = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        # Place grid on sphere centered at atom i, radius r_sas[i].
+        pts = coords_b[i][None, :] + r_sas[i] * grid  # (n_points, 3)
+        # For each point, check if it's INSIDE any other atom's SAS sphere.
+        # If yes → not exposed. n_exposed = points outside all other spheres.
+        exposed = np.ones(n_points, dtype=bool)
+        for j in range(n):
+            if j == i:
+                continue
+            d2 = np.sum((pts - coords_b[j][None, :]) ** 2, axis=-1)
+            inside = d2 < r_sas[j] ** 2
+            exposed &= ~inside
+        # Per-atom area = (4π r²) · (n_exposed / n_points).
+        sasa_per_atom[i] = 4.0 * np.pi * r_sas[i] ** 2 * float(np.sum(exposed)) / n_points
+
+    e_sasa = float(np.sum(gamma_per_atom * sasa_per_atom))
+    return sasa_per_atom, e_sasa
+
+
 def gfn2_alpb_water_native_singlepoint(
     atoms: list[int] | np.ndarray, coords_ang: np.ndarray,
     *, charge: int = 0, **scf_kwargs,
