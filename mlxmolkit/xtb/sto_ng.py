@@ -370,11 +370,30 @@ def gfn1_n_gauss(Z: int, l: int, n_principal: int, is_valence: bool) -> int:
 
 
 def gfn2_n_gauss(Z: int, l: int, n_principal: int, is_valence: bool) -> int:
-    """xtb's setGFN2NumberOfPrimitives rule (gfn2.f90 setGFN2NumberOfPrimitives).
+    """xtb's setGFN2NumberOfPrimitives rule (gfn2.f90:893-937).
 
-    All valence: STO-6G; d, f: STO-4G; H/He no aux 2s — only one valence
-    s shell. (Differs from GFN0/GFN1, which add an aux 2s on H.)
+    H, He (Z<=2):
+        l=0 (s)         → STO-3G
+        l=1 (2p polariz)→ STO-4G
+    Z >= 3:
+        l=0 (s):  n>5 → STO-6G ; else STO-4G
+        l=1 (p):  n>5 → STO-6G ; else STO-4G
+        l=2 (d):  STO-3G
+        l=3 (f):  STO-4G
+
+    H, He have no aux 2s in GFN2 — they use a single 1s + an explicit
+    2p polarization shell (He: nShell=2 with angShell=(0,1)).
     """
-    if l == 2 or l == 3:
+    if Z <= 2:
+        if l == 0:
+            return 3
+        if l == 1:
+            return 4
+        raise NotImplementedError(f"GFN2: unsupported l={l} for Z<=2")
+    if l == 0 or l == 1:
+        return 6 if n_principal > 5 else 4
+    if l == 2:
+        return 3
+    if l == 3:
         return 4
-    return 6
+    raise NotImplementedError(f"GFN2: unsupported l={l}")
