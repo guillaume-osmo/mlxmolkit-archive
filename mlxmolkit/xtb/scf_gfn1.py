@@ -170,6 +170,49 @@ def _coulomb_matrix(
     return jmat
 
 
+def _pulay_diis_numpy(
+    F_hist: list[np.ndarray],
+    e_hist: list[np.ndarray],
+) -> np.ndarray:
+    """Numpy mirror of :func:`mlx_addons.solvers.pulay_diis` for a single
+    Fock matrix at a time.
+
+    Solves the augmented Pulay system
+
+        [B  -1] [c]   [0 ]
+        [-1  0] [λ] = [-1]
+
+    with ``B[i,j] = <e_i, e_j>_F`` (Frobenius inner product), and
+    returns ``F_extrap = Σ c_i F_i``. The same shape and convention as
+    the MLX version on the feature/scf-primitives branch — kept in
+    numpy here because the GFN1 SCF loop currently runs single-mol on
+    the CPU (no batched GPU hot path yet).
+    """
+    nd = len(F_hist)
+    if nd < 2:
+        return F_hist[-1]
+    B = np.zeros((nd, nd), dtype=np.float64)
+    for i in range(nd):
+        for j in range(i, nd):
+            B[i, j] = float(np.sum(e_hist[i] * e_hist[j]))
+            B[j, i] = B[i, j]
+    A = np.zeros((nd + 1, nd + 1), dtype=np.float64)
+    A[:nd, :nd] = B
+    A[:nd, nd] = -1.0
+    A[nd, :nd] = -1.0
+    rhs = np.zeros(nd + 1, dtype=np.float64)
+    rhs[nd] = -1.0
+    try:
+        coeffs = np.linalg.solve(A, rhs)[:nd]
+    except np.linalg.LinAlgError:
+        # singular — fall back to the latest Fock unmixed
+        return F_hist[-1]
+    F_extrap = np.zeros_like(F_hist[-1])
+    for i, c in enumerate(coeffs):
+        F_extrap += c * F_hist[i]
+    return F_extrap
+
+
 def _mulliken_shell_charges(
     P: np.ndarray, S: np.ndarray, bf_to_shell: np.ndarray, n_shell: int,
     z_ref: np.ndarray,
@@ -191,7 +234,7 @@ def gfn1_energy(
     charge: int = 0,
     max_iter: int = 100,
     conv_tol: float = 1e-6,
-    mix: float = 0.4,
+    mix: float = 0.4,   # kept for API stability — DIIS supersedes
     verbose: bool = False,
 ) -> dict:
     """Compute the GFN1-xTB single-point energy for one molecule.
@@ -259,76 +302,92 @@ def gfn1_energy(
         if z_atom_ref > 1e-9:
             qsh[ish] = q_at_init[a] * z_ref[ish] / z_atom_ref
 
-    # 7. SCF iteration — linear mixing on qsh.
+    # 7. SCF iteration — Pulay DIIS on the Fock matrix (replaces the
+    #    earlier linear-mixing on qsh). Falls back to linear mixing on
+    #    the first iteration when no history exists.
     P = np.zeros((n_basis, n_basis), dtype=np.float64)
     converged = False
     n_iter = 0
     last_qsh = qsh.copy()
     n_elec = sum(int(z_ref[ish]) for ish in range(n_shell)) - int(charge)
     if n_elec % 2 != 0:
-        # Round to nearest even via Mulliken convention; the strict
-        # closed-shell branch is what xtb's wfn driver does for charge=0.
-        # For the MVP we error.
         raise NotImplementedError(
             f"Open-shell GFN1 not supported (n_elec={n_elec})"
         )
     n_occ = n_elec // 2
 
+    # SCF iteration with Pulay DIIS on the Fock matrix.
+    #
+    # Strategy:
+    #   - iters 0..diis_warmup-1: linear mixing on qsh (build history)
+    #   - iters >= diis_warmup:   DIIS extrapolation of F using the
+    #                              generalized commutator e = F P S − S P F
+    #
+    # The early linear-mixing phase ensures we have ≥ 2 *non-trivial*
+    # error vectors before DIIS kicks in (e at iter 0/1 is degenerate
+    # because P is built from a not-yet-self-consistent F).
+    F_hist: list[np.ndarray] = []
+    e_hist: list[np.ndarray] = []
+    diis_max = 6
+    diis_warmup = 3
+
     for it in range(max_iter):
-        # shellShift[ish] (Ha) = Σ_jsh jmat[ish, jsh] · qsh[jsh]
         shell_shift = jmat @ qsh
-        # atomicShift[iat] += qat² · Γ³_iat
         q_at = np.zeros(n_atoms)
         for ish in range(n_shell):
             q_at[shell_atom[ish]] += qsh[ish]
         atom_shift = np.zeros(n_atoms)
         for a in range(n_atoms):
-            Z = atoms_list[a]
-            atom_shift[a] = q_at[a] ** 2 * GFN1_PARAMS[Z].third_order
-
-        # Combined per-shell shift (Ha): V_ish = shellShift[ish] + atomShift[iat_ish].
+            atom_shift[a] = q_at[a] ** 2 * GFN1_PARAMS[atoms_list[a]].third_order
         V_sh = shell_shift + atom_shift[shell_atom]
-
-        # Build F (Ha): F[u,v] = H0[u,v] - S[u,v] · ½ · (V_ish + V_jsh).
-        # H0 is already in Hartree (built from selfE_eV · _HARTREE_PER_EV);
-        # shell_shift is in Ha, atom_shift in Ha → V_bf is in Ha. Both
-        # H0 and the correction live in Hartree.
         V_bf = V_sh[bf_to_shell]
         F = H0 - 0.5 * (V_bf[:, None] + V_bf[None, :]) * S
 
-        # Diagonalize F C = S C diag(ε)  via canonical orthogonalization.
-        # F is in Ha, so eigenvalues come out in Ha.
+        if it >= diis_warmup:
+            e = F @ P @ S - S @ P @ F
+            F_hist.append(F)
+            e_hist.append(e)
+            if len(F_hist) > diis_max:
+                F_hist.pop(0); e_hist.pop(0)
+            if len(F_hist) >= 2:
+                F_use = _pulay_diis_numpy(F_hist, e_hist)
+            else:
+                F_use = F
+        else:
+            F_use = F
+
         from scipy.linalg import eigh as _scipy_eigh
         try:
-            eigvals_h, C = _scipy_eigh(F, S)
+            eigvals_h, C = _scipy_eigh(F_use, S)
         except Exception:
-            # Near-singular S fallback
             s_eig, U = np.linalg.eigh(S)
             keep = s_eig > 1e-3
             X = U[:, keep] * (1.0 / np.sqrt(s_eig[keep]))[None, :]
-            F_p = X.T @ F @ X
+            F_p = X.T @ F_use @ X
             w_p, Cp = np.linalg.eigh(F_p)
             eigvals_h = w_p
             C = X @ Cp
 
-        # Density (closed-shell)
         nb_occ = min(n_occ, C.shape[1])
         C_occ = C[:, :nb_occ]
         P = 2.0 * (C_occ @ C_occ.T)
 
-        # Mulliken shell charges
         qsh_new = _mulliken_shell_charges(P, S, bf_to_shell, n_shell, z_ref)
-
         dq = float(np.max(np.abs(qsh_new - last_qsh)))
         if verbose:
-            print(f"  iter {it+1:3d}: dq={dq:.2e}")
+            tag = f"DIIS hist={len(F_hist)}" if it >= diis_warmup else "linear"
+            print(f"  iter {it+1:3d}: dq={dq:.2e}  ({tag})")
         if dq < conv_tol:
             qsh = qsh_new
             converged = True
             n_iter = it + 1
             break
-        # Linear mix.
-        qsh = mix * qsh_new + (1.0 - mix) * qsh
+        # During linear-mixing warmup: damp the new charges; once DIIS
+        # is on, just use the un-mixed Mulliken result.
+        if it < diis_warmup:
+            qsh = mix * qsh_new + (1.0 - mix) * qsh
+        else:
+            qsh = qsh_new
         last_qsh = qsh.copy()
 
     if not converged:
