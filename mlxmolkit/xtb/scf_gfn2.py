@@ -341,6 +341,8 @@ def gfn2_energy(
     converged = False
     n_iter = 0
     last_qsh = qsh.copy()
+    last_dipm = np.zeros((3, n_atoms), dtype=np.float64)
+    last_qp_aes = np.zeros((6, n_atoms), dtype=np.float64)
     # GFN2 uses fractional reference occupations (N is 1.5s + 3.5p,
     # for instance). Sum as floats, round to nearest int.
     n_elec_f = float(np.sum(z_ref)) - float(charge)
@@ -471,11 +473,18 @@ def gfn2_energy(
         P = 2.0 * (C_occ @ C_occ.T)
 
         qsh_new = _mulliken_shell_charges(P, S, bf_to_shell, n_shell, z_ref)
+        dipm_new, qp_aes_new = mmompop(P, S, dpint, qpint, aoat, coords_bohr)
         dq = float(np.max(np.abs(qsh_new - last_qsh)))
+        ddip = float(np.max(np.abs(dipm_new - last_dipm)))
+        dqp = float(np.max(np.abs(qp_aes_new - last_qp_aes)))
+        dstate = max(dq, ddip, dqp)
         if verbose:
             tag = f"DIIS hist={len(F_hist)}" if it >= diis_warmup else "linear"
-            print(f"  iter {it+1:3d}: dq={dq:.2e}  ({tag})")
-        if dq < conv_tol:
+            print(
+                f"  iter {it+1:3d}: dq={dq:.2e} "
+                f"ddip={ddip:.2e} dqp={dqp:.2e}  ({tag})"
+            )
+        if dstate < conv_tol:
             qsh = qsh_new
             converged = True
             n_iter = it + 1
@@ -485,6 +494,8 @@ def gfn2_energy(
         else:
             qsh = qsh_new
         last_qsh = qsh.copy()
+        last_dipm = dipm_new
+        last_qp_aes = qp_aes_new
 
     if not converged:
         n_iter = max_iter

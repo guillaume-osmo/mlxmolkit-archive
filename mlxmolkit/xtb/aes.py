@@ -446,6 +446,97 @@ def setvsdq(
     return vs, vd, vq
 
 
+def setdvsdq(
+    atoms: list[int],
+    coords_bohr: np.ndarray,
+    q: np.ndarray,
+    dipm: np.ndarray,
+    qp: np.ndarray,
+    gab3: np.ndarray,
+    gab5: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """AES potentials for nuclear-gradient multipole derivatives.
+
+    Port of xtb's ``setdvsdq``. Compared with :func:`setvsdq`, the
+    coordinate-origin shift terms are removed because these potentials
+    are meant to multiply multipole derivatives taken at atom origins.
+    """
+    nat = coords_bohr.shape[0]
+    vs = np.zeros(nat, dtype=np.float64)
+    vd = np.zeros((3, nat), dtype=np.float64)
+    vq = np.zeros((6, nat), dtype=np.float64)
+
+    idx = np.array([[0, 1, 3],
+                    [1, 2, 4],
+                    [3, 4, 5]], dtype=np.int64)
+
+    for i in range(nat):
+        ra = coords_bohr[i]
+        stmp = 0.0
+        dtmp = np.zeros(3, dtype=np.float64)
+        qtmp = np.zeros(6, dtype=np.float64)
+        for j in range(nat):
+            g3 = gab3[j, i]
+            g5 = gab5[j, i]
+            rb = coords_bohr[j]
+            dra = ra - rb
+            dum5a = 0.0
+            r2ab = 0.0
+            t2a = 0.0
+            for l1 in range(3):
+                r2ab += dra[l1] * dra[l1]
+                t2a += dipm[l1, j] * dra[l1]
+                for l2 in range(3):
+                    ll = idx[l1, l2]
+                    dum5a -= qp[ll, j] * dra[l1] * dra[l2]
+                    if l2 >= l1:
+                        continue
+                    if (l1, l2) == (1, 0):
+                        ki = 3
+                    elif (l1, l2) == (2, 0):
+                        ki = 4
+                    elif (l1, l2) == (2, 1):
+                        ki = 5
+                    else:
+                        raise RuntimeError("unreachable")
+                    qtmp[ki] -= 3.0 * q[j] * g5 * dra[l2] * dra[l1]
+                qtmp[l1] -= 1.5 * q[j] * g5 * dra[l1] * dra[l1]
+            stmp += (-t2a) * g3 + dum5a * g5
+            for l1 in range(3):
+                dum3a = dra[l1] * q[j]
+                dum5a_l = 3.0 * dra[l1] * t2a - r2ab * dipm[l1, j]
+                dtmp[l1] += dum3a * g3 + dum5a_l * g5
+                qtmp[l1] += 0.5 * r2ab * q[j] * g5
+        vs[i] = stmp
+        vd[:, i] = dtmp
+        vq[:, i] = qtmp
+
+        p = GFN2_PARAMS[int(atoms[i])]
+        qs1 = p.dip_kernel * 2.0
+        qs2 = p.quad_kernel * 6.0
+        t2a = 0.0
+        for l1 in range(3):
+            vd[l1, i] -= qs1 * dipm[l1, i]
+            for l2 in range(l1):
+                ll = idx[l1, l2]
+                if (l1, l2) == (1, 0):
+                    kvq = 3
+                elif (l1, l2) == (2, 0):
+                    kvq = 4
+                elif (l1, l2) == (2, 1):
+                    kvq = 5
+                else:
+                    raise RuntimeError("unreachable")
+                vq[kvq, i] -= qp[ll, i] * qs2
+            ll_diag = (0, 2, 5)[l1]
+            vq[l1, i] -= qp[ll_diag, i] * qs2 * 0.5
+            t2a += qp[ll_diag, i]
+        t2a *= p.quad_kernel
+        for l1 in range(3):
+            vq[l1, i] += t2a
+    return vs, vd, vq
+
+
 def fockelectro(
     P: np.ndarray,
     S: np.ndarray,
@@ -468,22 +559,23 @@ def fockelectro(
     The translation between qpint's (xx, yy, zz, xy, xz, yz) and vq's
     mmompop (xx, xy, yy, xz, yz, zz) is handled inline.
     """
-    nao = S.shape[0]
-    F = np.zeros_like(S)
-    e_aes = 0.0
-    # vq is in qpint layout (xx, yy, zz, xy, xz, yz) — same as qpint —
-    # so no translation needed.
-    for i in range(nao):
-        ii = int(aoat[i])
-        for j in range(nao):
-            jj = int(aoat[j])
-            pji = P[j, i]
-            fji = S[j, i] * (vs[ii] + vs[jj])
-            for k in range(3):
-                fji += dpint[k, i, j] * (vd[k, ii] + vd[k, jj])
-            for k in range(6):
-                fji += qpint[k, i, j] * (vq[k, ii] + vq[k, jj])
-            F[j, i] += 0.5 * fji
-            e_aes += pji * fji
-    e_aes *= 0.25
-    return F, float(e_aes)
+    ao = np.asarray(aoat, dtype=np.int64)
+    vs_ao = vs[ao]
+
+    # fji is stored with matrix indices [j, i], matching the original
+    # loop and the returned F[j, i]. dpint/qpint are addressed as
+    # integral[k, i, j] in xtb's formula, hence the transpose below.
+    fji = S * (vs_ao[None, :] + vs_ao[:, None])
+
+    for k in range(3):
+        vd_ao = vd[k, ao]
+        fji += dpint[k].T * (vd_ao[None, :] + vd_ao[:, None])
+
+    # vq is in qpint layout (xx, yy, zz, xy, xz, yz), same as qpint.
+    for k in range(6):
+        vq_ao = vq[k, ao]
+        fji += qpint[k].T * (vq_ao[None, :] + vq_ao[:, None])
+
+    F = 0.5 * fji
+    e_aes = 0.25 * float(np.sum(P * fji))
+    return F, e_aes
