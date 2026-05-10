@@ -158,6 +158,74 @@ def _tblite_alpb_water_calc(method: str = "GFN2-xTB"):
     return _calc
 
 
+def _opt_worker(args):
+    """Top-level worker for ProcessPoolExecutor (must be importable)."""
+    a, c, chg, mi, gt, et, st = args
+    r = gfn2_alpb_water_optimize(
+        a, c, charge=chg, max_iter=mi,
+        gtol_bohr=gt, etol=et, stol_bohr=st,
+    )
+    r.pop("trajectory", None)  # strip trajectory for IPC efficiency
+    return r
+
+
+def gfn2_alpb_water_optimize_batch(
+    conformers: list[tuple],
+    *,
+    charge: int = 0,
+    max_iter: int = 200,
+    gtol_bohr: float = 1e-3,
+    etol: float = 5e-6,
+    stol_bohr: float = 1e-3,
+    n_workers: int | None = None,
+    use_processes: bool = False,
+) -> list[dict]:
+    """Optimize a batch of conformers in parallel.
+
+    Bread-and-butter routine for the openCOSMO-RS pipeline: takes a
+    list of (atoms, coords) conformer tuples and returns optimized
+    geometries + energies for each, parallelized across cores.
+
+    Default backend is :class:`ThreadPoolExecutor` (works well because
+    tblite's analytical-gradient call releases the GIL during the
+    C-side compute). Pass ``use_processes=True`` for
+    :class:`ProcessPoolExecutor` if you need fork isolation.
+
+    Args:
+        conformers: list of ``(atoms, coords_ang)`` tuples or
+            ``(atoms, coords_ang, charge)`` triples (per-conformer
+            charge override).
+        charge: default integer net charge for any conformer that
+            doesn't specify its own.
+        max_iter / gtol_bohr / etol / stol_bohr: ANCopt tolerances.
+        n_workers: number of workers. ``None`` → ``os.cpu_count()``.
+        use_processes: True for process pool (fork isolation), False
+            for thread pool (default — lower overhead).
+
+    Returns:
+        List of per-conformer result dicts (same shape as
+        :func:`gfn2_alpb_water_optimize`).
+    """
+    import os
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
+
+    jobs = []
+    for c in conformers:
+        if len(c) == 2:
+            atoms_i, coords_i = c
+            chg_i = charge
+        else:
+            atoms_i, coords_i, chg_i = c
+        jobs.append((atoms_i, coords_i, chg_i, max_iter, gtol_bohr, etol, stol_bohr))
+
+    Pool = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+    with Pool(max_workers=n_workers) as ex:
+        return list(ex.map(_opt_worker, jobs))
+
+
 def gfn2_alpb_water_optimize(
     atoms: list[int] | np.ndarray,
     coords_ang: np.ndarray,

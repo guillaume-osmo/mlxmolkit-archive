@@ -78,3 +78,19 @@ def test_small_molecules_converge(name, atoms, coords, charge):
     res = gfn2_alpb_water_optimize(atoms, coords.copy(), charge=charge)
     assert res["converged"], f"{name} did not converge"
     assert res["n_iter"] < 50, f"{name} took {res['n_iter']} iters"
+
+
+def test_batch_optimize_matches_sequential():
+    """Batch optimization gives bitwise-identical results to sequential."""
+    from mlxmolkit.xtb.solvation_alpb import gfn2_alpb_water_optimize_batch
+    confs = [
+        ([8, 1, 1], np.array([[0,0,0.20],[0,0.85,-0.45],[0,-0.85,-0.45]])),
+        ([7, 1, 1, 1], np.array([[0,0,0],[0.95,0,-0.30],[-0.48,0.82,-0.30],[-0.48,-0.82,-0.30]])),
+        ([6, 1, 1, 1, 1], np.array([[0,0,0],[0.65,0.65,0.65],[-0.65,-0.65,0.65],[-0.65,0.65,-0.65],[0.65,-0.65,-0.65]])),
+    ]
+    seq = [gfn2_alpb_water_optimize(a, c) for a, c in confs]
+    par = gfn2_alpb_water_optimize_batch(confs, n_workers=2)
+    assert len(par) == len(seq)
+    for s, p in zip(seq, par):
+        assert s["converged"] == p["converged"]
+        assert abs(s["energy"] - p["energy"]) < 1e-9

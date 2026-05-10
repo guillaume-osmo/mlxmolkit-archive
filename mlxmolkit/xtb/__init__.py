@@ -21,6 +21,7 @@ swap ``method='GFN2-xTB'`` → ``'g-xtb'`` with no API changes.
 from .solvation_alpb import (  # noqa: F401
     alpb_water_correction,
     gfn2_alpb_water_optimize,
+    gfn2_alpb_water_optimize_batch,
     gfn2_energy_alpb_water,
 )
 from .solvation_alpb_native import (  # noqa: F401
@@ -43,6 +44,7 @@ from .optimizer import ancopt  # noqa: F401
 
 __all__ = [
     "gfn2_alpb_water_optimize",
+    "gfn2_alpb_water_optimize_batch",
     "gfn2_energy_alpb_water",
     "alpb_water_correction",
     "alpb_water_correction_native",
