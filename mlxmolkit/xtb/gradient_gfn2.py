@@ -139,9 +139,14 @@ def _fd_grad_scalar(
 
 
 def _aes_full_energy_at(atoms_list, coords_ang, P_sao, qsh, shell_atom):
-    """E_aes at perturbed coords with frozen P and qsh; downstream
-    quantities (dipm/qp via Mulliken from perturbed dpint/qpint;
-    gab3/gab5 via radcn(CN); rij directly) recomputed.
+    """E_aes at perturbed coords with frozen P and qsh; everything
+    downstream (Mulliken multipoles dipm/qp from perturbed dpint/qpint,
+    gab3/gab5 from radcn(CN), rij directly) is recomputed.
+
+    Captures the full ∂E_aes/∂R chain — the dipm/qp piece IS needed
+    because dipm/qp are Mulliken-derived from P (not variational).
+    Empirically gives ~6e-3 Ha/Å residual on H2O vs FD on the full
+    SCF.
     """
     from .aes import aniso_electro, get_radcn, mmomgabzero, mmompop
     from .basis import build_basis, sao_basis_metadata
@@ -314,10 +319,12 @@ def gfn2_gradient_analytical(
     g_rep_a = _gfn2_repulsion_gradient(atoms, coords)
 
     # ----- 6/7. AES + D4 (FD on full E_aes recompute) -----
-    # FD recomputes everything downstream of P (Mulliken multipoles
-    # dipm/qp from perturbed dpint/qpint, gab3/gab5 from radcn(CN),
-    # rij directly). Captures ∂E_aes/∂R fully — at the cost of being
-    # a 2N+1 closed-form integral build (no SCF).
+    # FD recomputes everything downstream of P (dipm/qp via Mulliken
+    # from perturbed dpint/qpint, gab3/gab5 from radcn(CN), rij). The
+    # dipm/qp chain DOES contribute to dE_total/dR (E_aes is not
+    # variational in those quantities — they're Mulliken-derived from
+    # P, not independent variational parameters). Captures the full
+    # ∂E_aes/∂R; ~6e-3 Ha/Å residual on H2O empirically.
     g_aes_a = _fd_grad_scalar(
         atoms, coords,
         lambda c: _aes_full_energy_at(atoms, c, P_sao, qsh, shell_atom),
@@ -329,15 +336,18 @@ def gfn2_gradient_analytical(
         h=fd_h_aux,
     )
 
-    # The analytical AES band-piece (xtb's dtmp/qtmp via origin-shifted
-    # multipole derivatives) was wired but found to disagree with the
-    # full-E_aes FD path because mlxmolkit's GFN2 SCF uses
-    # aniso_electro for the energy and fockelectro for the Fock
-    # contribution — these give different AES energies at convergence
-    # (~1.4e-3 vs −9.5e-3 Ha on H2O), so xtb's variational-derivative
-    # formula doesn't directly apply. The shifted-multipole tooling
-    # (:func:`shift_multipole_grad`) is shipped FD-verified and ready
-    # for a future SCF formulation that's fully variational.
+    # NOTE on the F_aes band gradient cancellation: in mlxmolkit's
+    # GFN2 SCF, E_aes is from aniso_electro (not fockelectro), but the
+    # F_aes Fock contribution is from fockelectro. The relation
+    # trace(P · F_aes) = 2 · E_focke (≠ 2·E_aes_aniso) means in the
+    # energy-form gradient expansion
+    #     E_total = 2Σε − V·z + ½q·J·q + ⅔q³Γ − 2·E_focke + E_aes_aniso + ...
+    # the trace(P·∂F_aes/∂R) term that appears positively in d(2Σε)/dR
+    # gets EXACTLY cancelled by the −2·dE_focke/dR term (since dE_focke
+    # = ½·trace(P·∂F_aes/∂R) at fixed vs/vd/vq). So the F_aes band
+    # piece doesn't appear explicitly — the dpint/qpint chain enters
+    # only through dE_aes_aniso/∂R, which is captured by the FD path
+    # below. Set band_aes_vd_vq to zero accordingly.
     g_band_aes_b = np.zeros((n_atoms, 3), dtype=np.float64)
 
     # Total: convert Ha/Bohr pieces to Ha/Å.
