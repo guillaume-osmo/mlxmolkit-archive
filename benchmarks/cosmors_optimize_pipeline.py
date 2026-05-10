@@ -199,6 +199,28 @@ def main() -> None:
     print(f"\nSummary: {n_conv}/{len(summary)} converged at "
           f"opt_level=normal (xtb default).")
 
+    # Stress test: 20-conformer batch via the parallel API.
+    print("\n" + "=" * 70)
+    print("Stress test: 20-conformer batch (5 base × 4 perturbations)")
+    print("=" * 70)
+    from mlxmolkit.xtb import gfn2_alpb_water_optimize_batch
+
+    rng = np.random.default_rng(42)
+    bases = [(atoms, coords) for _, (atoms, coords, _, _) in CONFORMERS.items()][:5]
+    confs_batch = []
+    for k in range(4):
+        for atoms, coords in bases:
+            confs_batch.append(
+                (atoms, coords + rng.normal(0, 0.08, coords.shape))
+            )
+    t0 = time.perf_counter()
+    bres = gfn2_alpb_water_optimize_batch(confs_batch, n_workers=4)
+    dt = time.perf_counter() - t0
+    n_ok = sum(1 for r in bres if r["converged"])
+    avg_it = sum(r["n_iter"] for r in bres) / len(bres)
+    print(f"  {n_ok}/{len(bres)} converged in {dt:.1f} s "
+          f"(avg {avg_it:.1f} iters; mean {dt/len(bres):.2f} s/conformer)")
+
 
 if __name__ == "__main__":
     main()
