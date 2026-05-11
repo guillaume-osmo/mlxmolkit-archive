@@ -492,6 +492,165 @@ def tiered_gxtb_orca_cosmors(
     }
 
 
+def generate_rdkit_conformers(
+    smiles: str,
+    *,
+    n_conformers: int = 20,
+    seed: int = 42,
+    mmff_iter: int = 300,
+) -> list[tuple[list[int], np.ndarray]]:
+    """RDKit ETKDGv3 conformer generation + MMFF94 refinement.
+
+    Returns a list of ``(atomic_numbers, coords_angstrom)`` tuples.
+    """
+
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"invalid SMILES: {smiles!r}")
+    mol = Chem.AddHs(mol)
+    p = AllChem.ETKDGv3()
+    p.randomSeed = int(seed)
+    p.useRandomCoords = True
+    p.pruneRmsThresh = 0.5
+    cids = AllChem.EmbedMultipleConfs(mol, numConfs=n_conformers, params=p)
+    if len(cids) == 0:
+        raise RuntimeError(f"RDKit failed to embed any conformers for {smiles!r}")
+    if AllChem.MMFFHasAllMoleculeParams(mol):
+        for cid in cids:
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=mmff_iter, confId=int(cid))
+    else:
+        for cid in cids:
+            AllChem.UFFOptimizeMolecule(mol, maxIters=mmff_iter, confId=int(cid))
+    atoms = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    out: list[tuple[list[int], np.ndarray]] = []
+    for cid in cids:
+        conf = mol.GetConformer(int(cid))
+        coords = np.asarray(
+            [[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z]
+             for i in range(mol.GetNumAtoms())],
+            dtype=np.float64,
+        )
+        out.append((list(atoms), coords))
+    return out
+
+
+def cosmosegments_from_orcacosmo(path: Path | str) -> CosmoSegments:
+    """Adapter: read an ORCA ``.orcacosmo`` via opencosmorspy and return a
+    ``CosmoSegments`` shaped for the σ-potential entry points."""
+
+    from opencosmorspy.input_parsers import SigmaProfileParser
+    from rdkit.Chem import GetPeriodicTable
+
+    BOHR_PER_A = 1.0 / 0.52917721092
+    spp = SigmaProfileParser(str(path))
+    pt = GetPeriodicTable()
+    atom_z = [pt.GetAtomicNumber(s.title()) for s in spp["atm_elmnt"]]
+    return CosmoSegments(
+        epsilon=float("inf"), fepsi=1.0,
+        area=float(spp["area"]), volume=float(spp["volume"]),
+        total_screening_charge=0.0,
+        total_energy_hartree=float("nan"),
+        dielectric_energy_hartree=float("nan"),
+        atom_radii=np.asarray(spp["atm_rad"]),
+        atom_coords_bohr=np.asarray(spp["atm_pos"]) * BOHR_PER_A,
+        atom_z=atom_z,
+        segments_atom=np.asarray(spp["seg_atm_nr"], dtype=np.intp),
+        segments_xyz_bohr=np.asarray(spp["seg_pos"]) * BOHR_PER_A,
+        segments_charge=np.asarray(spp["seg_charge"]),
+        segments_area=np.asarray(spp["seg_area"]),
+        segments_sigma=np.asarray(spp["seg_sigma_raw"]),
+        segments_potential=np.asarray(spp["seg_potential"]),
+        cosmo_text="",
+    )
+
+
+def tiered_multiconformer_gxtb_orca(
+    smiles: str,
+    *,
+    n_conformers: int = 20,
+    n_keep: int = 5,
+    seed: int = 42,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    orca_path: Path = _DEFAULT_ORCA,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    orca_cores: int = 1,
+    acc: float = 0.1,
+) -> dict[str, object]:
+    """Multi-conformer tiered pipeline: RDKit → g-xTB --opt → ORCA COSMORS.
+
+    Steps:
+      1. Generate ``n_conformers`` RDKit conformers (ETKDGv3 + MMFF/UFF).
+      2. g-xTB --opt each one.
+      3. Sort by g-xTB energy, keep the top ``n_keep`` (lowest energy).
+      4. ORCA BP86/def2-TZVP COSMORS on each survivor.
+      5. Return per-conformer cosmo objects + energies for downstream
+         Boltzmann weighting.
+
+    Returns a dict with:
+      - ``cosmos`` : list[CosmoSegments] (one per kept conformer)
+      - ``energies_gxtb_hartree`` : list[float]
+      - ``orcacosmo_paths`` : list[Path]
+    """
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="multi-cosmors-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    confs = generate_rdkit_conformers(smiles, n_conformers=n_conformers, seed=seed)
+
+    gxtb_optimized: list[tuple[list[int], np.ndarray, float]] = []
+    for idx, (atoms, coords) in enumerate(confs):
+        try:
+            opt_coords, e_g = gxtb_optimize_geometry(
+                atoms, coords,
+                charge=charge, uhf=uhf, xtb_path=xtb_path,
+                workdir=workdir / f"conf{idx:03d}_gxtb", keep_workdir=False, acc=acc,
+            )
+            gxtb_optimized.append((atoms, opt_coords, float(e_g)))
+        except Exception:
+            continue
+    if not gxtb_optimized:
+        raise RuntimeError(f"all conformers failed g-xTB opt for {smiles!r}")
+    gxtb_optimized.sort(key=lambda x: x[2])
+    kept = gxtb_optimized[: max(1, int(n_keep))]
+
+    cosmos: list[CosmoSegments] = []
+    paths: list[Path] = []
+    energies: list[float] = []
+    for idx, (atoms, opt_coords, e_g) in enumerate(kept):
+        orcacosmo = orca_cosmors_singlepoint(
+            atoms, opt_coords,
+            charge=charge, uhf=uhf, method=method, basis=basis, solvent=solvent,
+            orca_path=orca_path,
+            workdir=workdir / f"keep{idx:03d}_orca",
+            keep_workdir=keep_workdir, n_cores=orca_cores,
+        )
+        cs = cosmosegments_from_orcacosmo(orcacosmo)
+        cosmos.append(cs)
+        paths.append(orcacosmo)
+        energies.append(e_g)
+    if not keep_workdir:
+        # the per-conformer subdirs of survivors are already managed by
+        # orca_cosmors_singlepoint; clean up the parent shell.
+        shutil.rmtree(workdir, ignore_errors=True)
+    return {
+        "cosmos": cosmos,
+        "energies_gxtb_hartree": energies,
+        "orcacosmo_paths": paths,
+        "n_conformers_generated": len(confs),
+        "n_optimized": len(gxtb_optimized),
+        "n_kept": len(kept),
+    }
+
+
 def tiered_gxtb_orca_cosmors_from_smiles(
     smiles: str,
     *,
@@ -713,6 +872,134 @@ OPENCOSMORS25A_PARAMS = {
 }
 
 
+def sigma_potential_from_arrays(
+    sigma_avg_e_per_A2: np.ndarray,
+    area_A2: np.ndarray,
+    *,
+    sigma_grid_e_per_A2: np.ndarray | None = None,
+    T: float = 298.15,
+    params: dict | None = None,
+    sigma_bin_min: float = -0.030,
+    sigma_bin_max: float = 0.030,
+    sigma_bin_step: float = 0.001,
+    n_iter_max: int = 500,
+    conv_tol: float = 1.0e-9,
+    damping: float = 0.7,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Low-level σ-potential entry point that skips Klamt averaging.
+
+    Takes pre-averaged segment σ values and segment areas (in arbitrary
+    common scale; only relative weights matter). For multi-conformer
+    Boltzmann-weighted ensembles, the caller should weight the per-conformer
+    areas before concatenating.
+    """
+
+    p = dict(OPENCOSMORS25A_PARAMS) if params is None else {**OPENCOSMORS25A_PARAMS, **params}
+    Aeff = p["Aeff"]; alpha = p["alpha"]; CHB = p["CHB"]
+    CHBT = p["CHBT"]; sigma_HB = p["SigmaHB"]; R = p["R"]
+
+    sigma_arr = np.asarray(sigma_avg_e_per_A2, dtype=np.float64)
+    area_arr = np.asarray(area_A2, dtype=np.float64)
+
+    edges = np.arange(sigma_bin_min - 0.5 * sigma_bin_step,
+                      sigma_bin_max + 1.5 * sigma_bin_step,
+                      sigma_bin_step)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    area_bins, _ = np.histogram(sigma_arr, bins=edges, weights=area_arr)
+    keep = area_bins > 0
+    sigma_alpha = centers[keep]
+    X = area_bins[keep] / area_bins[keep].sum()
+
+    buff = 1.0 - CHBT + CHBT * (298.15 / T)
+    CHB_T = CHB * buff if buff > 0 else 0.0
+
+    sigma_sum = sigma_alpha[:, None] + sigma_alpha[None, :]
+    E_mf = 0.5 * Aeff * alpha * sigma_sum * sigma_sum
+
+    sigma_min = np.minimum(sigma_alpha[:, None], sigma_alpha[None, :])
+    sigma_max = np.maximum(sigma_alpha[:, None], sigma_alpha[None, :])
+    donor = np.minimum(0.0, sigma_min + sigma_HB)
+    acceptor = np.maximum(0.0, sigma_max - sigma_HB)
+    E_hb = Aeff * CHB_T * donor * acceptor
+
+    RT = R * T
+    tau = np.exp(-(E_mf + E_hb) / RT)
+
+    Gamma = np.ones_like(X)
+    for _ in range(n_iter_max):
+        Gamma_new = 1.0 / (tau @ (X * Gamma))
+        if np.max(np.abs(Gamma_new - Gamma) / np.abs(Gamma)) < conv_tol:
+            Gamma = Gamma_new
+            break
+        Gamma = damping * (Gamma_new - Gamma) + Gamma
+
+    if sigma_grid_e_per_A2 is None:
+        sigma_test = np.round(np.arange(-0.030, 0.0301, 0.001), 6)
+    else:
+        sigma_test = np.asarray(sigma_grid_e_per_A2, dtype=np.float64)
+
+    sum_t = sigma_test[:, None] + sigma_alpha[None, :]
+    E_mf_t = 0.5 * Aeff * alpha * sum_t * sum_t
+
+    min_t = np.minimum(sigma_test[:, None], sigma_alpha[None, :])
+    max_t = np.maximum(sigma_test[:, None], sigma_alpha[None, :])
+    donor_t = np.minimum(0.0, min_t + sigma_HB)
+    acceptor_t = np.maximum(0.0, max_t - sigma_HB)
+    E_hb_t = Aeff * CHB_T * donor_t * acceptor_t
+
+    tau_t = np.exp(-(E_mf_t + E_hb_t) / RT)
+    Gamma_test = 1.0 / (tau_t @ (X * Gamma))
+    mu_S_J = RT * np.log(Gamma_test)
+    return sigma_test, mu_S_J
+
+
+def sigma_potential_ensemble(
+    cosmo_list: list[CosmoSegments],
+    energies_hartree: np.ndarray,
+    *,
+    T: float = 298.15,
+    klamt_variant: str = "mullins",
+    sigma_grid_e_per_A2: np.ndarray | None = None,
+    **kwargs,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Boltzmann-weighted ensemble σ-potential over multiple conformers.
+
+    For conformer i with energy E_i, the population weight is
+
+        w_i = exp(-E_i/RT) / Σ_j exp(-E_j/RT)
+
+    and the ensemble σ-profile is Σ_i w_i p_i(σ). Each conformer is Klamt-
+    averaged independently (positions don't mix across conformers), then
+    σ values are concatenated with area scaled by w_i.
+
+    Returns ``(sigma_test, mu_ensemble, weights)``.
+    """
+
+    e = np.asarray(energies_hartree, dtype=np.float64)
+    R_J_per_mol_K = 8.314462618
+    HARTREE_PER_J_PER_MOL = 1.0 / 2625499.6394
+    kT_hartree = R_J_per_mol_K * T * HARTREE_PER_J_PER_MOL
+    e_rel = e - e.min()
+    weights = np.exp(-e_rel / kT_hartree)
+    weights /= weights.sum()
+
+    all_sigma: list[np.ndarray] = []
+    all_area: list[np.ndarray] = []
+    for cs, w in zip(cosmo_list, weights):
+        sigma_avg = klamt_average_sigmas(cs, variant=klamt_variant)
+        all_sigma.append(sigma_avg)
+        all_area.append(np.asarray(cs.segments_area, dtype=np.float64) * float(w))
+
+    sigma_test, mu = sigma_potential_from_arrays(
+        np.concatenate(all_sigma),
+        np.concatenate(all_area),
+        sigma_grid_e_per_A2=sigma_grid_e_per_A2,
+        T=T,
+        **kwargs,
+    )
+    return sigma_test, mu, weights
+
+
 def sigma_potential(
     cosmo: CosmoSegments,
     *,
@@ -743,78 +1030,16 @@ def sigma_potential(
     to -3 to +3 e/nm²).
     """
 
-    p = dict(OPENCOSMORS25A_PARAMS) if params is None else {**OPENCOSMORS25A_PARAMS, **params}
-    Aeff = p["Aeff"]; alpha = p["alpha"]; CHB = p["CHB"]
-    CHBT = p["CHBT"]; sigma_HB = p["SigmaHB"]; R = p["R"]
-
-    # r-averaged σ per segment, area per segment
     sigma_seg = klamt_average_sigmas(cosmo, variant=klamt_variant)
     area_seg = np.asarray(cosmo.segments_area, dtype=np.float64)
-
-    # Bin into a σ-grid for the COSMOSPACE iteration
-    edges = np.arange(sigma_bin_min - 0.5 * sigma_bin_step,
-                      sigma_bin_max + 1.5 * sigma_bin_step,
-                      sigma_bin_step)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    area_bins, _ = np.histogram(sigma_seg, bins=edges, weights=area_seg)
-    keep = area_bins > 0
-    sigma_alpha = centers[keep]                            # (n_bin,)
-    X = area_bins[keep] / area_bins[keep].sum()            # (n_bin,)
-
-    # Temperature-dependent HB prefactor (Klamt convention)
-    buff = 1.0 - CHBT + CHBT * (298.15 / T)
-    CHB_T = CHB * buff if buff > 0 else 0.0
-
-    # Interaction energy matrix E_int[i, j] in J/mol
-    sigma_sum = sigma_alpha[:, None] + sigma_alpha[None, :]
-    E_mf = 0.5 * Aeff * alpha * sigma_sum * sigma_sum
-
-    sigma_min = np.minimum(sigma_alpha[:, None], sigma_alpha[None, :])
-    sigma_max = np.maximum(sigma_alpha[:, None], sigma_alpha[None, :])
-    donor = np.minimum(0.0, sigma_min + sigma_HB)     # ≤ 0 for donor segments
-    acceptor = np.maximum(0.0, sigma_max - sigma_HB)  # ≥ 0 for acceptor segments
-    E_hb = Aeff * CHB_T * donor * acceptor            # ≤ 0 (favorable when both present)
-
-    RT = R * T
-    tau = np.exp(-(E_mf + E_hb) / RT)                 # (n_bin, n_bin)
-
-    # COSMOSPACE successive substitution: Γ_new = 1 / (tau @ (X * Γ))
-    Gamma = np.ones_like(X)
-    converged = False
-    for _ in range(n_iter_max):
-        Gamma_new = 1.0 / (tau @ (X * Gamma))
-        if np.max(np.abs(Gamma_new - Gamma) / np.abs(Gamma)) < conv_tol:
-            Gamma = Gamma_new
-            converged = True
-            break
-        Gamma = damping * (Gamma_new - Gamma) + Gamma
-    if not converged:
-        # Carry on with the last iterate but flag.
-        pass
-
-    # Build test grid (default = paper's 61 bins from -3 to +3 e/nm² = -0.030..+0.030 e/Å²)
-    if sigma_grid_e_per_A2 is None:
-        sigma_test = np.round(np.arange(-0.030, 0.0301, 0.001), 6)
-    else:
-        sigma_test = np.asarray(sigma_grid_e_per_A2, dtype=np.float64)
-
-    # E_int(test, β) on (n_test, n_bin)
-    sum_t = sigma_test[:, None] + sigma_alpha[None, :]
-    E_mf_t = 0.5 * Aeff * alpha * sum_t * sum_t
-
-    min_t = np.minimum(sigma_test[:, None], sigma_alpha[None, :])
-    max_t = np.maximum(sigma_test[:, None], sigma_alpha[None, :])
-    donor_t = np.minimum(0.0, min_t + sigma_HB)
-    acceptor_t = np.maximum(0.0, max_t - sigma_HB)
-    E_hb_t = Aeff * CHB_T * donor_t * acceptor_t
-
-    tau_t = np.exp(-(E_mf_t + E_hb_t) / RT)            # (n_test, n_bin)
-    Gamma_test = 1.0 / (tau_t @ (X * Gamma))
-    # COSMO-RS convention (COSMOtherm, openCOSMO-RS): μ_S(σ) = +RT · ln Γ_S(σ).
-    # Positive μ = unfavorable segment in S; negative = favorable. Matches the
-    # sign of σ-potentials in the RSC Adv 2026 paper dataset.
-    mu_S_J = RT * np.log(Gamma_test)
-    return sigma_test, mu_S_J
+    return sigma_potential_from_arrays(
+        sigma_seg, area_seg,
+        sigma_grid_e_per_A2=sigma_grid_e_per_A2,
+        T=T, params=params,
+        sigma_bin_min=sigma_bin_min, sigma_bin_max=sigma_bin_max,
+        sigma_bin_step=sigma_bin_step,
+        n_iter_max=n_iter_max, conv_tol=conv_tol, damping=damping,
+    )
 
 
 def sigma_profile_klamt(

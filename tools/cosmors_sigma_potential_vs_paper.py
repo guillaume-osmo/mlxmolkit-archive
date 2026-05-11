@@ -97,40 +97,32 @@ def sigma_pot_tmcosmo(smi: str) -> np.ndarray:
     return mu  # J/mol
 
 
-def sigma_pot_orca(smi: str, n_cores: int = 4) -> np.ndarray:
-    """μ_S from g-xTB opt + ORCA BP86/def2-TZVP COSMORS σ-profile."""
-    from mlxmolkit.xtb import tiered_gxtb_orca_cosmors_from_smiles, sigma_potential
-    out = tiered_gxtb_orca_cosmors_from_smiles(smi, seed=42, solvent="water", n_cores=n_cores)
-    # Adapt: read the .orcacosmo via spp, build a CosmoSegments-shaped object
-    from opencosmorspy.input_parsers import SigmaProfileParser
-    from mlxmolkit.xtb.cosmo_sigma import CosmoSegments
-    spp = SigmaProfileParser(str(out["orcacosmo_path"]))
-    # positions in spp are in Å; CosmoSegments expects Bohr — convert
-    BOHR_PER_A = 1.0 / 0.52917721092
-    cs = CosmoSegments(
-        epsilon=float("inf"), fepsi=1.0,
-        area=float(spp["area"]), volume=float(spp["volume"]),
-        total_screening_charge=0.0,
-        total_energy_hartree=float("nan"),
-        dielectric_energy_hartree=float("nan"),
-        atom_radii=np.asarray(spp["atm_rad"]),
-        atom_coords_bohr=np.asarray(spp["atm_pos"]) * BOHR_PER_A,
-        atom_z=[int(z) for z in (atomic_number_from_symbol(s) for s in spp["atm_elmnt"])],
-        segments_atom=np.asarray(spp["seg_atm_nr"], dtype=np.intp),
-        segments_xyz_bohr=np.asarray(spp["seg_pos"]) * BOHR_PER_A,
-        segments_charge=np.asarray(spp["seg_charge"]),
-        segments_area=np.asarray(spp["seg_area"]),
-        segments_sigma=np.asarray(spp["seg_sigma_raw"]),
-        segments_potential=np.asarray(spp["seg_potential"]),
-        cosmo_text="",
+def sigma_pot_orca(smi: str, n_cores: int = 1) -> np.ndarray:
+    """μ_S from g-xTB opt + ORCA BP86/def2-TZVP COSMORS (single conformer)."""
+    from mlxmolkit.xtb import (
+        cosmosegments_from_orcacosmo,
+        sigma_potential,
+        tiered_gxtb_orca_cosmors_from_smiles,
     )
+    out = tiered_gxtb_orca_cosmors_from_smiles(smi, seed=42, solvent="water", n_cores=n_cores)
+    cs = cosmosegments_from_orcacosmo(out["orcacosmo_path"])
     _, mu = sigma_potential(cs, sigma_grid_e_per_A2=PAPER_SIGMA_E_PER_A2)
     return mu
 
 
-def atomic_number_from_symbol(s: str) -> int:
-    from rdkit.Chem import GetPeriodicTable
-    return GetPeriodicTable().GetAtomicNumber(s.title())
+def sigma_pot_orca_multiconformer(smi: str, *, n_conformers: int = 10, n_keep: int = 3,
+                                    n_cores: int = 1) -> tuple[np.ndarray, int, list[float]]:
+    """Multi-conformer μ_S via RDKit→g-xTB-screen→ORCA→Boltzmann-weighted."""
+    from mlxmolkit.xtb import sigma_potential_ensemble, tiered_multiconformer_gxtb_orca
+    out = tiered_multiconformer_gxtb_orca(
+        smi, n_conformers=n_conformers, n_keep=n_keep,
+        seed=42, solvent="water", orca_cores=n_cores,
+    )
+    _, mu, weights = sigma_potential_ensemble(
+        out["cosmos"], out["energies_gxtb_hartree"],
+        sigma_grid_e_per_A2=PAPER_SIGMA_E_PER_A2,
+    )
+    return mu, out["n_kept"], list(weights)
 
 
 def standardize_columnwise(M: np.ndarray) -> np.ndarray:
@@ -150,24 +142,32 @@ def pearson(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _worker(task: dict) -> dict | None:
-    """Per-molecule worker for ProcessPoolExecutor.
-
-    Imports happen inside so each forked process starts fresh; this avoids
-    pickling issues with the mlxmolkit / opencosmorspy modules.
-    """
+    """Per-molecule worker for ProcessPoolExecutor."""
     name = task["name"]; smi = task["smiles"]; backend = task["backend"]
     try:
         t0 = time.perf_counter()
+        meta_extra: dict = {}
         if backend == "tmcosmo":
             mu_ours = sigma_pot_tmcosmo(smi)
-        else:
+        elif backend == "orca":
             mu_ours = sigma_pot_orca(smi, n_cores=task.get("orca_cores", 1))
+        elif backend == "orca-multi":
+            mu_ours, n_kept, weights = sigma_pot_orca_multiconformer(
+                smi,
+                n_conformers=task.get("n_conformers", 10),
+                n_keep=task.get("n_keep", 3),
+                n_cores=task.get("orca_cores", 1),
+            )
+            meta_extra = {"n_kept": n_kept, "boltzmann_weights": weights}
+        else:
+            raise ValueError(f"unknown backend {backend!r}")
         wall = time.perf_counter() - t0
         return {
             "name": name, "cas": task["cas"], "smiles": smi,
             "cluster": task["cluster"], "n_heavy": task["n_heavy"],
-            "mu_ours": mu_ours.tolist(), "mu_paper": task["mu_paper"],
+            "mu_ours": mu_ours.tolist(),
             "wall_s": wall, "error": None,
+            **meta_extra,
         }
     except Exception as exc:
         return {"name": name, "smiles": smi, "error": f"{type(exc).__name__}: {exc}"}
@@ -178,7 +178,12 @@ def main() -> None:
     parser.add_argument("--xlsx", type=Path, default=REPO_ROOT / "data" / "d5ra08246c1.xlsx")
     parser.add_argument("--n", type=int, default=20)
     parser.add_argument("--max-heavy", type=int, default=10)
-    parser.add_argument("--backend", choices=["tmcosmo", "orca"], default="tmcosmo")
+    parser.add_argument("--backend", choices=["tmcosmo", "orca", "orca-multi"], default="tmcosmo",
+                        help="orca-multi: RDKit→g-xTB-screen→ORCA on each survivor, Boltzmann-weighted")
+    parser.add_argument("--n-conformers", type=int, default=10,
+                        help="(orca-multi only) total RDKit conformers to generate per molecule")
+    parser.add_argument("--n-keep", type=int, default=3,
+                        help="(orca-multi only) lowest-energy g-xTB conformers kept for ORCA")
     parser.add_argument("--require-cluster", action="store_true")
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "benchmarks" / "cosmors_sigma_potential_vs_paper.csv")
     parser.add_argument("--workers", type=int, default=4,
@@ -219,6 +224,8 @@ def main() -> None:
             "mu_paper": mu_paper,
             "backend": args.backend,
             "orca_cores": args.orca_cores,
+            "n_conformers": args.n_conformers,
+            "n_keep": args.n_keep,
         })
     save_cache(cache)
     print(f"Prepared {len(tasks)} tasks (backend={args.backend}, workers={args.workers}, orca_cores={args.orca_cores})", flush=True)
