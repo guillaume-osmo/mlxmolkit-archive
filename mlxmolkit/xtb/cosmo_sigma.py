@@ -376,11 +376,11 @@ def sigma_profile_histogram(
     sigma_max: float = 0.025,
     n_bins: int = 51,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Area-weighted σ-profile histogram p(σ).
+    """Raw (un-averaged) area-weighted σ-profile histogram p(σ).
 
     Returns ``(sigma_centers, p_area)`` where ``p_area`` is the surface area
-    in Å² summed into each σ bin. This is the "raw" σ-profile before Klamt
-    r-averaging; openCOSMO-RS applies its own averaging downstream.
+    in Å² summed into each σ bin. For the canonical Klamt-averaged COSMO-RS
+    σ-profile use :func:`sigma_profile_klamt` instead.
     """
 
     edges = np.linspace(sigma_min, sigma_max, n_bins + 1)
@@ -389,3 +389,78 @@ def sigma_profile_histogram(
     sigmas = np.asarray(cosmo.segments_sigma, dtype=np.float64)
     p_area, _ = np.histogram(sigmas, bins=edges, weights=weights)
     return centers, p_area
+
+
+_KLAMT_PARAMS = {
+    # Mullins 2008 (IECR), used by NIST COSMOSAC v2:
+    "mullins": (0.8176300195**2, 1.0),
+    # Hsieh 2010 (Fluid Phase Equil.), used by COSMO-SAC-2010:
+    "hsieh": (7.25 / np.pi, 3.57),
+}
+
+
+def klamt_average_sigmas(
+    cosmo: CosmoSegments,
+    *,
+    variant: str = "mullins",
+    bohr_to_ang: float = 0.5291772108,
+) -> np.ndarray:
+    """Klamt r-averaged segment σ values (e/Å²).
+
+    For each segment i:
+
+        σ̄_i = Σ_j w_ij · σ_j / Σ_j w_ij
+
+        w_ij = (r_n² · r_av² / (r_n² + r_av²))
+               · exp( -f_decay · d_ij² / (r_n² + r_av²) )
+
+    where ``r_n²`` is the segment's effective radius squared (area / π),
+    ``r_av²`` and ``f_decay`` are the variant constants, and ``d_ij`` is the
+    pairwise segment-segment distance in Å.
+
+    Variants:
+      * ``'mullins'`` (default): ``r_av² = 0.8176²``, ``f_decay = 1.0``.
+      * ``'hsieh'``: ``r_av² = 7.25/π``, ``f_decay = 3.57``.
+    """
+
+    if variant not in _KLAMT_PARAMS:
+        raise ValueError(f"variant must be one of {sorted(_KLAMT_PARAMS)}; got {variant!r}")
+    r_av2, f_decay = _KLAMT_PARAMS[variant]
+
+    area = np.asarray(cosmo.segments_area, dtype=np.float64)
+    sigma = np.asarray(cosmo.segments_sigma, dtype=np.float64)
+    xyz_ang = np.asarray(cosmo.segments_xyz_bohr, dtype=np.float64) * bohr_to_ang
+
+    rn2 = area / np.pi  # per-segment r² (Å²)
+    diff = xyz_ang[:, None, :] - xyz_ang[None, :, :]
+    d2 = np.einsum("ijk,ijk->ij", diff, diff)
+
+    denom = rn2[:, None] + r_av2
+    pref = rn2[:, None] * r_av2 / denom
+    w = pref * np.exp(-f_decay * d2 / denom)
+
+    return (w @ sigma) / w.sum(axis=1)
+
+
+def sigma_profile_klamt(
+    cosmo: CosmoSegments,
+    *,
+    variant: str = "mullins",
+    sigma_min: float = -0.025,
+    sigma_max: float = 0.025,
+    bin_width: float = 0.001,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Canonical Klamt-averaged σ-profile p(σ) used by COSMO-SAC / openCOSMO-RS.
+
+    Returns ``(sigma_centers, p_area, sigma_avg)`` where ``sigma_avg`` is the
+    per-segment averaged σ values (e/Å²) and ``p_area`` is the area-weighted
+    histogram (Å²) on the standard ``[-0.025, 0.025]`` grid at ``0.001`` step.
+    """
+
+    sigma_avg = klamt_average_sigmas(cosmo, variant=variant)
+    n_bins = int(round((sigma_max - sigma_min) / bin_width))
+    edges = np.linspace(sigma_min, sigma_max, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    weights = np.asarray(cosmo.segments_area, dtype=np.float64)
+    p_area, _ = np.histogram(sigma_avg, bins=edges, weights=weights)
+    return centers, p_area, sigma_avg

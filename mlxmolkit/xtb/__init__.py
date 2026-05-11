@@ -50,8 +50,10 @@ from .cosmo_sigma import (  # noqa: F401
     gxtb_optimize_geometry,
     hybrid_gxtb_gfn2_cosmo,
     hybrid_gxtb_gfn2_cosmo_from_smiles,
+    klamt_average_sigmas,
     parse_xtb_cosmo,
     sigma_profile_histogram,
+    sigma_profile_klamt,
     write_cosmo_file,
 )
 
@@ -82,4 +84,6 @@ __all__ = [
     "hybrid_gxtb_gfn2_cosmo_from_smiles",
     "write_cosmo_file",
     "sigma_profile_histogram",
+    "sigma_profile_klamt",
+    "klamt_average_sigmas",
 ]
