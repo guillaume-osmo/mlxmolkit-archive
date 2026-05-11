@@ -363,10 +363,77 @@ def hybrid_gxtb_gfn2_cosmo_from_smiles(
     return out
 
 
-def write_cosmo_file(cosmo: CosmoSegments, path: Path | str) -> None:
-    """Write the raw TURBOMOLE-format ``.cosmo`` text back to disk."""
+_BOHR_PER_ANG = 1.0 / 0.52917721092  # match opencosmorspy's constant
+_ANG2_PER_BOHR2 = 0.52917721092 ** 2
+_ANG3_PER_BOHR3 = 0.52917721092 ** 3
 
-    Path(path).write_text(cosmo.cosmo_text)
+
+def write_cosmo_file(
+    cosmo: CosmoSegments,
+    path: Path | str,
+    *,
+    method_tag: str = "xtb;gfn2-tmcosmo",
+    opencosmors_compat: bool = True,
+) -> None:
+    """Write the TURBOMOLE-format ``.cosmo`` text to disk.
+
+    With ``opencosmors_compat=True`` (default) the output is patched so that
+    openCOSMO-RS_py's ``SigmaProfileParser`` reads it directly:
+
+      * The line under ``$info`` is rewritten to a ``program;method`` tag
+        (xtb writes ``prog.: xtb``, the parser expects a ``;``-separated
+        string).
+      * The global ``area=`` and ``volume=`` fields in ``$cosmo_data`` are
+        converted from Å²/Å³ (xtb's convention) to Bohr²/Bohr³ — the parser
+        applies a ``Bohr→Å`` conversion factor to those fields. Per-segment
+        ``seg_area`` and ``seg_pos`` already match the parser's expected
+        units (Å² and Bohr respectively), so they are left untouched.
+
+    Set ``opencosmors_compat=False`` to write the raw xtb-format text.
+    """
+
+    text = cosmo.cosmo_text
+    if not opencosmors_compat:
+        Path(path).write_text(text)
+        return
+
+    lines = text.splitlines(keepends=True)
+    out = []
+    rewrite_next = False
+    in_cosmo_data = False
+    for line in lines:
+        if rewrite_next:
+            indent = line[: len(line) - len(line.lstrip())]
+            newline = "\r\n" if line.endswith("\r\n") else "\n"
+            out.append(f"{indent}{method_tag}{newline}")
+            rewrite_next = False
+            continue
+
+        stripped = line.strip()
+        if stripped.startswith("$"):
+            in_cosmo_data = stripped == "$cosmo_data"
+            out.append(line)
+            if stripped == "$info":
+                rewrite_next = True
+            continue
+
+        if in_cosmo_data:
+            if stripped.startswith("area"):
+                val = float(stripped.split("=")[1])
+                indent = line[: len(line) - len(line.lstrip())]
+                newline = "\r\n" if line.endswith("\r\n") else "\n"
+                out.append(f"{indent}area={val / _ANG2_PER_BOHR2:.15g}{newline}")
+                continue
+            if stripped.startswith("volume"):
+                val = float(stripped.split("=")[1])
+                indent = line[: len(line) - len(line.lstrip())]
+                newline = "\r\n" if line.endswith("\r\n") else "\n"
+                out.append(f"{indent}volume={val / _ANG3_PER_BOHR3:.15g}{newline}")
+                continue
+
+        out.append(line)
+
+    Path(path).write_text("".join(out))
 
 
 def sigma_profile_histogram(
@@ -435,8 +502,10 @@ def klamt_average_sigmas(
     diff = xyz_ang[:, None, :] - xyz_ang[None, :, :]
     d2 = np.einsum("ijk,ijk->ij", diff, diff)
 
-    denom = rn2[:, None] + r_av2
-    pref = rn2[:, None] * r_av2 / denom
+    # Both NIST COSMOSAC's to_sigma.py and openCOSMO-RS_py weight by the
+    # contributing segment j's radius — denom[i, j] = r_n[j]² + r_av².
+    denom = rn2[None, :] + r_av2
+    pref = rn2[None, :] * r_av2 / denom
     w = pref * np.exp(-f_decay * d2 / denom)
 
     return (w @ sigma) / w.sum(axis=1)
