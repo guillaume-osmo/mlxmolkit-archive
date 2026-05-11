@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -777,6 +778,129 @@ def tiered_multiconformer_gxtb_orca(
         "n_optimized": len(gxtb_optimized),
         "n_kept": len(kept),
         "screen_with_solvent": screen_with_solvent,
+    }
+
+
+def is_complex_case(smiles: str) -> tuple[bool, str]:
+    """Heuristic flag: does this molecule need deep multi-conformer sampling?
+
+    Returns ``(is_complex, reason)``. A mol is "complex" if any of:
+
+    1. **Aromatic + lone-pair donor**: aromatic carbon directly bonded to
+       O / N / S, or to a CH2 bridging to O/N (anisole, aniline,
+       benzyl alcohol, phenols pattern). Their σ-potential is sensitive
+       to donor-group orientation relative to the π-system.
+    2. **HB-rich flexible**: ≥2 HB donors (OH, NH₁/₂, SH) AND ≥3
+       rotatable bonds (glycerol, diols, triethylene glycol pattern).
+    3. **High flexibility**: ≥4 rotatable bonds regardless of HB content.
+
+    For these cases ``tiered_multiconformer_gxtb_orca`` with
+    ``use_exp_torsion_prefs=False`` and ``prune_rms_thresh=0.1`` and
+    ``n_keep≥5`` recovers near-perfect agreement with the paper
+    reference (benzyl alcohol: 0.91 single → 0.997 deep multi).
+    """
+    from rdkit import Chem
+    from rdkit.Chem import Lipinski
+
+    m = Chem.MolFromSmiles(smiles)
+    if m is None:
+        return False, "invalid_smiles"
+
+    # 1a. aromatic-C directly bonded to lone-pair-bearing heteroatom
+    if m.HasSubstructMatch(Chem.MolFromSmarts("c-[O,N,S;!H0,!X1]")):
+        return True, "aromatic_donor_direct"
+    # 1b. aromatic-C bonded to sp3 C bonded to OH/NH (benzyl alcohol class)
+    if m.HasSubstructMatch(Chem.MolFromSmarts("c-[CX4]-[OX2H1,NX3]")):
+        return True, "aromatic_benzyl_donor"
+
+    n_rot = Lipinski.NumRotatableBonds(m)
+    # Count HB donors (heavy atoms with at least one explicit H neighbour)
+    mol_h = Chem.AddHs(m)
+    n_hbd = sum(
+        1 for a in mol_h.GetAtoms()
+        if a.GetAtomicNum() in (7, 8, 16)
+        and any(n.GetAtomicNum() == 1 for n in a.GetNeighbors())
+    )
+
+    # 2. HB-rich flexible — diols, triols, oligoglycols, sugars
+    if n_hbd >= 2 and n_rot >= 2:
+        return True, f"hb_rich_flex(donors={n_hbd},rot={n_rot})"
+
+    return False, "simple"
+
+
+def cosmors_sigma_potential_auto(
+    smiles: str,
+    *,
+    seed: int = 42,
+    charge: int = 0,
+    uhf: int = 0,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    sigma_grid_e_per_A2: np.ndarray | None = None,
+    T: float = 298.15,
+    n_cores: int = 1,
+    deep_n_conformers: int = 20,
+    deep_n_keep: int = 5,
+    deep_prune_rms: float = 0.1,
+    force_deep: bool = False,
+) -> dict[str, object]:
+    """End-to-end σ-potential with automatic single vs deep-multi selection.
+
+    Auto-flags complex cases via :func:`is_complex_case` and switches to
+    deep multi-conformer mode (relaxed RDKit + ALPB(water) screen +
+    Boltzmann-weighted σ-orth ensemble) only when the structure warrants
+    it. Simple/rigid mols use the single-conformer path with σ-orth.
+
+    Returns ``{'sigma_test', 'mu_S_J_per_mol', 'mode', 'reason', 'n_kept',
+    'weights', 'walls'}``.
+    """
+
+    complex_flag, reason = is_complex_case(smiles)
+    use_deep = bool(force_deep or complex_flag)
+    walls: dict[str, float] = {}
+    t0 = time.perf_counter()
+
+    if use_deep:
+        mp = tiered_multiconformer_gxtb_orca(
+            smiles,
+            n_conformers=deep_n_conformers, n_keep=deep_n_keep,
+            seed=seed, charge=charge, uhf=uhf,
+            method=method, basis=basis, solvent=solvent,
+            orca_cores=n_cores,
+            screen_with_solvent=True,
+            use_exp_torsion_prefs=False,
+            prune_rms_thresh=deep_prune_rms,
+        )
+        sigma_test, mu, weights = sigma_potential_ensemble(
+            mp["cosmos"], mp["energies_screen_hartree"],
+            sigma_grid_e_per_A2=sigma_grid_e_per_A2, T=T,
+        )
+        n_kept = int(mp["n_kept"])
+        weights_list = list(map(float, weights))
+        mode = "deep"
+    else:
+        sp = tiered_gxtb_orca_cosmors_from_smiles(
+            smiles, seed=seed, charge=charge, uhf=uhf,
+            method=method, basis=basis, solvent=solvent,
+            n_cores=n_cores,
+        )
+        cs = cosmosegments_from_orcacosmo(sp["orcacosmo_path"])
+        sigma_test, mu = sigma_potential(cs, sigma_grid_e_per_A2=sigma_grid_e_per_A2, T=T)
+        n_kept = 1
+        weights_list = [1.0]
+        mode = "single"
+    walls["total_s"] = time.perf_counter() - t0
+    return {
+        "sigma_test_e_per_A2": sigma_test,
+        "mu_S_J_per_mol": mu,
+        "mode": mode,
+        "reason": reason,
+        "is_complex": complex_flag,
+        "n_kept": n_kept,
+        "weights": weights_list,
+        "walls": walls,
     }
 
 

@@ -125,6 +125,18 @@ def sigma_pot_orca_multiconformer(smi: str, *, n_conformers: int = 10, n_keep: i
     return mu, out["n_kept"], list(weights)
 
 
+def sigma_pot_orca_auto(smi: str, *, n_cores: int = 1) -> tuple[np.ndarray, int, list[float], str, str]:
+    """Auto-mode: detects complex cases, dispatches to single or deep-multi."""
+    from mlxmolkit.xtb import cosmors_sigma_potential_auto
+    out = cosmors_sigma_potential_auto(
+        smi, sigma_grid_e_per_A2=PAPER_SIGMA_E_PER_A2,
+        n_cores=n_cores,
+    )
+    return (np.asarray(out["mu_S_J_per_mol"]),
+            int(out["n_kept"]), list(out["weights"]),
+            str(out["mode"]), str(out["reason"]))
+
+
 def standardize_columnwise(M: np.ndarray) -> np.ndarray:
     """Z-score per column (the paper's FPCA pre-processing)."""
     M = np.asarray(M, dtype=np.float64)
@@ -159,6 +171,12 @@ def _worker(task: dict) -> dict | None:
                 n_cores=task.get("orca_cores", 1),
             )
             meta_extra = {"n_kept": n_kept, "boltzmann_weights": weights}
+        elif backend == "orca-auto":
+            mu_ours, n_kept, weights, mode, reason = sigma_pot_orca_auto(
+                smi, n_cores=task.get("orca_cores", 1),
+            )
+            meta_extra = {"n_kept": n_kept, "boltzmann_weights": weights,
+                          "auto_mode": mode, "auto_reason": reason}
         else:
             raise ValueError(f"unknown backend {backend!r}")
         wall = time.perf_counter() - t0
@@ -178,8 +196,9 @@ def main() -> None:
     parser.add_argument("--xlsx", type=Path, default=REPO_ROOT / "data" / "d5ra08246c1.xlsx")
     parser.add_argument("--n", type=int, default=20)
     parser.add_argument("--max-heavy", type=int, default=10)
-    parser.add_argument("--backend", choices=["tmcosmo", "orca", "orca-multi"], default="tmcosmo",
-                        help="orca-multi: RDKit→g-xTB-screen→ORCA on each survivor, Boltzmann-weighted")
+    parser.add_argument("--backend", choices=["tmcosmo", "orca", "orca-multi", "orca-auto"], default="tmcosmo",
+                        help="orca-multi: RDKit→g-xTB-screen→ORCA on each survivor, Boltzmann-weighted. "
+                             "orca-auto: detects complex cases and switches between single and deep-multi.")
     parser.add_argument("--n-conformers", type=int, default=10,
                         help="(orca-multi only) total RDKit conformers to generate per molecule")
     parser.add_argument("--n-keep", type=int, default=3,
