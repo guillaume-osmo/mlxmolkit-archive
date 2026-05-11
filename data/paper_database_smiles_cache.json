@@ -1,0 +1,22 @@
+{
+  "1-bromobutane||109-65-9": "CCCCBr",
+  "1-butanol||71-36-3": "CCCCO",
+  "2-butanol||78-92-2": "CCC(C)O",
+  "aceticacid||64-19-7": "CC(=O)O",
+  "aceticanhydride||108-24-7": "CC(=O)OC(=O)C",
+  "acetonitrile||75-05-8": "CC#N",
+  "acetophenone||98-86-2": "CC(=O)C1=CC=CC=C1",
+  "acetylacetone||123-54-6": "CC(=O)CC(=O)C",
+  "aniline||62-53-3": "C1=CC=C(C=C1)N",
+  "anisole||100-66-3": "COC1=CC=CC=C1",
+  "benzaldehyde||100-52-7": "C1=CC=C(C=C1)C=O",
+  "benzene||71-43-2": "C1=CC=CC=C1",
+  "benzonitrile||100-47-0": "C1=CC=C(C=C1)C#N",
+  "benzylalcohol||100-51-6": "C1=CC=C(C=C1)CO",
+  "bromobenzene||108-86-1": "C1=CC=C(C=C1)Br",
+  "bromoethane||74-96-4": "CCBr",
+  "butanone||78-93-3": "CCC(=O)C",
+  "ethanolamine||141-43-5": "C(CO)N",
+  "n-butylacetate||123-86-4": "CCCCOC(=O)C",
+  "propanone||67-64-1": "CC(=O)C"
+}
