@@ -541,8 +541,22 @@ def generate_rdkit_conformers(
     n_conformers: int = 20,
     seed: int = 42,
     mmff_iter: int = 300,
+    use_exp_torsion_prefs: bool = True,
+    use_basic_knowledge: bool = True,
+    prune_rms_thresh: float = 0.5,
 ) -> list[tuple[list[int], np.ndarray]]:
     """RDKit ETKDGv3 conformer generation + MMFF94 refinement.
+
+    Defaults match ETKDGv3 stock (``useExpTorsionAnglePrefs=True``,
+    ``useBasicKnowledge=True``) — these collapse aggressively but keep the
+    chemically-most-likely conformers. For some mols (e.g. benzyl alcohol)
+    the default returns only 1 conformer; setting
+    ``use_exp_torsion_prefs=False`` raises that to ~8 but also lets
+    RDKit emit some intramolecular-H-bond geometries that gas-phase g-xTB
+    incorrectly favors over solvent-relevant open conformers. So broader
+    sampling here can hurt the Boltzmann-weighted COSMO-RS σ-profile
+    unless paired with a solvent-aware screening step (g-xTB doesn't
+    support ALPB; switching to GFN2+ALPB for screening is the proper fix).
 
     Returns a list of ``(atomic_numbers, coords_angstrom)`` tuples.
     """
@@ -557,7 +571,9 @@ def generate_rdkit_conformers(
     p = AllChem.ETKDGv3()
     p.randomSeed = int(seed)
     p.useRandomCoords = True
-    p.pruneRmsThresh = 0.5
+    p.pruneRmsThresh = float(prune_rms_thresh)
+    p.useExpTorsionAnglePrefs = bool(use_exp_torsion_prefs)
+    p.useBasicKnowledge = bool(use_basic_knowledge)
     cids = AllChem.EmbedMultipleConfs(mol, numConfs=n_conformers, params=p)
     if len(cids) == 0:
         raise RuntimeError(f"RDKit failed to embed any conformers for {smiles!r}")
