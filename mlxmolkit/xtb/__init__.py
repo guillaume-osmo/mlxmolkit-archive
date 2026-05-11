@@ -12,9 +12,9 @@ GFN1 (FD-floor accuracy) and partially for GFN2 (band+SCC analytical;
 AES via FD on E_aes; ~6e-3 Ha/Å residual on small organics — for
 production opt use the tblite-backed pipeline).
 
-Future hook for g-xTB (Grimme 2026): when the ``thfroitzheim/save_tblite``
-module goes public, the calc factory in :mod:`solvation_alpb` will
-swap ``method='GFN2-xTB'`` → ``'g-xtb'`` with no API changes.
+Experimental g-xTB reconstruction pieces live in :mod:`scf_gxtb`. They are
+useful for reverse-engineering and benchmarking, but production workflows still
+use the mature tblite/xtb path until the native analytic gradient is complete.
 """
 
 # --- Production API ---
@@ -33,6 +33,7 @@ from .solvation_alpb_native import (  # noqa: F401
 from .energy import gfn0_energy  # noqa: F401
 from .scf_gfn1 import gfn1_energy  # noqa: F401
 from .scf_gfn2 import gfn2_energy  # noqa: F401
+from .scf_gxtb import gxtb_energy, gxtb_energy_gradient, gxtb_gradient_numerical  # noqa: F401
 
 # --- Gradients ---
 from .gradient_gfn0 import gfn0_gradient  # noqa: F401
@@ -41,6 +42,18 @@ from .gradient_gfn2 import gfn2_gradient, gfn2_gradient_analytical  # noqa: F401
 
 # --- Optimizer ---
 from .optimizer import ancopt  # noqa: F401
+
+# --- COSMO σ-profile pipeline (binary-backed: g-xTB --opt → GFN2 --tmcosmo) ---
+from .cosmo_sigma import (  # noqa: F401
+    CosmoSegments,
+    gfn2_tmcosmo_singlepoint,
+    gxtb_optimize_geometry,
+    hybrid_gxtb_gfn2_cosmo,
+    hybrid_gxtb_gfn2_cosmo_from_smiles,
+    parse_xtb_cosmo,
+    sigma_profile_histogram,
+    write_cosmo_file,
+)
 
 __all__ = [
     "gfn2_alpb_water_optimize",
@@ -52,10 +65,21 @@ __all__ = [
     "gfn0_energy",
     "gfn1_energy",
     "gfn2_energy",
+    "gxtb_energy",
+    "gxtb_energy_gradient",
+    "gxtb_gradient_numerical",
     "gfn0_gradient",
     "gfn1_gradient",
     "gfn1_gradient_analytical",
     "gfn2_gradient",
     "gfn2_gradient_analytical",
     "ancopt",
+    "CosmoSegments",
+    "parse_xtb_cosmo",
+    "gxtb_optimize_geometry",
+    "gfn2_tmcosmo_singlepoint",
+    "hybrid_gxtb_gfn2_cosmo",
+    "hybrid_gxtb_gfn2_cosmo_from_smiles",
+    "write_cosmo_file",
+    "sigma_profile_histogram",
 ]
