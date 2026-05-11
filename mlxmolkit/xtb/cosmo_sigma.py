@@ -374,6 +374,28 @@ _ANG3_PER_BOHR3 = 0.52917721092 ** 3
 
 
 _DEFAULT_ORCA = Path.home() / "Library" / "orca_6_1_0" / "orca"
+_DEFAULT_ORCACOSMO_CACHE = Path.home() / ".cache" / "mlxmolkit-orcacosmo"
+
+
+def _orcacosmo_cache_key(
+    atoms: np.ndarray, coords_ang: np.ndarray,
+    *, charge: int, uhf: int, method: str, basis: str, solvent: str,
+) -> str:
+    """Deterministic SHA-256 key for caching ``.orcacosmo`` outputs.
+
+    Hashes the input geometry (rounded to 5 decimals, the precision of xtb's
+    optimizer output) plus the QM method/basis/solvent. Any caller producing
+    the same XYZ + same QM directive hits the cache and skips ORCA.
+    """
+
+    import hashlib
+    atoms_arr = np.asarray(atoms, dtype=int)
+    coords_arr = np.round(np.asarray(coords_ang, dtype=np.float64), 5)
+    payload = (
+        f"{atoms_arr.tolist()}|{coords_arr.tolist()}"
+        f"|chg={charge}|uhf={uhf}|method={method}|basis={basis}|solvent={solvent}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
 def orca_cosmors_singlepoint(
@@ -391,6 +413,7 @@ def orca_cosmors_singlepoint(
     n_cores: int = 1,
     extra_keywords: str = "",
     timeout: float = 1800.0,
+    cache_dir: Path | None = _DEFAULT_ORCACOSMO_CACHE,
 ) -> Path:
     """Run ORCA's ``!METHOD BASIS COSMORS(SOLVENT)`` single point.
 
@@ -407,11 +430,25 @@ def orca_cosmors_singlepoint(
     The choice still affects which reference solvent ORCA optimizes for.
     """
 
+    atoms = np.asarray(atoms, dtype=int)
+    coords = np.asarray(coords_ang, dtype=np.float64)
+
+    # Cache hit: deterministic by (geometry, method, basis, solvent, charge, uhf).
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        key = _orcacosmo_cache_key(
+            atoms, coords,
+            charge=charge, uhf=uhf, method=method, basis=basis, solvent=solvent,
+        )
+        cache_path = cache_dir / f"{key}.orcacosmo"
+        if cache_path.exists():
+            return cache_path
+
     workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="orca-cosmors-"))
     workdir.mkdir(parents=True, exist_ok=True)
     try:
-        atoms = np.asarray(atoms, dtype=int)
-        coords = np.asarray(coords_ang, dtype=np.float64)
         inp_path = workdir / "job.inp"
         with inp_path.open("w") as f:
             kw_extra = f" {extra_keywords}" if extra_keywords else ""
@@ -436,6 +473,12 @@ def orca_cosmors_singlepoint(
         solute_cosmo = workdir / "job.solute.orcacosmo"
         if not solute_cosmo.exists():
             raise RuntimeError(f"ORCA wrote no .solute.orcacosmo. Job log tail:\n{out_path.read_text()[-2000:]}")
+        # Cache the result (atomic copy) before workdir is cleaned up
+        if cache_path is not None:
+            shutil.copy2(solute_cosmo, cache_path)
+            if not keep_workdir:
+                shutil.rmtree(workdir, ignore_errors=True)
+            return cache_path
         return solute_cosmo
     except Exception:
         if not keep_workdir:
