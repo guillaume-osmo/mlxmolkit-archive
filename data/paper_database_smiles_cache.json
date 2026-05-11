@@ -848,7 +848,7 @@
   "8-methylquinoline||611-32-5": "CC=1C=CC=C2C=CC=NC12",
   "9,12,15-octadecatrienoicacid||463-40-1": "C(CCCCCCCC=CCC=CCC=CCC)(=O)O",
   "9decenol1||13019-22-2": "OCCCCCCCCC=C",
-  "PDMS||63148-62-9": "",
+  "PDMS||63148-62-9": "C[Si](C)(C)O[Si](C)(C)O[Si](C)(C)C",
   "a,a'-glycerol||627-82-7": "OCC(O)COCC(O)CO",
   "a-bromobutyricacid||80-58-0": "CCC(Br)C(O)=O",
   "aceticacid-2-ethylhexylester||103-09-3": "C(C)C(COC(C)=O)CCCC",
