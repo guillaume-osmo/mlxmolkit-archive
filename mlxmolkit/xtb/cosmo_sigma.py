@@ -373,6 +373,178 @@ _ANG2_PER_BOHR2 = 0.52917721092 ** 2
 _ANG3_PER_BOHR3 = 0.52917721092 ** 3
 
 
+_DEFAULT_ORCA = Path.home() / "Library" / "orca_6_1_0" / "orca"
+
+
+def orca_cosmors_singlepoint(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    charge: int = 0,
+    uhf: int = 0,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    orca_path: Path = _DEFAULT_ORCA,
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    n_cores: int = 1,
+    extra_keywords: str = "",
+    timeout: float = 1800.0,
+) -> Path:
+    """Run ORCA's ``!METHOD BASIS COSMORS(SOLVENT)`` single point.
+
+    Returns the path to the produced ``<job>.solute.orcacosmo`` (DFT-level
+    σ-profile in the format openCOSMO-RS_py / _cpp consume).
+
+    The canonical recipe used by the openCOSMO-RS_conformer_pipeline is
+    ``BP86 def2-TZVP COSMORS(...)``; openCOSMORS24a was parameterized against
+    these σ-profiles.
+
+    The ``solvent`` argument sets the CPCM dielectric for the second
+    "in solvent" pass that ORCA does as part of !COSMORS; the σ-profile
+    itself is computed at ε=∞ regardless (the standard COSMO-RS convention).
+    The choice still affects which reference solvent ORCA optimizes for.
+    """
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="orca-cosmors-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        atoms = np.asarray(atoms, dtype=int)
+        coords = np.asarray(coords_ang, dtype=np.float64)
+        inp_path = workdir / "job.inp"
+        with inp_path.open("w") as f:
+            kw_extra = f" {extra_keywords}" if extra_keywords else ""
+            f.write(f"! {method} {basis} COSMORS({solvent}){kw_extra}\n")
+            if n_cores > 1:
+                f.write(f"%pal nprocs {n_cores} end\n")
+            f.write(f"* xyz {charge} {uhf + 1}\n")
+            for z, (x, y, zc) in zip(atoms, coords):
+                f.write(f"{_ELEMENTS[int(z)]:<3s} {x:.10f} {y:.10f} {zc:.10f}\n")
+            f.write("*\n")
+
+        out_path = workdir / "job.out"
+        with out_path.open("w") as out:
+            proc = subprocess.run(
+                [str(orca_path), str(inp_path.name)],
+                cwd=workdir, stdout=out, stderr=subprocess.STDOUT,
+                text=True, check=False, timeout=timeout,
+            )
+        if proc.returncode != 0:
+            tail = out_path.read_text()[-3000:]
+            raise RuntimeError(f"ORCA failed (code {proc.returncode}):\n{tail}")
+        solute_cosmo = workdir / "job.solute.orcacosmo"
+        if not solute_cosmo.exists():
+            raise RuntimeError(f"ORCA wrote no .solute.orcacosmo. Job log tail:\n{out_path.read_text()[-2000:]}")
+        return solute_cosmo
+    except Exception:
+        if not keep_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
+
+def tiered_gxtb_orca_cosmors(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    orca_path: Path = _DEFAULT_ORCA,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    n_cores: int = 1,
+    acc: float = 0.1,
+) -> dict[str, object]:
+    """Tiered σ-profile: g-xTB --opt → ORCA BP86/def2-TZVP COSMORS.
+
+    Returns a dict with ``coords_opt_ang``, ``gxtb_energy_hartree``, and
+    ``orcacosmo_path`` (the ORCA-format σ-profile file consumable by
+    openCOSMO-RS).
+    """
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="tiered-cosmors-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    coords_opt, e_gxtb = gxtb_optimize_geometry(
+        atoms, coords_ang,
+        charge=charge, uhf=uhf, xtb_path=xtb_path,
+        workdir=workdir / "step1_gxtb", keep_workdir=True, acc=acc,
+    )
+    orcacosmo = orca_cosmors_singlepoint(
+        atoms, coords_opt,
+        charge=charge, uhf=uhf, method=method, basis=basis, solvent=solvent,
+        orca_path=orca_path,
+        workdir=workdir / "step2_orca", keep_workdir=True,
+        n_cores=n_cores,
+    )
+    return {
+        "atoms": np.asarray(atoms, dtype=int),
+        "coords_opt_ang": coords_opt,
+        "gxtb_energy_hartree": e_gxtb,
+        "orcacosmo_path": orcacosmo,
+        "method": f"{method}/{basis} COSMORS({solvent})",
+        "solvent": solvent,
+        "workdir": workdir if keep_workdir else None,
+    }
+
+
+def tiered_gxtb_orca_cosmors_from_smiles(
+    smiles: str,
+    *,
+    seed: int = 42,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    orca_path: Path = _DEFAULT_ORCA,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    n_cores: int = 1,
+    acc: float = 0.1,
+) -> dict[str, object]:
+    """End-to-end: SMILES → embed → g-xTB --opt → ORCA BP86/TZVP COSMORS."""
+
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"invalid SMILES: {smiles!r}")
+    mol = Chem.AddHs(mol)
+    p = AllChem.ETKDGv3()
+    p.randomSeed = int(seed)
+    p.useRandomCoords = True
+    if AllChem.EmbedMolecule(mol, p) != 0:
+        raise RuntimeError(f"RDKit embedding failed for {smiles!r}")
+    if AllChem.MMFFHasAllMoleculeParams(mol):
+        AllChem.MMFFOptimizeMolecule(mol, maxIters=300)
+    else:
+        AllChem.UFFOptimizeMolecule(mol, maxIters=300)
+    conf = mol.GetConformer()
+    atoms = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    coords = np.asarray(
+        [[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z]
+         for i in range(mol.GetNumAtoms())],
+        dtype=np.float64,
+    )
+    out = tiered_gxtb_orca_cosmors(
+        atoms, coords,
+        charge=charge, uhf=uhf,
+        xtb_path=xtb_path, orca_path=orca_path,
+        method=method, basis=basis, solvent=solvent,
+        workdir=workdir, keep_workdir=keep_workdir,
+        n_cores=n_cores, acc=acc,
+    )
+    out["smiles"] = smiles
+    return out
+
+
 def write_cosmo_file(
     cosmo: CosmoSegments,
     path: Path | str,

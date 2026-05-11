@@ -51,9 +51,12 @@ from .cosmo_sigma import (  # noqa: F401
     hybrid_gxtb_gfn2_cosmo,
     hybrid_gxtb_gfn2_cosmo_from_smiles,
     klamt_average_sigmas,
+    orca_cosmors_singlepoint,
     parse_xtb_cosmo,
     sigma_profile_histogram,
     sigma_profile_klamt,
+    tiered_gxtb_orca_cosmors,
+    tiered_gxtb_orca_cosmors_from_smiles,
     write_cosmo_file,
 )
 
@@ -86,4 +89,7 @@ __all__ = [
     "sigma_profile_histogram",
     "sigma_profile_klamt",
     "klamt_average_sigmas",
+    "orca_cosmors_singlepoint",
+    "tiered_gxtb_orca_cosmors",
+    "tiered_gxtb_orca_cosmors_from_smiles",
 ]
