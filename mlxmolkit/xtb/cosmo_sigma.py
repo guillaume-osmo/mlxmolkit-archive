@@ -922,6 +922,10 @@ _KLAMT_PARAMS = {
     "mullins": (0.8176300195**2, 1.0),
     # Hsieh 2010 (Fluid Phase Equil.), used by COSMO-SAC-2010:
     "hsieh": (7.25 / np.pi, 3.57),
+    # openCOSMORS25a primary averaging (Rav=0.5 Å, no f_decay scaling):
+    "ocrs25a_primary": (0.5**2, 1.0),
+    # openCOSMORS25a correlation averaging (RavCorr=1.0 Å):
+    "ocrs25a_corr": (1.0**2, 1.0),
 }
 
 
@@ -992,6 +996,12 @@ OPENCOSMORS25A_PARAMS = {
     "CHBT":  1.5,           # HB temperature factor
     "SigmaHB": 0.009953,    # e/Å²          HB threshold
     "R":     8.314462618,   # J/(mol·K)
+    # 25a σ-orthogonal correlation correction (Chem Eng Sci 2025, Eq. 16):
+    # the misfit gets a (σ_corr - 0.816·σ) cross-term using a second Klamt
+    # averaging with a wider radius.
+    "RavCorr":  1.0,        # Å      second-averaging radius
+    "fCorr":    2.4,        # dimensionless  σ-orth correction coefficient
+    "sigma_trans_factor": 0.816,
 }
 
 
@@ -999,7 +1009,9 @@ def sigma_potential_from_arrays(
     sigma_avg_e_per_A2: np.ndarray,
     area_A2: np.ndarray,
     *,
+    sigma_corr_avg_e_per_A2: np.ndarray | None = None,
     sigma_grid_e_per_A2: np.ndarray | None = None,
+    sigma_test_corr_e_per_A2: np.ndarray | None = None,
     T: float = 298.15,
     params: dict | None = None,
     sigma_bin_min: float = -0.030,
@@ -1008,36 +1020,62 @@ def sigma_potential_from_arrays(
     n_iter_max: int = 500,
     conv_tol: float = 1.0e-9,
     damping: float = 0.7,
+    use_sigma_orth: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Low-level σ-potential entry point that skips Klamt averaging.
 
-    Takes pre-averaged segment σ values and segment areas (in arbitrary
-    common scale; only relative weights matter). For multi-conformer
-    Boltzmann-weighted ensembles, the caller should weight the per-conformer
-    areas before concatenating.
+    Takes pre-averaged segment σ values + segment areas. When
+    ``sigma_corr_avg_e_per_A2`` is provided (the second Klamt averaging at
+    r_av_corr), the 25a σ-orthogonal correlation term enters the misfit
+    energy (Chem Eng Sci 2025, Eq. 16):
+
+        σ_trans = σ_corr − 0.816·σ
+        E_mf(i, j) = (A_eff·α / 2) · σ_sum · (σ_sum + f_corr·(σ_trans_i + σ_trans_j))
+
+    Set ``use_sigma_orth=False`` to fall back to the symmetric Klamt 1995 form.
     """
 
     p = dict(OPENCOSMORS25A_PARAMS) if params is None else {**OPENCOSMORS25A_PARAMS, **params}
     Aeff = p["Aeff"]; alpha = p["alpha"]; CHB = p["CHB"]
     CHBT = p["CHBT"]; sigma_HB = p["SigmaHB"]; R = p["R"]
+    fCorr = p.get("fCorr", 2.4); sigma_trans_factor = p.get("sigma_trans_factor", 0.816)
 
     sigma_arr = np.asarray(sigma_avg_e_per_A2, dtype=np.float64)
     area_arr = np.asarray(area_A2, dtype=np.float64)
+    apply_orth = use_sigma_orth and (sigma_corr_avg_e_per_A2 is not None)
+    if apply_orth:
+        sigma_corr_arr = np.asarray(sigma_corr_avg_e_per_A2, dtype=np.float64)
 
     edges = np.arange(sigma_bin_min - 0.5 * sigma_bin_step,
                       sigma_bin_max + 1.5 * sigma_bin_step,
                       sigma_bin_step)
     centers = 0.5 * (edges[:-1] + edges[1:])
     area_bins, _ = np.histogram(sigma_arr, bins=edges, weights=area_arr)
+
+    if apply_orth:
+        # Area-weighted mean σ_corr per σ-bin
+        s_corr_weighted, _ = np.histogram(sigma_arr, bins=edges, weights=area_arr * sigma_corr_arr)
+        sigma_corr_per_bin = np.zeros_like(centers)
+        nz = area_bins > 0
+        sigma_corr_per_bin[nz] = s_corr_weighted[nz] / area_bins[nz]
+
     keep = area_bins > 0
     sigma_alpha = centers[keep]
     X = area_bins[keep] / area_bins[keep].sum()
+    if apply_orth:
+        sigma_corr_alpha = sigma_corr_per_bin[keep]
+        sigma_trans_alpha = sigma_corr_alpha - sigma_trans_factor * sigma_alpha
 
     buff = 1.0 - CHBT + CHBT * (298.15 / T)
     CHB_T = CHB * buff if buff > 0 else 0.0
 
+    # Misfit (25a σ-orth form when correlation σ available; Klamt 1995 else)
     sigma_sum = sigma_alpha[:, None] + sigma_alpha[None, :]
-    E_mf = 0.5 * Aeff * alpha * sigma_sum * sigma_sum
+    if apply_orth:
+        sigma_trans_sum = sigma_trans_alpha[:, None] + sigma_trans_alpha[None, :]
+        E_mf = 0.5 * Aeff * alpha * sigma_sum * (sigma_sum + fCorr * sigma_trans_sum)
+    else:
+        E_mf = 0.5 * Aeff * alpha * sigma_sum * sigma_sum
 
     sigma_min = np.minimum(sigma_alpha[:, None], sigma_alpha[None, :])
     sigma_max = np.maximum(sigma_alpha[:, None], sigma_alpha[None, :])
@@ -1062,7 +1100,18 @@ def sigma_potential_from_arrays(
         sigma_test = np.asarray(sigma_grid_e_per_A2, dtype=np.float64)
 
     sum_t = sigma_test[:, None] + sigma_alpha[None, :]
-    E_mf_t = 0.5 * Aeff * alpha * sum_t * sum_t
+    if apply_orth:
+        # For the test segment, assume σ_corr_test = σ_test (no extra info per
+        # test grid point). The cross-term still uses σ_trans_α for the
+        # contributing solvent bins.
+        if sigma_test_corr_e_per_A2 is None:
+            sigma_test_trans = (1.0 - sigma_trans_factor) * sigma_test
+        else:
+            sigma_test_trans = np.asarray(sigma_test_corr_e_per_A2, dtype=np.float64) - sigma_trans_factor * sigma_test
+        sigma_trans_sum_t = sigma_test_trans[:, None] + sigma_trans_alpha[None, :]
+        E_mf_t = 0.5 * Aeff * alpha * sum_t * (sum_t + fCorr * sigma_trans_sum_t)
+    else:
+        E_mf_t = 0.5 * Aeff * alpha * sum_t * sum_t
 
     min_t = np.minimum(sigma_test[:, None], sigma_alpha[None, :])
     max_t = np.maximum(sigma_test[:, None], sigma_alpha[None, :])
@@ -1106,18 +1155,24 @@ def sigma_potential_ensemble(
     weights = np.exp(-e_rel / kT_hartree)
     weights /= weights.sum()
 
+    use_orth = bool(kwargs.pop("use_sigma_orth", True))
+    primary_variant = "ocrs25a_primary" if use_orth else klamt_variant
     all_sigma: list[np.ndarray] = []
+    all_sigma_corr: list[np.ndarray] = []
     all_area: list[np.ndarray] = []
     for cs, w in zip(cosmo_list, weights):
-        sigma_avg = klamt_average_sigmas(cs, variant=klamt_variant)
-        all_sigma.append(sigma_avg)
+        all_sigma.append(klamt_average_sigmas(cs, variant=primary_variant))
+        if use_orth:
+            all_sigma_corr.append(klamt_average_sigmas(cs, variant="ocrs25a_corr"))
         all_area.append(np.asarray(cs.segments_area, dtype=np.float64) * float(w))
 
     sigma_test, mu = sigma_potential_from_arrays(
         np.concatenate(all_sigma),
         np.concatenate(all_area),
+        sigma_corr_avg_e_per_A2=np.concatenate(all_sigma_corr) if use_orth else None,
         sigma_grid_e_per_A2=sigma_grid_e_per_A2,
         T=T,
+        use_sigma_orth=use_orth,
         **kwargs,
     )
     return sigma_test, mu, weights
@@ -1153,15 +1208,27 @@ def sigma_potential(
     to -3 to +3 e/nm²).
     """
 
-    sigma_seg = klamt_average_sigmas(cosmo, variant=klamt_variant)
+    # openCOSMORS25a σ-orth form: primary σ at Rav=0.5, σ_corr at RavCorr=1.0.
+    # The 0.816 σ_trans coefficient is calibrated for this exact pair of radii.
+    # ``klamt_variant`` is honoured only when use_sigma_orth=False (legacy
+    # Klamt 1995 mode, e.g. for NIST/Mullins-style comparisons).
+    use_orth = bool(params.get("use_sigma_orth", True)) if params else True
+    if use_orth:
+        sigma_seg = klamt_average_sigmas(cosmo, variant="ocrs25a_primary")
+        sigma_corr_seg = klamt_average_sigmas(cosmo, variant="ocrs25a_corr")
+    else:
+        sigma_seg = klamt_average_sigmas(cosmo, variant=klamt_variant)
+        sigma_corr_seg = None
     area_seg = np.asarray(cosmo.segments_area, dtype=np.float64)
     return sigma_potential_from_arrays(
         sigma_seg, area_seg,
+        sigma_corr_avg_e_per_A2=sigma_corr_seg,
         sigma_grid_e_per_A2=sigma_grid_e_per_A2,
         T=T, params=params,
         sigma_bin_min=sigma_bin_min, sigma_bin_max=sigma_bin_max,
         sigma_bin_step=sigma_bin_step,
         n_iter_max=n_iter_max, conv_tol=conv_tol, damping=damping,
+        use_sigma_orth=use_orth,
     )
 
 
