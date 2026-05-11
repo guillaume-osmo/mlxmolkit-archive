@@ -684,6 +684,8 @@ def tiered_multiconformer_gxtb_orca(
     orca_cores: int = 1,
     acc: float = 0.1,
     screen_with_solvent: bool = True,
+    use_exp_torsion_prefs: bool = True,
+    prune_rms_thresh: float = 0.5,
 ) -> dict[str, object]:
     """Multi-conformer tiered pipeline: RDKit → g-xTB --opt → ORCA COSMORS.
 
@@ -704,7 +706,11 @@ def tiered_multiconformer_gxtb_orca(
     workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="multi-cosmors-"))
     workdir.mkdir(parents=True, exist_ok=True)
 
-    confs = generate_rdkit_conformers(smiles, n_conformers=n_conformers, seed=seed)
+    confs = generate_rdkit_conformers(
+        smiles, n_conformers=n_conformers, seed=seed,
+        use_exp_torsion_prefs=use_exp_torsion_prefs,
+        prune_rms_thresh=prune_rms_thresh,
+    )
 
     # Step 1: g-xTB --opt (best gas-phase geometry per conformer)
     gxtb_optimized: list[tuple[list[int], np.ndarray, float]] = []

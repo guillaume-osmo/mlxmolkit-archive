@@ -53,6 +53,7 @@ from .cosmo_sigma import (  # noqa: F401
     klamt_average_sigmas,
     cosmosegments_from_orcacosmo,
     generate_rdkit_conformers,
+    gfn2_alpb_water_singlepoint,
     orca_cosmors_singlepoint,
     parse_xtb_cosmo,
     sigma_potential,
@@ -105,5 +106,6 @@ __all__ = [
     "tiered_multiconformer_gxtb_orca",
     "cosmosegments_from_orcacosmo",
     "generate_rdkit_conformers",
+    "gfn2_alpb_water_singlepoint",
     "OPENCOSMORS25A_PARAMS",
 ]
