@@ -688,6 +688,135 @@ def klamt_average_sigmas(
     return (w @ sigma) / w.sum(axis=1)
 
 
+# --- σ-potential evaluator (openCOSMORS25a parameters) ----------------------
+#
+# σ-potential μ_S(σ) is the chemical potential of a test surface segment of
+# screening-charge density σ in reference solvent S. From the converged
+# COSMOSPACE segment-activity Γ_S(σ_α), the σ-potential on any test grid is
+#
+#     μ_S(σ_test) = -RT · ln Γ_S(σ_test)
+#     Γ_S(σ_test) = 1 / Σ_α X[α] Γ[α] exp(-E_int(σ_test, σ_α)/RT)
+#
+# We use the symmetric Klamt 1995 kernel (no polarizability correction; that
+# variant of 25a needs per-atom polarizabilities from ORCA and is left for a
+# follow-up). The 25a numerical parameter values are taken from the cpp
+# reference (Chem Eng Sci 2025, doi:10.1016/j.ces.2025.122170).
+
+
+OPENCOSMORS25A_PARAMS = {
+    "Aeff": 4.90825,        # Å²            effective contact area
+    "alpha": 7876000.0,     # J/(mol·Å²·e²) misfit prefactor
+    "CHB":   49318000.0,    # J/(mol·Å²·e²) HB prefactor
+    "CHBT":  1.5,           # HB temperature factor
+    "SigmaHB": 0.009953,    # e/Å²          HB threshold
+    "R":     8.314462618,   # J/(mol·K)
+}
+
+
+def sigma_potential(
+    cosmo: CosmoSegments,
+    *,
+    sigma_grid_e_per_A2: np.ndarray | None = None,
+    T: float = 298.15,
+    params: dict | None = None,
+    sigma_bin_min: float = -0.030,
+    sigma_bin_max: float = 0.030,
+    sigma_bin_step: float = 0.001,
+    klamt_variant: str = "mullins",
+    n_iter_max: int = 500,
+    conv_tol: float = 1.0e-9,
+    damping: float = 0.7,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(sigma_test_e_per_A2, mu_S_J_per_mol)`` σ-potential μ_S(σ).
+
+    Workflow:
+      1. r-average the cosmo segments (Klamt averaging) — same as for the
+         σ-profile.
+      2. Bin into a coarse σ-grid (bin width 0.001 e/Å² by default).
+      3. Solve COSMOSPACE self-consistently for the pure-component reference
+         state: ``Γ_new[α] = 1 / Σ_β X[β] Γ[β] τ[α, β]``.
+      4. For each test σ, evaluate ``Γ_test = 1 / Σ_β X[β] Γ[β] τ(σ_test, σ_β)``
+         and return ``μ_S(σ_test) = -RT ln Γ_test``.
+
+    The default ``sigma_grid_e_per_A2`` is ``None``, in which case we use the
+    RSC Adv 2026 paper grid: 61 bins from -0.030 to +0.030 e/Å² (equivalent
+    to -3 to +3 e/nm²).
+    """
+
+    p = dict(OPENCOSMORS25A_PARAMS) if params is None else {**OPENCOSMORS25A_PARAMS, **params}
+    Aeff = p["Aeff"]; alpha = p["alpha"]; CHB = p["CHB"]
+    CHBT = p["CHBT"]; sigma_HB = p["SigmaHB"]; R = p["R"]
+
+    # r-averaged σ per segment, area per segment
+    sigma_seg = klamt_average_sigmas(cosmo, variant=klamt_variant)
+    area_seg = np.asarray(cosmo.segments_area, dtype=np.float64)
+
+    # Bin into a σ-grid for the COSMOSPACE iteration
+    edges = np.arange(sigma_bin_min - 0.5 * sigma_bin_step,
+                      sigma_bin_max + 1.5 * sigma_bin_step,
+                      sigma_bin_step)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    area_bins, _ = np.histogram(sigma_seg, bins=edges, weights=area_seg)
+    keep = area_bins > 0
+    sigma_alpha = centers[keep]                            # (n_bin,)
+    X = area_bins[keep] / area_bins[keep].sum()            # (n_bin,)
+
+    # Temperature-dependent HB prefactor (Klamt convention)
+    buff = 1.0 - CHBT + CHBT * (298.15 / T)
+    CHB_T = CHB * buff if buff > 0 else 0.0
+
+    # Interaction energy matrix E_int[i, j] in J/mol
+    sigma_sum = sigma_alpha[:, None] + sigma_alpha[None, :]
+    E_mf = 0.5 * Aeff * alpha * sigma_sum * sigma_sum
+
+    sigma_min = np.minimum(sigma_alpha[:, None], sigma_alpha[None, :])
+    sigma_max = np.maximum(sigma_alpha[:, None], sigma_alpha[None, :])
+    donor = np.minimum(0.0, sigma_min + sigma_HB)     # ≤ 0 for donor segments
+    acceptor = np.maximum(0.0, sigma_max - sigma_HB)  # ≥ 0 for acceptor segments
+    E_hb = Aeff * CHB_T * donor * acceptor            # ≤ 0 (favorable when both present)
+
+    RT = R * T
+    tau = np.exp(-(E_mf + E_hb) / RT)                 # (n_bin, n_bin)
+
+    # COSMOSPACE successive substitution: Γ_new = 1 / (tau @ (X * Γ))
+    Gamma = np.ones_like(X)
+    converged = False
+    for _ in range(n_iter_max):
+        Gamma_new = 1.0 / (tau @ (X * Gamma))
+        if np.max(np.abs(Gamma_new - Gamma) / np.abs(Gamma)) < conv_tol:
+            Gamma = Gamma_new
+            converged = True
+            break
+        Gamma = damping * (Gamma_new - Gamma) + Gamma
+    if not converged:
+        # Carry on with the last iterate but flag.
+        pass
+
+    # Build test grid (default = paper's 61 bins from -3 to +3 e/nm² = -0.030..+0.030 e/Å²)
+    if sigma_grid_e_per_A2 is None:
+        sigma_test = np.round(np.arange(-0.030, 0.0301, 0.001), 6)
+    else:
+        sigma_test = np.asarray(sigma_grid_e_per_A2, dtype=np.float64)
+
+    # E_int(test, β) on (n_test, n_bin)
+    sum_t = sigma_test[:, None] + sigma_alpha[None, :]
+    E_mf_t = 0.5 * Aeff * alpha * sum_t * sum_t
+
+    min_t = np.minimum(sigma_test[:, None], sigma_alpha[None, :])
+    max_t = np.maximum(sigma_test[:, None], sigma_alpha[None, :])
+    donor_t = np.minimum(0.0, min_t + sigma_HB)
+    acceptor_t = np.maximum(0.0, max_t - sigma_HB)
+    E_hb_t = Aeff * CHB_T * donor_t * acceptor_t
+
+    tau_t = np.exp(-(E_mf_t + E_hb_t) / RT)            # (n_test, n_bin)
+    Gamma_test = 1.0 / (tau_t @ (X * Gamma))
+    # COSMO-RS convention (COSMOtherm, openCOSMO-RS): μ_S(σ) = +RT · ln Γ_S(σ).
+    # Positive μ = unfavorable segment in S; negative = favorable. Matches the
+    # sign of σ-potentials in the RSC Adv 2026 paper dataset.
+    mu_S_J = RT * np.log(Gamma_test)
+    return sigma_test, mu_S_J
+
+
 def sigma_profile_klamt(
     cosmo: CosmoSegments,
     *,

@@ -53,11 +53,13 @@ from .cosmo_sigma import (  # noqa: F401
     klamt_average_sigmas,
     orca_cosmors_singlepoint,
     parse_xtb_cosmo,
+    sigma_potential,
     sigma_profile_histogram,
     sigma_profile_klamt,
     tiered_gxtb_orca_cosmors,
     tiered_gxtb_orca_cosmors_from_smiles,
     write_cosmo_file,
+    OPENCOSMORS25A_PARAMS,
 )
 
 __all__ = [
@@ -92,4 +94,6 @@ __all__ = [
     "orca_cosmors_singlepoint",
     "tiered_gxtb_orca_cosmors",
     "tiered_gxtb_orca_cosmors_from_smiles",
+    "sigma_potential",
+    "OPENCOSMORS25A_PARAMS",
 ]
