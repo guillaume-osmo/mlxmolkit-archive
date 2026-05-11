@@ -74,13 +74,15 @@ def _worker(task: dict) -> dict:
         out["wall_single_s"] = time.perf_counter() - t0
         out["mu_single"] = mu_single.tolist()
 
-        # Multi-conformer
+        # Multi-conformer (solvent-aware ranking + weighting)
         t0 = time.perf_counter()
         mp = tiered_multiconformer_gxtb_orca(
             smi, n_conformers=10, n_keep=3, seed=42, solvent="water",
+            screen_with_solvent=True,
         )
+        # Boltzmann-weight by GFN2-ALPB(water) energy (the solvent-aware one).
         _, mu_multi, weights = sigma_potential_ensemble(
-            mp["cosmos"], mp["energies_gxtb_hartree"],
+            mp["cosmos"], mp["energies_screen_hartree"],
             sigma_grid_e_per_A2=PAPER_SIGMA_E_PER_A2,
         )
         out["wall_multi_s"] = time.perf_counter() - t0

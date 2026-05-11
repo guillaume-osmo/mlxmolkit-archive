@@ -211,6 +211,46 @@ def parse_xtb_cosmo(path: Path) -> CosmoSegments:
     )
 
 
+def gfn2_alpb_water_singlepoint(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    acc: float = 0.1,
+) -> float:
+    """``xtb --gfn 2 --alpb water`` single-point, returns total energy (Ha).
+
+    Used by the multi-conformer pipeline for solvent-aware conformer ranking:
+    g-xTB gives a high-quality gas-phase geometry, but gas-phase energies
+    over-stabilise intramolecular H-bonded conformers that don't dominate
+    in water. A GFN2-ALPB single point on the g-xTB-optimised geometry
+    restores the right solvent-corrected population for COSMO-RS.
+    """
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="gfn2-alpb-sp-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        xyz = workdir / "mol.xyz"
+        _write_xyz(xyz, atoms, coords_ang)
+        log = _run_xtb(
+            workdir,
+            [str(xyz.name), "--gfn", "2", "--alpb", "water",
+             "--acc", str(acc), "--chrg", str(charge), "--uhf", str(uhf)],
+            xtb_path=xtb_path,
+        )
+        m = re.search(r"TOTAL ENERGY\s+([-+0-9.Ee]+)\s+Eh", log)
+        if m is None:
+            raise RuntimeError(f"failed to parse TOTAL ENERGY from xtb log:\n{log[-1000:]}")
+        return float(m.group(1))
+    finally:
+        if not keep_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
 def gxtb_optimize_geometry(
     atoms: list[int] | np.ndarray,
     coords_ang: np.ndarray,
@@ -643,6 +683,7 @@ def tiered_multiconformer_gxtb_orca(
     keep_workdir: bool = False,
     orca_cores: int = 1,
     acc: float = 0.1,
+    screen_with_solvent: bool = True,
 ) -> dict[str, object]:
     """Multi-conformer tiered pipeline: RDKit → g-xTB --opt → ORCA COSMORS.
 
@@ -665,6 +706,7 @@ def tiered_multiconformer_gxtb_orca(
 
     confs = generate_rdkit_conformers(smiles, n_conformers=n_conformers, seed=seed)
 
+    # Step 1: g-xTB --opt (best gas-phase geometry per conformer)
     gxtb_optimized: list[tuple[list[int], np.ndarray, float]] = []
     for idx, (atoms, coords) in enumerate(confs):
         try:
@@ -678,13 +720,34 @@ def tiered_multiconformer_gxtb_orca(
             continue
     if not gxtb_optimized:
         raise RuntimeError(f"all conformers failed g-xTB opt for {smiles!r}")
-    gxtb_optimized.sort(key=lambda x: x[2])
-    kept = gxtb_optimized[: max(1, int(n_keep))]
+
+    # Step 2: GFN2 + ALPB(water) single-point on each g-xTB-optimised geometry.
+    # Re-rank by solvent-aware energy. Gas-phase ranking over-stabilises
+    # intramolecular H-bonded conformers that don't dominate in water.
+    e_screen: list[float] = []
+    if screen_with_solvent:
+        for idx, (atoms, opt_coords, e_g) in enumerate(gxtb_optimized):
+            try:
+                e_sol = gfn2_alpb_water_singlepoint(
+                    atoms, opt_coords,
+                    charge=charge, uhf=uhf, xtb_path=xtb_path,
+                    workdir=workdir / f"conf{idx:03d}_gfn2alpb",
+                )
+                e_screen.append(float(e_sol))
+            except Exception:
+                e_screen.append(float(e_g))  # fallback to gas-phase
+    else:
+        e_screen = [e_g for (_, _, e_g) in gxtb_optimized]
+
+    # Sort by screening energy (low → high), keep top n_keep
+    order = np.argsort(np.asarray(e_screen, dtype=np.float64))
+    kept_idx = order[: max(1, int(n_keep))]
+    kept = [gxtb_optimized[i] for i in kept_idx]
+    kept_screen_energies = [float(e_screen[i]) for i in kept_idx]
 
     cosmos: list[CosmoSegments] = []
     paths: list[Path] = []
-    energies: list[float] = []
-    for idx, (atoms, opt_coords, e_g) in enumerate(kept):
+    for idx, (atoms, opt_coords, _e_g) in enumerate(kept):
         orcacosmo = orca_cosmors_singlepoint(
             atoms, opt_coords,
             charge=charge, uhf=uhf, method=method, basis=basis, solvent=solvent,
@@ -695,18 +758,19 @@ def tiered_multiconformer_gxtb_orca(
         cs = cosmosegments_from_orcacosmo(orcacosmo)
         cosmos.append(cs)
         paths.append(orcacosmo)
-        energies.append(e_g)
     if not keep_workdir:
-        # the per-conformer subdirs of survivors are already managed by
-        # orca_cosmors_singlepoint; clean up the parent shell.
         shutil.rmtree(workdir, ignore_errors=True)
     return {
         "cosmos": cosmos,
-        "energies_gxtb_hartree": energies,
+        # Use solvent-aware energies for downstream Boltzmann weighting; gas
+        # energies retained for diagnostics.
+        "energies_gxtb_hartree": [k[2] for k in kept],
+        "energies_screen_hartree": kept_screen_energies,
         "orcacosmo_paths": paths,
         "n_conformers_generated": len(confs),
         "n_optimized": len(gxtb_optimized),
         "n_kept": len(kept),
+        "screen_with_solvent": screen_with_solvent,
     }
 
 
