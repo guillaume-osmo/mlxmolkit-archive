@@ -126,7 +126,12 @@ def parse_xtb_cosmo(path: Path) -> CosmoSegments:
     def kv(section: str, key: str) -> float:
         for ln in sections.get(section, []):
             if key in ln:
-                return float(_NUMBER_RE.findall(ln)[-1])
+                # xtb writes ``epsilon=Inf`` literally for --tmcosmo inf.
+                if "inf" in ln.lower() and "=" in ln:
+                    return float("inf")
+                matches = _NUMBER_RE.findall(ln)
+                if matches:
+                    return float(matches[-1])
         raise KeyError(f"{key} not found in ${section}")
 
     epsilon = kv("cosmo", "epsilon")
