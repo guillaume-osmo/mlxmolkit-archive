@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -147,6 +149,30 @@ def pearson(a: np.ndarray, b: np.ndarray) -> float:
     return float((da * db).sum() / denom) if denom > 0 else float("nan")
 
 
+def _worker(task: dict) -> dict | None:
+    """Per-molecule worker for ProcessPoolExecutor.
+
+    Imports happen inside so each forked process starts fresh; this avoids
+    pickling issues with the mlxmolkit / opencosmorspy modules.
+    """
+    name = task["name"]; smi = task["smiles"]; backend = task["backend"]
+    try:
+        t0 = time.perf_counter()
+        if backend == "tmcosmo":
+            mu_ours = sigma_pot_tmcosmo(smi)
+        else:
+            mu_ours = sigma_pot_orca(smi, n_cores=task.get("orca_cores", 1))
+        wall = time.perf_counter() - t0
+        return {
+            "name": name, "cas": task["cas"], "smiles": smi,
+            "cluster": task["cluster"], "n_heavy": task["n_heavy"],
+            "mu_ours": mu_ours.tolist(), "mu_paper": task["mu_paper"],
+            "wall_s": wall, "error": None,
+        }
+    except Exception as exc:
+        return {"name": name, "smiles": smi, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--xlsx", type=Path, default=REPO_ROOT / "data" / "d5ra08246c1.xlsx")
@@ -155,6 +181,10 @@ def main() -> None:
     parser.add_argument("--backend", choices=["tmcosmo", "orca"], default="tmcosmo")
     parser.add_argument("--require-cluster", action="store_true")
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "benchmarks" / "cosmors_sigma_potential_vs_paper.csv")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="number of parallel σ-potential workers (1 = serial)")
+    parser.add_argument("--orca-cores", type=int, default=1,
+                        help="ORCA --pal nprocs per worker (multiply by --workers for total)")
     args = parser.parse_args()
 
     df = pd.read_excel(args.xlsx, sheet_name="Database", header=0)
@@ -162,14 +192,11 @@ def main() -> None:
         df = df[df["Cluster"].notna()].copy()
     cache = load_cache()
 
-    paper_mat: list[np.ndarray] = []  # rows of μ_paper
-    ours_mat: list[np.ndarray] = []   # rows of μ_ours
-    meta: list[dict] = []
-
-    backend_fn = sigma_pot_tmcosmo if args.backend == "tmcosmo" else sigma_pot_orca
-    success = 0
+    # Resolve SMILES + filter serially first (PubChem rate-limited, fast).
+    tasks: list[dict] = []
+    from rdkit import Chem
     for _, row in df.iterrows():
-        if success >= args.n:
+        if len(tasks) >= args.n:
             break
         name = str(row["Name"]).strip() if pd.notna(row["Name"]) else ""
         cas = str(row["CAS"]).strip() if pd.notna(row["CAS"]) else ""
@@ -179,62 +206,95 @@ def main() -> None:
         if smi is None:
             continue
         try:
-            from rdkit import Chem
             if not smiles_passes(smi, args.max_heavy):
                 continue
         except Exception:
             continue
-        try:
-            t0 = time.perf_counter()
-            mu_ours = backend_fn(smi)
-            wall = time.perf_counter() - t0
-        except Exception as exc:
-            print(f"  [skip] {name!r}: {exc}", flush=True)
-            continue
-        mu_paper = row.iloc[3:64].to_numpy(dtype=np.float64)
-        # mu_paper has 61 entries; ours have 61 entries on the same grid
-        if mu_paper.size != mu_ours.size:
-            continue
-        paper_mat.append(mu_paper)
-        ours_mat.append(mu_ours)
-        meta.append({"name": name, "cas": cas, "smiles": smi,
-                     "cluster": row["Cluster"] if pd.notna(row["Cluster"]) else None,
-                     "n_heavy": Chem.MolFromSmiles(smi).GetNumHeavyAtoms(),
-                     "wall_s": wall})
-        r_raw = pearson(mu_paper, mu_ours)
-        success += 1
-        print(f"[{success:3d}] {name:<22} nat={meta[-1]['n_heavy']:>2} cluster={meta[-1]['cluster']}  "
-              f"r_raw={r_raw:+.4f}  ({wall:.1f}s)", flush=True)
-        if success % 10 == 0:
-            save_cache(cache)
-
+        m = Chem.MolFromSmiles(smi)
+        mu_paper = row.iloc[3:64].to_numpy(dtype=np.float64).tolist()
+        tasks.append({
+            "name": name, "cas": cas, "smiles": smi,
+            "cluster": row["Cluster"] if pd.notna(row["Cluster"]) else None,
+            "n_heavy": m.GetNumHeavyAtoms(),
+            "mu_paper": mu_paper,
+            "backend": args.backend,
+            "orca_cores": args.orca_cores,
+        })
     save_cache(cache)
-    if not paper_mat:
-        print("no rows collected")
-        return
+    print(f"Prepared {len(tasks)} tasks (backend={args.backend}, workers={args.workers}, orca_cores={args.orca_cores})", flush=True)
 
-    paper_mat = np.array(paper_mat)        # (N, 61)
-    ours_mat = np.array(ours_mat)          # (N, 61)
-    # Column-wise standardization (paper FPCA pre-processing)
+    results: list[dict] = []
+    t_total = time.perf_counter()
+    if args.workers <= 1:
+        for task in tasks:
+            res = _worker(task)
+            results.append(res)
+            if res.get("error"):
+                print(f"  [fail] {task['name']!r}: {res['error']}", flush=True)
+            else:
+                rr = pearson(np.array(task["mu_paper"]), np.array(res["mu_ours"]))
+                print(f"  [{len(results):>3}/{len(tasks)}] {task['name']:<22} "
+                      f"r_raw={rr:+.4f}  ({res['wall_s']:.1f}s)", flush=True)
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(_worker, task): task for task in tasks}
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                task = futures[fut]
+                res = fut.result()
+                results.append(res)
+                if res.get("error"):
+                    print(f"  [fail {done}/{len(tasks)}] {task['name']!r}: {res['error']}", flush=True)
+                else:
+                    rr = pearson(np.array(task["mu_paper"]), np.array(res["mu_ours"]))
+                    print(f"  [{done}/{len(tasks)}] {task['name']:<22} nat={task['n_heavy']:>2} "
+                          f"cluster={task['cluster']}  r_raw={rr:+.4f}  ({res['wall_s']:.1f}s)", flush=True)
+    elapsed = time.perf_counter() - t_total
+
+    # Aggregate
+    valid = [r for r in results if not r.get("error")]
+    if not valid:
+        print("\nno successful rows")
+        return
+    paper_mat = np.array([r["mu_paper"] if "mu_paper" in r else
+                          next(t["mu_paper"] for t in tasks if t["name"] == r["name"])
+                          for r in valid], dtype=np.float64)
+    # Re-attach mu_paper from tasks (worker stripped it)
+    name_to_paper = {t["name"]: np.asarray(t["mu_paper"], dtype=np.float64) for t in tasks}
+    paper_mat = np.array([name_to_paper[r["name"]] for r in valid], dtype=np.float64)
+    ours_mat = np.array([r["mu_ours"] for r in valid], dtype=np.float64)
+
     paper_std = standardize_columnwise(paper_mat)
     ours_std = standardize_columnwise(ours_mat)
-
-    # Per-mol correlations: raw + standardized
-    r_raw = np.array([pearson(paper_mat[i], ours_mat[i]) for i in range(len(meta))])
-    r_std = np.array([pearson(paper_std[i], ours_std[i]) for i in range(len(meta))])
+    r_raw = np.array([pearson(paper_mat[i], ours_mat[i]) for i in range(len(valid))])
+    r_std = np.array([pearson(paper_std[i], ours_std[i]) for i in range(len(valid))])
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    dfo = pd.DataFrame(meta)
+    dfo = pd.DataFrame([{
+        "name": r["name"], "cas": r.get("cas", ""), "smiles": r["smiles"],
+        "cluster": r.get("cluster"), "n_heavy": r.get("n_heavy"),
+        "wall_s": r["wall_s"],
+    } for r in valid])
     dfo["pearson_r_raw"] = r_raw
     dfo["pearson_r_standardized"] = r_std
     dfo.to_csv(args.out, index=False)
 
+    failed = [r for r in results if r.get("error")]
     print(f"\nWrote {len(dfo)} rows to {args.out}")
+    print(f"Wall: {elapsed:.1f} s  ({elapsed/len(valid):.1f} s/mol effective; speedup vs serial ≈ {sum(r['wall_s'] for r in valid)/elapsed:.1f}×)")
+    if failed:
+        print(f"Failed: {len(failed)} (names: {', '.join(r['name'] for r in failed[:5])}{'...' if len(failed)>5 else ''})")
     print(f"\nSummary (backend={args.backend}, {len(dfo)} molecules):")
     print(f"  Pearson r raw          : mean={r_raw.mean():+.4f}  median={np.median(r_raw):+.4f}  "
-          f"min={r_raw.min():+.4f}  max={r_raw.max():+.4f}")
+          f"min={r_raw.min():+.4f}  max={r_raw.max():+.4f}  ≥0.9: {(r_raw>=0.9).sum()}/{len(r_raw)}")
     print(f"  Pearson r standardized : mean={r_std.mean():+.4f}  median={np.median(r_std):+.4f}  "
-          f"min={r_std.min():+.4f}  max={r_std.max():+.4f}")
+          f"min={r_std.min():+.4f}  max={r_std.max():+.4f}  ≥0.5: {(r_std>=0.5).sum()}/{len(r_std)}")
+    if dfo["cluster"].notna().any():
+        print("\n  by cluster:")
+        for c, sub in dfo[dfo["cluster"].notna()].groupby("cluster"):
+            print(f"    cluster {int(c):>2}: n={len(sub):>3}  r_raw mean={sub['pearson_r_raw'].mean():+.4f}  "
+                  f"r_std mean={sub['pearson_r_standardized'].mean():+.4f}")
 
 
 if __name__ == "__main__":
