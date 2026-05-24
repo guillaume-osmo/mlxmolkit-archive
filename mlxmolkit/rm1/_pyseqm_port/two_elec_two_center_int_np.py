@@ -126,19 +126,21 @@ def two_elec_two_center_int(const,idxi, idxj, ni, nj, xij, rij, Z,
     isX = Z>2   # Heavy atom
     #### populations elements with d-oribitals
     ###Need extra rho to hold additive terms
-    rho_0=torch.zeros_like(qn0)
-    rho_1=torch.zeros_like(qn0)
-    rho_2=torch.zeros_like(qn0)
-    rho_2d=torch.zeros_like(qn0)
+    # qn0/qnd0 are integer dtype (period numbers); the rho/dd/qq arrays
+    # MUST be float — otherwise float assignments later get truncated to 0.
+    rho_0=np.zeros(qn0.shape, dtype=np.float64)
+    rho_1=np.zeros(qn0.shape, dtype=np.float64)
+    rho_2=np.zeros(qn0.shape, dtype=np.float64)
+    rho_2d=np.zeros(qn0.shape, dtype=np.float64)
 
 
 
-    dd=torch.zeros_like(qn0)
-    qq=torch.zeros_like(qn0)
+    dd=np.zeros(qn0.shape, dtype=np.float64)
+    qq=np.zeros(qn0.shape, dtype=np.float64)
     ###Aditional charge seperations we can have with d-oribitals
-    dp=torch.zeros_like(qn0)
-    ds=torch.zeros_like(qn0)
-    dorbdorb=torch.zeros_like(qn0)
+    dp=np.zeros(qn0.shape, dtype=np.float64)
+    ds=np.zeros(qn0.shape, dtype=np.float64)
+    dorbdorb=np.zeros(qn0.shape, dtype=np.float64)
     ###
     rho1 = additive_term_rho1.apply
     rho2 = additive_term_rho2.apply
@@ -148,17 +150,17 @@ def two_elec_two_center_int(const,idxi, idxj, ni, nj, xij, rij, Z,
 ###Correct coefficients?
 ### 1/5, 4/15, 3/49, 1 or values from paper?
 
-    dsAdditiveTerm=torch.zeros_like(qn0)
-    dpAdditiveTerm=torch.zeros_like(qn0)
-    ddAdditiveTerm=torch.zeros_like(qn0)
-    dd0AdditiveTerm=torch.zeros_like(qn0)
-    AIJ52    = torch.zeros_like(qn0)
-    AIJ43    = torch.zeros_like(qn0)
-    AIJ63    = torch.zeros_like(qn0)
-##    AIJ22 = torch.zeros_like(qn0)
+    dsAdditiveTerm=np.zeros(qn0.shape, dtype=np.float64)
+    dpAdditiveTerm=np.zeros(qn0.shape, dtype=np.float64)
+    ddAdditiveTerm=np.zeros(qn0.shape, dtype=np.float64)
+    dd0AdditiveTerm=np.zeros(qn0.shape, dtype=np.float64)
+    AIJ52    = np.zeros(qn0.shape, dtype=np.float64)
+    AIJ43    = np.zeros(qn0.shape, dtype=np.float64)
+    AIJ63    = np.zeros(qn0.shape, dtype=np.float64)
+##    AIJ22 = np.zeros(qn0.shape, dtype=np.float64)
 
-    dd4 = torch.zeros_like(qn0)
-    dp3 = torch.zeros_like(qn0)
+    dd4 = np.zeros(qn0.shape, dtype=np.float64)
+    dp3 = np.zeros(qn0.shape, dtype=np.float64)
     mask_a = ((Z > 20) & (Z < 30)) | ((Z > 38) & (Z < 48)) | ((Z > 70) & (Z < 80)) | (Z == 57)
     if themethod == "PM6":
         mask_b = ((Z > 12) & (Z < 18)) | ((Z > 32) & (Z < 36)) | ((Z > 50) & (Z < 54))
@@ -212,10 +214,10 @@ def two_elec_two_center_int(const,idxi, idxj, ni, nj, xij, rij, Z,
     isY = qnd[Z] > 0
     D = torch.sqrt(AIJ43*math.sqrt(1.0000/15.0000))*math.sqrt(2.0000)
     ds = D
-    DS = torch.zeros_like(qn0)
+    DS = np.zeros(qn0.shape, dtype=np.float64)
     DS[isY] = POIJ(2,D[isY],dsAdditiveTerm[isY])
 
-    DD0 = torch.zeros_like(qn0)
+    DD0 = np.zeros(qn0.shape, dtype=np.float64)
     FG = dd0AdditiveTerm + ddAdditiveTerm + 4/49*dd4
     FG1 = dd0AdditiveTerm + 0.5*ddAdditiveTerm - 24/441*dd4
     FG2 = dd0AdditiveTerm - ddAdditiveTerm + 6/441*dd4
@@ -224,14 +226,14 @@ def two_elec_two_center_int(const,idxi, idxj, ni, nj, xij, rij, Z,
     D = AIJ52/math.sqrt(5.0000)
     FG=dpAdditiveTerm+dp3
     FG1=3/49*245/27*dp3
-    DP = torch.zeros_like(qn0)
+    DP = np.zeros(qn0.shape, dtype=np.float64)
     DP[isY] = POIJ(1,D[isY],FG[isY]-1.8000*FG1[isY])
     D        = AIJ63/7.0000
     D        = torch.sqrt(2.0000*D)
     dorbdorb = D
     FG= 3/4*ddAdditiveTerm+20/441*dd4
     FG1=35/441*dd4
-    DD = torch.zeros_like(qn0)
+    DD = np.zeros(qn0.shape, dtype=np.float64)
     DD[isY] = POIJ(2,D[isY],FG[isY]-(20.0000/35.0000)*FG1[isY])
 #    y = torch.sqrt((2*qn0+1)*(2*qn0+2)/20.00000) / zetap
 #    x = POIJ(2,y*math.sqrt(2),hpp[isY])

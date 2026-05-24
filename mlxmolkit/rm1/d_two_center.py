@@ -153,12 +153,7 @@ def _packed_idx_4(i: int, j: int) -> int:
 
 
 def _yy_pair_w_pyseqm(pA, pB, coordA, coordB):
-    """Try PYSEQM hcore first (ground truth); fall back to numpy TETCI."""
-    try:
-        import seqm  # noqa: F401
-        return _yy_pair_w_pyseqm_OLD(pA, pB, coordA, coordB)
-    except ImportError:
-        pass
+    """Compute via vendored numpy TETCI (bit-exact to PYSEQM)."""
     w, first_is_A = _tetci_pair_w(pA, pB, coordA, coordB)
     if w is None:
         return None
@@ -248,12 +243,7 @@ def _yy_pair_w_pyseqm_OLD(pA, pB, coordA, coordB):
 
 
 def _yx_pair_w_pyseqm(p_d, p_sp, coord_d, coord_sp):
-    """Try PYSEQM hcore first (ground truth); fall back to numpy TETCI."""
-    try:
-        import seqm  # noqa: F401
-        return _yx_pair_w_pyseqm_OLD(p_d, p_sp, coord_d, coord_sp)
-    except ImportError:
-        pass
+    """Compute via vendored numpy TETCI (bit-exact to PYSEQM)."""
     w, first_is_d = _tetci_pair_w(p_d, p_sp, coord_d, coord_sp)
     if w is None:
         return None
