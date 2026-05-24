@@ -162,32 +162,21 @@ def overlap_d_local(
 
 
 def _pyseqm_overlap_matrix(pA, pB, coordA, coordB):
-    """Delegate diatomic overlap to PYSEQM (BSD-3-Clause, github.com/lanl/PYSEQM).
+    """Vendored NumPy port of PYSEQM's ``diatom_overlap_matrixD`` (BSD-3,
+    github.com/lanl/PYSEQM). No external PYSEQM/torch dependency.
 
-    Returns (nA_basis, nB_basis) overlap matrix in molecular frame, exactly as
-    PYSEQM's ``diatom_overlap_matrixD`` would compute it. Used when at least
-    one of A, B has d-orbitals because mlxmolkit's native overlap only supports
-    qn={1, 2} (no support for qn=3 needed by P/S/Cl, qn=4 by Br, qn=5 by I).
-    Returns None if PYSEQM is not importable.
+    Returns (nA_basis, nB_basis) overlap matrix in molecular frame. The
+    PYSEQM table only covers (qni, qnj) pairs with qni >= qnj; we swap
+    A/B if needed and transpose at the end.
     """
-    try:
-        import torch
-        from seqm.seqm_functions.diat_overlapD import diatom_overlap_matrixD
-        from seqm.seqm_functions.constants import Constants
-    except ImportError:
-        return None
+    from ._pyseqm_port.diat_overlapD_np import diatom_overlap_matrixD
+    from ._pyseqm_port.constants_np import qn_int, qnD_int
 
     R_vec = coordB - coordA
     R_ang = float(np.linalg.norm(R_vec))
     if R_ang < 1e-10:
         return None
-    # Constants() freezes dtype at instantiation; set torch float64 first.
-    prev_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.float64)
-    const = Constants()
-    # PYSEQM's diat_overlapD requires ni (first atom) to have qn >= qn(nj):
-    # only (qni, qnj) pairs with qni >= qnj are tabulated. Swap if needed,
-    # then transpose the result so the returned matrix is shaped (nA, nB).
+
     swap = pA.Z < pB.Z
     if swap:
         p1, p2, c1, c2 = pB, pA, coordB, coordA
@@ -195,29 +184,25 @@ def _pyseqm_overlap_matrix(pA, pB, coordA, coordB):
         p1, p2, c1, c2 = pA, pB, coordA, coordB
     R12 = c2 - c1
     R12_ang = float(np.linalg.norm(R12))
-    xij_t = torch.from_numpy(np.asarray([R12 / R12_ang], dtype=np.float64))
-    R_bohr_t = torch.from_numpy(np.asarray([R12_ang * ANG_TO_BOHR], dtype=np.float64))
-    ni_t = torch.tensor([int(p1.Z)], dtype=torch.int64)
-    nj_t = torch.tensor([int(p2.Z)], dtype=torch.int64)
-    zeta_i = torch.from_numpy(
-        np.asarray([[p1.zeta_s, p1.zeta_p, getattr(p1, "zeta_d", 0.0)]], dtype=np.float64)
+    xij = np.asarray([R12 / R12_ang], dtype=np.float64)
+    R_bohr = np.asarray([R12_ang * ANG_TO_BOHR], dtype=np.float64)
+    ni = np.asarray([int(p1.Z)], dtype=np.int64)
+    nj = np.asarray([int(p2.Z)], dtype=np.int64)
+    zeta_i = np.asarray(
+        [[p1.zeta_s, p1.zeta_p, getattr(p1, "zeta_d", 0.0)]], dtype=np.float64
     )
-    zeta_j = torch.from_numpy(
-        np.asarray([[p2.zeta_s, p2.zeta_p, getattr(p2, "zeta_d", 0.0)]], dtype=np.float64)
+    zeta_j = np.asarray(
+        [[p2.zeta_s, p2.zeta_p, getattr(p2, "zeta_d", 0.0)]], dtype=np.float64
     )
     try:
         S_full = diatom_overlap_matrixD(
-            ni_t, nj_t, xij_t, R_bohr_t, zeta_i, zeta_j,
-            const.qn_int, const.qnD_int,
-        ).detach().cpu().numpy()[0]
+            ni, nj, xij, R_bohr, zeta_i, zeta_j, qn_int, qnD_int,
+        )[0]
     except Exception:
-        torch.set_default_dtype(prev_dtype)
         return None
-    torch.set_default_dtype(prev_dtype)
-    # PYSEQM returns (9, 9) padded; crop to actual basis sizes.
     S = S_full[: p1.n_basis, : p2.n_basis].copy()
     if swap:
-        S = S.T  # now (nA, nB)
+        S = S.T
     return S
 
 

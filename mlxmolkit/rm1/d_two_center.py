@@ -19,6 +19,120 @@ from .d_charge_sep import compute_d_charge_separations
 from .two_center_integrals import _compute_multipole_params, EV
 
 
+_PM6_CSV_CACHE = None
+
+def _load_pm6_csv_params():
+    """Load PM6 params from bundled MOPAC CSV. Returns dict {Z: {field: float}}.
+
+    Cached on first call. The CSV columns we use:
+        zeta_s/p/d, g_ss, g_pp, g_p2, h_sp, F0SD, G2SD, rho_core,
+        alpha, s/p/d_orb_exp_tail.
+    """
+    global _PM6_CSV_CACHE
+    if _PM6_CSV_CACHE is not None:
+        return _PM6_CSV_CACHE
+    import os
+    csv = os.path.join(os.path.dirname(__file__), 'data', 'parameters_PM6_MOPAC.csv')
+    out = {}
+    with open(csv) as f:
+        header = next(f).strip().split(',')
+        header = [h.strip() for h in header]
+        for line in f:
+            row = [x.strip() for x in line.strip().split(',')]
+            if not row or not row[0].isdigit():
+                continue
+            Z = int(row[0])
+            d = {}
+            for i, name in enumerate(header):
+                try:
+                    d[name] = float(row[i])
+                except (ValueError, IndexError):
+                    pass
+            out[Z] = d
+    _PM6_CSV_CACHE = out
+    return out
+
+
+def _tetci_pair_w(p1, p2, coord1, coord2):
+    """Compute the per-pair 45x45 packed w tensor via the vendored numpy
+    TETCI port (no PYSEQM/torch dependency).
+
+    p1, p2 : ElementParams (any order; TETCI handles internal sorting)
+    coord1, coord2 : ndarray (3,) in Angstrom
+
+    Returns w[45, 45] in the PYSEQM packed convention, or None on failure.
+    Add a phantom H if the subsystem has odd electron count (RHF require).
+    """
+    from ._pyseqm_port.two_elec_two_center_int_np import two_elec_two_center_int
+    from ._pyseqm_port import constants_np
+
+    if p1.Z >= p2.Z:
+        pa, pb, ca, cb = p1, p2, coord1, coord2
+    else:
+        pa, pb, ca, cb = p2, p1, coord2, coord1
+    Zs = [int(pa.Z), int(pb.Z)]
+    coords = [np.asarray(ca, dtype=np.float64), np.asarray(cb, dtype=np.float64)]
+    n_elec = int(pa.n_valence + pb.n_valence)
+    if n_elec % 2 == 1:
+        Zs.append(1)
+        coords.append(coords[0] + np.array([1000.0, 0.0, 0.0]))
+
+    # Pack 2-atom system as the per-pair flat arrays TETCI expects.
+    n = len(Zs)
+    Z = np.asarray(Zs, dtype=np.int64)
+    # All pairs i<j
+    idxi_list, idxj_list = [], []
+    for i in range(n):
+        for j in range(i + 1, n):
+            idxi_list.append(i); idxj_list.append(j)
+    idxi = np.asarray(idxi_list, dtype=np.int64)
+    idxj = np.asarray(idxj_list, dtype=np.int64)
+    ni = Z[idxi]; nj = Z[idxj]
+    coords_arr = np.asarray(coords, dtype=np.float64)
+    diff = coords_arr[idxj] - coords_arr[idxi]
+    R_ang = np.linalg.norm(diff, axis=1)
+    rij = R_ang * ANG_TO_BOHR
+    xij = diff / R_ang[:, None]
+
+    # Load PM6 params from bundled CSV (PYSEQM MOPAC values, BSD-3 Clause).
+    csv = _load_pm6_csv_params()
+    def col(name):
+        return np.asarray([csv[z].get(name, 0.0) for z in Zs], dtype=np.float64)
+
+    zetas = col('zeta_s')
+    zetap = col('zeta_p')
+    zetad = col('zeta_d')
+    zs = col('s_orb_exp_tail')
+    zp = col('p_orb_exp_tail')
+    zd = col('d_orb_exp_tail')
+    # For elements without tail values (H, C, N, O, F), use zeta_s/p as fallback to avoid log(0)
+    zs = np.where(zs > 0, zs, zetas)
+    zp = np.where(zp > 0, zp, np.where(zetap > 0, zetap, zetas))
+    zd = np.where(zd > 0, zd, np.where(zetad > 0, zetad, zetas))
+    gss = col('g_ss'); gpp = col('g_pp'); gp2 = col('g_p2'); hsp = col('h_sp')
+    F0SD = col('F0SD'); G2SD = col('G2SD')
+    rho_core = col('rho_core')
+    alpha = col('alpha')
+    chi = np.zeros_like(zetas)
+
+    class FakeConst:
+        qn = constants_np.qn_int
+        qnD_int = constants_np.qnD_int
+        tore = np.array([0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+                         0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0] + [0.0]*60)
+    const = FakeConst()
+    try:
+        w, e1b, e2a, _, _, _, _ = two_elec_two_center_int(
+            const, idxi, idxj, ni, nj, xij, rij, Z,
+            zetas, zetap, zetad, zs, zp, zd,
+            gss, gpp, gp2, hsp, F0SD, G2SD, rho_core, alpha, chi, 'PM6'
+        )
+    except Exception:
+        return None, False
+    # First pair (the real pair we care about; phantom pairs come after).
+    return w[0], (p1.Z >= p2.Z)
+
+
 # Lower-triangle packing for 9x9 — PYSEQM convention (i, j) with i >= j
 _TRIL9_I = np.array([i for i in range(9) for j in range(i + 1)])
 _TRIL9_J = np.array([j for i in range(9) for j in range(i + 1)])
@@ -39,14 +153,32 @@ def _packed_idx_4(i: int, j: int) -> int:
 
 
 def _yy_pair_w_pyseqm(pA, pB, coordA, coordB):
-    """Return the 9×9×9×9 rotated two-electron integral tensor for a YY pair.
+    """Try PYSEQM hcore first (ground truth); fall back to numpy TETCI."""
+    try:
+        import seqm  # noqa: F401
+        return _yy_pair_w_pyseqm_OLD(pA, pB, coordA, coordB)
+    except ImportError:
+        pass
+    w, first_is_A = _tetci_pair_w(pA, pB, coordA, coordB)
+    if w is None:
+        return None
+    W = np.zeros((9, 9, 9, 9))
+    for mu in range(9):
+        for nu in range(mu + 1):
+            kl = _packed_idx_9(mu, nu)
+            for lam in range(9):
+                for sig in range(lam + 1):
+                    ij = _packed_idx_9(lam, sig)
+                    val = w[ij, kl]
+                    W[mu, nu, lam, sig] = val
+                    W[nu, mu, lam, sig] = val
+                    W[mu, nu, sig, lam] = val
+                    W[nu, mu, sig, lam] = val
+    return W if first_is_A else W.transpose(2, 3, 0, 1)
 
-    Same delegation pattern as ``_yx_pair_w_pyseqm`` but for the case where
-    both atoms have d-orbitals. Returns ``W[μ_A, ν_A, λ_B, σ_B]`` indexed
-    by the caller's atom order (not PYSEQM's sorted order).
 
-    Returns None if PYSEQM is not importable.
-    """
+def _yy_pair_w_pyseqm_OLD(pA, pB, coordA, coordB):
+    """Original PYSEQM delegation — kept for reference, not used."""
     try:
         import torch
         from seqm.Molecule import Molecule
@@ -116,34 +248,32 @@ def _yy_pair_w_pyseqm(pA, pB, coordA, coordB):
 
 
 def _yx_pair_w_pyseqm(p_d, p_sp, coord_d, coord_sp):
-    """Return the 9×9×4×4 rotated two-electron integral tensor for a YX pair.
+    """Try PYSEQM hcore first (ground truth); fall back to numpy TETCI."""
+    try:
+        import seqm  # noqa: F401
+        return _yx_pair_w_pyseqm_OLD(p_d, p_sp, coord_d, coord_sp)
+    except ImportError:
+        pass
+    w, first_is_d = _tetci_pair_w(p_d, p_sp, coord_d, coord_sp)
+    if w is None:
+        return None
+    W = np.zeros((9, 9, 4, 4))
+    for mu in range(9):
+        for nu in range(mu + 1):
+            kl = _packed_idx_9(mu, nu)
+            for lam in range(4):
+                for sig in range(lam + 1):
+                    ij = _packed_idx_4(lam, sig)
+                    val = w[ij, kl]
+                    W[mu, nu, lam, sig] = val
+                    W[nu, mu, lam, sig] = val
+                    W[mu, nu, sig, lam] = val
+                    W[nu, mu, sig, lam] = val
+    return W
 
-    Delegates to PYSEQM's ``hcore`` (BSD-3-Clause, github.com/lanl/PYSEQM)
-    by constructing a 2-atom subsystem and extracting the per-pair w
-    tensor.
 
-    Parameters
-    ----------
-    p_d : ElementParams
-        The d-orbital atom (n_basis == 9). Must be the heavier-Z atom by PYSEQM
-        convention; caller is responsible for ordering correctly.
-    p_sp : ElementParams
-        The sp-only heavy atom (n_basis == 4).
-    coord_d, coord_sp : ndarray (3,)
-        Cartesian coordinates of the two atoms.
-
-    Returns
-    -------
-    W : ndarray (9, 9, 4, 4) or None
-        ``W[μ, ν, λ, σ] = (μ_d-atom ν_d-atom | λ_sp-atom σ_sp-atom)`` in
-        eV. Symmetric in (μ, ν) and in (λ, σ). Returns None if PYSEQM is
-        not importable.
-
-    The two-electron integrals in PM6 NDDO are strictly pairwise — they
-    don't depend on third atoms — so a 2-atom hcore call gives bit-exact
-    results matching PYSEQM's multi-atom run for the same pair (verified
-    empirically against CSC's S-C pair).
-    """
+def _yx_pair_w_pyseqm_OLD(p_d, p_sp, coord_d, coord_sp):
+    """Original PYSEQM delegation — kept for reference, not used."""
     try:
         import torch
         from seqm.Molecule import Molecule
