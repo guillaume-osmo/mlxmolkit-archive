@@ -2,15 +2,30 @@
 
 Source: https://github.com/lanl/PYSEQM
 
-Currently vendored:
-  - ``constants_np`` — minimal stand-in for PYSEQM's Constants class
-    (just qn_int / qnD_int / physical constants).
-  - ``diat_overlapD_np`` — mechanical torch->numpy port of
-    ``seqm/seqm_functions/diat_overlapD.py``. Implements the full
-    sp + d-orbital diatomic overlap for all PYSEQM-supported pairs
-    (qn=1..6, including qn=4 Br and qn=5 I).
+Bit-exact to PYSEQM (~1e-15) — verified by tests/test_pyseqm_port.py.
 
-Pending (TETCI port — still requires PYSEQM fallback in d_two_center.py):
-  - ``two_elec_two_center_int_local_frame_d_orbitals`` needs custom
-    torch.autograd.Function ports + the RotationMatrixD chain.
+Exports
+-------
+diatom_overlap_matrixD(ni, nj, xij, rij, zeta_a, zeta_b, qn_int, qnD_int)
+    Diatomic overlap matrix in molecular frame. Covers qn=1..6 (H..I).
+    Returns (npairs, 9, 9) for PM6 (with d-orbitals).
+
+two_elec_two_center_int(const, idxi, idxj, ni, nj, xij, rij, Z, ...)
+    Per-pair two-electron two-center integrals. Returns the rotated
+    (npairs, 45, 45) w tensor plus core-electron e1b/e2a (4x4 sp blocks)
+    and electron-electron rho terms.
+
+qn_int, qnD_int : ndarray
+    Period of the periodic table for valence sp and d shells, indexed by Z.
 """
+from .diat_overlapD_np import diatom_overlap_matrixD
+from .two_elec_two_center_int_np import two_elec_two_center_int
+from .constants_np import qn_int, qnD_int, Constants
+
+__all__ = [
+    "diatom_overlap_matrixD",
+    "two_elec_two_center_int",
+    "qn_int",
+    "qnD_int",
+    "Constants",
+]

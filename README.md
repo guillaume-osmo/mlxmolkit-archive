@@ -8,13 +8,40 @@ Port of [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to App
 
 ## What's new
 
-- **PM6_D SCF in pure NumPy** — no PYSEQM/PyTorch runtime dependency. Per-pair W tensor matches PYSEQM to 2.66e-15 (machine epsilon). 27/27 SCF charge tests pass against frozen PYSEQM/MOPAC references.
+PM6_D semi-empirical SCF on Apple Silicon, **bit-exact to PYSEQM** with no
+PYSEQM/PyTorch runtime dependency. All exposed entry points are covered by
+the test suite — see `tests/test_{pm6_d_native,pm6_d3h4,pyseqm_port,rm1_scf}.py`
+(65 tests total).
+
+- **PM6_D SCF in pure NumPy** — per-pair W tensor matches PYSEQM to 2.66e-15 (machine epsilon). 27/27 SCF charge tests pass against frozen PYSEQM/MOPAC references.
 - **Full d-orbital support** — P, S, Cl (qn=3) and Br (qn=4) with the 22-integral local frame, rotated to molecular frame via Wigner D-matrices. Covers YH, YX, YY pair types.
 - **PM6-D3H4 post-SCF corrections** — Grimme D3 dispersion + Rezáč–Hobza H4 hydrogen-bond + HH-repulsion.
 - **DIIS + adaptive damping SCF** — converges reliably on hard cases (CCl4, SF6, DMSO) where plain mixing freezes the wrong basin.
-- **numba JIT + einsum hot kernels** — `w_withquaternion`, `GenerateRotationMatrix`, `Rotate2Center2Electron` accelerated; ~2× end-to-end per pair.
-- **MLX GPU SCF prototypes** — single-mol Metal SCF (`scf_gpu.py`) and batched B-mol SCF (`scf_batched_gpu.py`) via mlx-addons.
-- **Bit-exactness regression suite** — 23 frozen-reference tests in `tests/test_pyseqm_port.py` guard the numerical invariants of the vendored port.
+- **numba JIT + einsum hot kernels** — `w_withquaternion`, `GenerateRotationMatrix`, `Rotate2Center2Electron` accelerated; ~2× end-to-end per pair (3.3 → 1.6 ms per S-C pair on M3 Max).
+- **Bit-exactness regression suite** — 23 frozen-reference tests guard the numerical invariants of the vendored PYSEQM port.
+
+### Public API
+
+```python
+from mlxmolkit.rm1 import (
+    # SCF
+    rm1_energy, rm1_energy_batch,
+    # PM6-D3H4 corrections
+    pm6_d3h4_correction, d3_energy, h4_energy, hh_repulsion,
+    # Parameters
+    METHOD_PARAMS, get_params, ElementParams,
+)
+
+# Bit-exact primitives (vendored from PYSEQM)
+from mlxmolkit.rm1._pyseqm_port import (
+    diatom_overlap_matrixD, two_elec_two_center_int,
+    qn_int, qnD_int,
+)
+
+# Example: PM6_D total energy with D3H4 corrections
+result = rm1_energy(atoms=[16, 1, 1], coords=[[0,0,0], [0.97,0,0.93], [-0.97,0,0.93]], method='PM6_D')
+correction = pm6_d3h4_correction(atoms=[16, 1, 1], coords=...)
+```
 
 ## Installation
 
