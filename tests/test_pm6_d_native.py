@@ -96,7 +96,7 @@ PM6_D_TESTS = [
 def _run_native(atoms, coords):
     """Run mlxmolkit native PM6_D SCF with DIIS on a small molecule.
 
-    Uses the same convergence machinery as the production ``rm1_energy``
+    Uses the same convergence machinery as the production ``nddo_energy``
     main loop (Pulay DIIS + adaptive damping + level shift for d-orbital
     atoms). The plain-mixing minimal SCF used in earlier dev tests
     converges to wrong basins on YY-heavy molecules like CCl4 / SF6 even

@@ -7,7 +7,7 @@ import sys; sys.path.insert(0, '.')
 import numpy as np
 import pytest
 
-from mlxmolkit.rm1.scf import rm1_energy, rm1_energy_batch
+from mlxmolkit.rm1.scf import nddo_energy, nddo_energy_batch
 
 
 # Test geometries (Angstrom)
@@ -48,7 +48,7 @@ def test_energy_vs_pyseqm(method, mol_name):
     atoms, coords = MOLS[mol_name]
     ref = PYSEQM_REF[method][mol_name]
 
-    result = rm1_energy(list(atoms), coords, method=method, max_iter=200, conv_tol=1e-8)
+    result = nddo_energy(list(atoms), coords, method=method, max_iter=200, conv_tol=1e-8)
 
     assert result['converged'], f"{method} {mol_name} did not converge"
     assert abs(result['electronic_eV'] - ref['E_elec']) < 0.001, \
@@ -62,10 +62,10 @@ def test_energy_vs_pyseqm(method, mol_name):
 def test_batch_matches_single():
     """Test that batch SCF gives same results as single molecule."""
     mol_list = [(list(a), c) for a, c in MOLS.values()]
-    batch_results = rm1_energy_batch(mol_list, method='RM1', use_metal=False)
+    batch_results = nddo_energy_batch(mol_list, method='RM1', use_metal=False)
 
     for i, (name, (atoms, coords)) in enumerate(MOLS.items()):
-        single = rm1_energy(list(atoms), coords, method='RM1')
+        single = nddo_energy(list(atoms), coords, method='RM1')
         assert abs(batch_results[i]['energy_eV'] - single['energy_eV']) < 1e-10, \
             f"Batch vs single mismatch for {name}"
 
@@ -74,7 +74,7 @@ def test_all_methods_converge():
     """Test that all 7 methods converge for water."""
     atoms, coords = MOLS['H2O']
     for method in ['RM1', 'AM1', 'PM3', 'PM6', 'AM1_STAR', 'RM1_STAR']:
-        result = rm1_energy(list(atoms), coords, method=method, max_iter=200)
+        result = nddo_energy(list(atoms), coords, method=method, max_iter=200)
         assert result['converged'], f"{method} did not converge for H2O"
 
 
@@ -82,7 +82,7 @@ def test_density_trace():
     """Test that Tr(P) = n_electrons for all methods."""
     atoms, coords = MOLS['H2O']
     for method in ['RM1', 'AM1', 'PM6']:
-        result = rm1_energy(list(atoms), coords, method=method)
+        result = nddo_energy(list(atoms), coords, method=method)
         P = result['density']
         n_elec = 8  # O(6) + H(1) + H(1)
         assert abs(np.trace(P) - n_elec) < 0.01, \

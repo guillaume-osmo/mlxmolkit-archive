@@ -13,7 +13,7 @@ ONE SCF + derivative pass vs 6N+1 SCF calls for numerical gradient.
 from __future__ import annotations
 
 import numpy as np
-from .scf import rm1_energy
+from .scf import nddo_energy
 from .methods import get_params
 from .integrals import compute_nuclear_repulsion
 
@@ -37,7 +37,7 @@ def analytical_gradient(
     n_atoms = len(atoms)
 
     # Converged SCF
-    result = rm1_energy(atoms, coords, method=method, max_iter=200, conv_tol=1e-8)
+    result = nddo_energy(atoms, coords, method=method, max_iter=200, conv_tol=1e-8)
     P = result['density']
     E0 = result['energy_eV']
 

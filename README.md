@@ -36,7 +36,7 @@ entry point is covered by `tests/test_{methods_api,pm6_d_native,pm6_d3h4,pyseqm_
 ```python
 from mlxmolkit.rm1 import (
     # SCF
-    rm1_energy, rm1_energy_batch,
+    nddo_energy, nddo_energy_batch,
     # PM6-D3H4 corrections
     pm6_d3h4_correction, d3_energy, h4_energy, hh_repulsion,
     # Parameters
@@ -50,7 +50,7 @@ from mlxmolkit.rm1._pyseqm_port import (
 )
 
 # Example: PM6_D total energy with D3H4 corrections
-result = rm1_energy(atoms=[16, 1, 1], coords=[[0,0,0], [0.97,0,0.93], [-0.97,0,0.93]], method='PM6_D')
+result = nddo_energy(atoms=[16, 1, 1], coords=[[0,0,0], [0.97,0,0.93], [-0.97,0,0.93]], method='PM6_D')
 correction = pm6_d3h4_correction(atoms=[16, 1, 1], coords=...)
 ```
 

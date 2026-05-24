@@ -8,14 +8,14 @@ Tested entry points
 -------------------
 
 SCF
-    rm1_energy(atoms, coords, method='RM1') -> dict
+    nddo_energy(atoms, coords, method='RM1') -> dict
         Single-molecule SCF. Returns electronic + nuclear + heat-of-formation
         energies plus the converged density. Methods: 'RM1', 'AM1', 'PM3',
         'PM6_SP' (sp-only), 'PM6_D' (full d-orbital, requires the vendored
         NumPy PYSEQM port — no external dep).
         Tests: tests/test_rm1_scf.py, tests/test_pm6_d_native.py
 
-    rm1_energy_batch(atoms_list, coords_list, method='RM1') -> list[dict]
+    nddo_energy_batch(atoms_list, coords_list, method='RM1') -> list[dict]
         Batched version. Tests: tests/test_rm1_scf.py
 
 PM6-D3H4 corrections (post-SCF)
@@ -47,7 +47,7 @@ Bit-exact reference primitives (vendored from PYSEQM, BSD-3, LANL)
 """
 
 # --- public API ---
-from .scf import rm1_energy, rm1_energy_batch
+from .scf import nddo_energy, nddo_energy_batch
 from .pm6_d3h4 import (
     pm6_d3h4_correction,
     d3_energy,
@@ -59,8 +59,8 @@ from .params import ElementParams, ANG_TO_BOHR, principal_qn, RM1_PARAMS
 
 __all__ = [
     # SCF
-    "rm1_energy",
-    "rm1_energy_batch",
+    "nddo_energy",
+    "nddo_energy_batch",
     # PM6-D3H4 corrections
     "pm6_d3h4_correction",
     "d3_energy",

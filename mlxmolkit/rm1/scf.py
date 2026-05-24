@@ -9,7 +9,7 @@ Iterative procedure:
 
 Two SCF entry points:
 
-- :func:`rm1_energy_batch` — original numpy-loop implementation. Each
+- :func:`nddo_energy_batch` — original numpy-loop implementation. Each
   molecule diagonalizes / DIISes on the CPU in a Python loop; the Fock
   build is the only batched-on-Metal step.
 - :func:`rm1_energy_batch_mlx` — all-MLX batched SCF: Fock, eigh (CPU
@@ -571,7 +571,7 @@ def _pm6d_via_pyseqm(atoms: list[int], coords: np.ndarray) -> dict:
     }
 
 
-def rm1_energy(
+def nddo_energy(
     atoms: list[int],
     coords: np.ndarray,
     max_iter: int = 100,
@@ -808,7 +808,7 @@ def rm1_energy(
     }
 
 
-def rm1_energy_batch(
+def nddo_energy_batch(
     molecules: list[tuple[list[int], np.ndarray]],
     max_iter: int = 100,
     conv_tol: float = 1e-6,
@@ -827,7 +827,7 @@ def rm1_energy_batch(
         method: 'RM1', 'AM1', or 'AM1_STAR'
 
     Returns:
-        list of result dicts (same format as rm1_energy)
+        list of result dicts (same format as nddo_energy)
     """
     from .batch import prepare_batch
     from .fock_metal import build_fock_batch_metal, build_fock_batch_cpu, MetalFockContext
@@ -1015,7 +1015,7 @@ def rm1_energy_batch_mlx(
 ) -> list[dict]:
     """All-MLX batched NDDO SCF.
 
-    Same numerical recipe as :func:`rm1_energy_batch` (NDDO Fock build,
+    Same numerical recipe as :func:`nddo_energy_batch` (NDDO Fock build,
     DIIS-extrapolated F, eigh-based density), but every per-iteration
     array stays an ``mx.array`` from start to finish:
 
@@ -1030,7 +1030,7 @@ def rm1_energy_batch_mlx(
     padding cannot enter the occupied set; the corresponding eigenvectors
     are masked out in the density build.
 
-    Parameters mirror :func:`rm1_energy_batch`. ``use_metal`` is implicit
+    Parameters mirror :func:`nddo_energy_batch`. ``use_metal`` is implicit
     (always Metal Fock build — the CPU Fock path doesn't fit the all-MLX
     contract).
 
@@ -1042,7 +1042,7 @@ def rm1_energy_batch_mlx(
         method: RM1 / AM1 / AM1_STAR / RM1_STAR.
 
     Returns:
-        list of result dicts (same shape as :func:`rm1_energy_batch`).
+        list of result dicts (same shape as :func:`nddo_energy_batch`).
     """
     from .batch import prepare_batch
     from .fock_metal import MetalFockContext
@@ -1240,3 +1240,10 @@ def _pulay_diis_extrap(F_hist, e_hist, solve_lu) -> mx.array:
     coeffs = coeffs_full[..., :nd, 0]              # (N, nd)
     # F_extrap[..., n, m] = sum_i c_i F_stack[i, ..., n, m]
     return mx.einsum("...i,i...nm->...nm", coeffs, F_stack)
+
+
+# --- Back-compat aliases (the function was named rm1_energy before this PR
+# expanded it to all 8 NDDO methods; keep the old names so external callers
+# don't break). ---
+rm1_energy = nddo_energy
+rm1_energy_batch = nddo_energy_batch

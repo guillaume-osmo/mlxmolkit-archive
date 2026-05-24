@@ -8,7 +8,7 @@ Batch version: optimize N molecules simultaneously.
 from __future__ import annotations
 
 import numpy as np
-from .scf import rm1_energy, rm1_energy_batch
+from .scf import nddo_energy, nddo_energy_batch
 
 
 def nddo_gradient(
@@ -31,7 +31,7 @@ def nddo_gradient(
     coords = np.asarray(coords, dtype=np.float64)
     n_atoms = len(atoms)
 
-    result = rm1_energy(atoms, coords, method=method)
+    result = nddo_energy(atoms, coords, method=method)
     E0 = result['energy_eV']
 
     grad = np.zeros((n_atoms, 3))
@@ -39,8 +39,8 @@ def nddo_gradient(
         for j in range(3):
             cp = coords.copy(); cp[i, j] += step
             cm = coords.copy(); cm[i, j] -= step
-            Ep = rm1_energy(atoms, cp, method=method)['energy_eV']
-            Em = rm1_energy(atoms, cm, method=method)['energy_eV']
+            Ep = nddo_energy(atoms, cp, method=method)['energy_eV']
+            Em = nddo_energy(atoms, cm, method=method)['energy_eV']
             grad[i, j] = (Ep - Em) / (2.0 * step)
 
     return E0, grad
@@ -90,7 +90,7 @@ def nddo_gradient_batch(
         mol_info.append((mol_idx, n_at, center_idx, grad_start))
 
     # One batch call for ALL displaced geometries
-    results = rm1_energy_batch(all_mols, method=method, use_metal=True)
+    results = nddo_energy_batch(all_mols, method=method, use_metal=True)
 
     # Extract energies and gradients
     energies = np.zeros(N)
@@ -209,7 +209,7 @@ def nddo_optimize_batch(
             trial_indices.append(i)
 
         if len(trial_mols) > 0:
-            trial_results = rm1_energy_batch(trial_mols, method=method, use_metal=True)
+            trial_results = nddo_energy_batch(trial_mols, method=method, use_metal=True)
 
             # Accept or reduce step per molecule
             for k, i in enumerate(trial_indices):
@@ -246,7 +246,7 @@ def nddo_optimize_batch(
                     rho_hist[i].pop(0)
 
     # Final energies
-    final_results = rm1_energy_batch(
+    final_results = nddo_energy_batch(
         [(atoms_list[i], coords_list[i]) for i in range(N)],
         method=method, use_metal=True,
     )
