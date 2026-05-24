@@ -5177,7 +5177,10 @@ def aintgs(x0, jcall):
     # in same case x will be zero, which causes an issue when backpropagating
     # like zete_p from Hydrogen, H -  H Pair
     # or pairs for same atom, then rab = 0
-    t = 1.0 / np.asarray(0.0)
+    # The `1/0 -> +inf` is intentional (matches PYSEQM); silence the
+    # numpy warning so test output stays clean.
+    with np.errstate(divide='ignore'):
+        t = 1.0 / np.asarray(0.0)
     x = np.where(x0 != 0, x0, t).reshape(-1, 1)
     a1 = np.exp(-x) / x
 
