@@ -8,10 +8,21 @@ Port of [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to App
 
 ## What's new
 
-PM6_D semi-empirical SCF on Apple Silicon, **bit-exact to PYSEQM** with no
-PYSEQM/PyTorch runtime dependency. All exposed entry points are covered by
-the test suite — see `tests/test_{pm6_d_native,pm6_d3h4,pyseqm_port,rm1_scf}.py`
-(65 tests total).
+Semi-empirical SCF on Apple Silicon — **7 methods** (RM1, AM1, PM3, PM6,
+PM6_SP, PM6_D, AM1\*) plus PM6-D3H4 post-SCF corrections — **bit-exact to
+PYSEQM** for PM6_D, with no PYSEQM/PyTorch runtime dependency. Every
+entry point is covered by `tests/test_{methods_api,pm6_d_native,pm6_d3h4,pyseqm_port,rm1_scf}.py`
+(83 tests total).
+
+| Method | Coverage | HoF (H2O, kcal/mol) | Status |
+|---|---|---:|---|
+| RM1 | H, C, N, O, F, P, S, Cl, Br, I | -57.81 | tested |
+| AM1 | H, C, N, O | -59.22 | tested |
+| PM3 | H, C, N, O, F, P, S, Cl, Br, I | -53.19 | tested |
+| PM6 / PM6_SP | H, C, N, O, F, P, S, Cl, Br, I (sp-only) | -54.19 | tested |
+| PM6_D | + d-orbitals on P, S, Cl, Br | bit-exact vs PYSEQM | tested |
+| AM1\* / RM1\* | H, C, N, O (\*-variants) | -53.71 / -54.47 | tested |
+| PM6-D3H4 | D3 dispersion + H4 H-bond + HH repulsion | post-SCF correction | tested |
 
 - **PM6_D SCF in pure NumPy** — per-pair W tensor matches PYSEQM to 2.66e-15 (machine epsilon). 27/27 SCF charge tests pass against frozen PYSEQM/MOPAC references.
 - **Full d-orbital support** — P, S, Cl (qn=3) and Br (qn=4) with the 22-integral local frame, rotated to molecular frame via Wigner D-matrices. Covers YH, YX, YY pair types.

@@ -607,8 +607,10 @@ def rm1_energy(
         to PYSEQM (validated against the MOPAC binary). Set
         ``native=True`` to run the mlxmolkit path instead.
     """
-    if method == "PM6_D" and not native and any(z in _D_ORBITAL_ELEMENTS for z in atoms):
-        return _pm6d_via_pyseqm(atoms, np.asarray(coords, dtype=np.float64))
+    # PM6_D is bit-exact via the vendored numpy PYSEQM port
+    # (mlxmolkit/rm1/_pyseqm_port/), so the native path is always used.
+    # `native` kw is kept for back-compat but is now a no-op.
+    _ = native
 
     PARAMS = get_params(method)
     coords = np.asarray(coords, dtype=np.float64)
