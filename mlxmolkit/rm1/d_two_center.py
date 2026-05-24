@@ -121,14 +121,11 @@ def _tetci_pair_w(p1, p2, coord1, coord2):
         tore = np.array([0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
                          0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0] + [0.0]*60)
     const = FakeConst()
-    try:
-        w, e1b, e2a, _, _, _, _ = two_elec_two_center_int(
-            const, idxi, idxj, ni, nj, xij, rij, Z,
-            zetas, zetap, zetad, zs, zp, zd,
-            gss, gpp, gp2, hsp, F0SD, G2SD, rho_core, alpha, chi, 'PM6'
-        )
-    except Exception:
-        return None, False
+    w, e1b, e2a, _, _, _, _ = two_elec_two_center_int(
+        const, idxi, idxj, ni, nj, xij, rij, Z,
+        zetas, zetap, zetad, zs, zp, zd,
+        gss, gpp, gp2, hsp, F0SD, G2SD, rho_core, alpha, chi, 'PM6'
+    )
     # First pair (the real pair we care about; phantom pairs come after).
     return w[0], (p1.Z >= p2.Z)
 

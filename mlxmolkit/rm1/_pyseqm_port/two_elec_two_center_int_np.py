@@ -1381,6 +1381,47 @@ def binom(a, b):
 
       return k 
 
+def _w_withquaternion_e1b_e2a(tore, ni, nj, xij, HH, XH, XX, w, wXH, wHH):
+    """Compute the electron-nuclear terms e1b, e2a from the rotated w/wXH.
+    Pulled out of w_withquaternion so the numba fast-path can return early."""
+    e1b = torch.zeros((xij.shape[0], 4, 4), dtype=w.dtype)
+    e2a = torch.zeros((xij.shape[0], 4, 4), dtype=w.dtype)
+    w_ = w.reshape(-1, 10, 10)
+    e1b[HH, 0, 0] = -tore[1] * wHH
+    e2a[HH, 0, 0] = -tore[1] * wHH
+    e1b[XH, 0, 0] = -tore[nj[XH]] * wXH[:, 0]
+    e2a[XH, 0, 0] = -tore[ni[XH]] * wXH[:, 0]
+    e2a[XH, 0, 1] = -tore[ni[XH]] * wXH[:, 1]
+    e2a[XH, 1, 1] = -tore[ni[XH]] * wXH[:, 2]
+    e2a[XH, 0, 2] = -tore[ni[XH]] * wXH[:, 3]
+    e2a[XH, 1, 2] = -tore[ni[XH]] * wXH[:, 4]
+    e2a[XH, 2, 2] = -tore[ni[XH]] * wXH[:, 5]
+    e2a[XH, 0, 3] = -tore[ni[XH]] * wXH[:, 6]
+    e2a[XH, 1, 3] = -tore[ni[XH]] * wXH[:, 7]
+    e2a[XH, 2, 3] = -tore[ni[XH]] * wXH[:, 8]
+    e2a[XH, 3, 3] = -tore[ni[XH]] * wXH[:, 9]
+    e1b[XX, 0, 0] = -tore[nj[XX]] * w_[:, 0, 0]
+    e1b[XX, 0, 1] = -tore[nj[XX]] * w_[:, 1, 0]
+    e1b[XX, 1, 1] = -tore[nj[XX]] * w_[:, 2, 0]
+    e1b[XX, 0, 2] = -tore[nj[XX]] * w_[:, 3, 0]
+    e1b[XX, 1, 2] = -tore[nj[XX]] * w_[:, 4, 0]
+    e1b[XX, 2, 2] = -tore[nj[XX]] * w_[:, 5, 0]
+    e1b[XX, 0, 3] = -tore[nj[XX]] * w_[:, 6, 0]
+    e1b[XX, 1, 3] = -tore[nj[XX]] * w_[:, 7, 0]
+    e1b[XX, 2, 3] = -tore[nj[XX]] * w_[:, 8, 0]
+    e1b[XX, 3, 3] = -tore[nj[XX]] * w_[:, 9, 0]
+    e2a[XX, 0, 1] = -tore[ni[XX]] * w_[:, 0, 1]
+    e2a[XX, 1, 1] = -tore[ni[XX]] * w_[:, 0, 2]
+    e2a[XX, 0, 2] = -tore[ni[XX]] * w_[:, 0, 3]
+    e2a[XX, 1, 2] = -tore[ni[XX]] * w_[:, 0, 4]
+    e2a[XX, 2, 2] = -tore[ni[XX]] * w_[:, 0, 5]
+    e2a[XX, 0, 3] = -tore[ni[XX]] * w_[:, 0, 6]
+    e2a[XX, 1, 3] = -tore[ni[XX]] * w_[:, 0, 7]
+    e2a[XX, 2, 3] = -tore[ni[XX]] * w_[:, 0, 8]
+    e2a[XX, 3, 3] = -tore[ni[XX]] * w_[:, 0, 9]
+    return e1b, e2a, wXH, w
+
+
 def w_withquaternion(mol,tore,ni, nj, xij, riXH, ri, wHH):
 
     dtype = xij.dtype
@@ -1395,6 +1436,33 @@ def w_withquaternion(mol,tore,ni, nj, xij, riXH, ri, wHH):
 
     w = torch.zeros(ri.shape[0], 100, dtype=dtype)
     wXH = torch.zeros(XH.sum(), 10, dtype=dtype)
+
+    # Try the numba-compiled hot kernel first (~240× faster than the
+    # python loop below). Falls back to the python path if numba is
+    # unavailable.
+    #
+    # Note: ri (and therefore w) is already XX-filtered with shape
+    # (XX.sum(), 22). riXH is already XH-filtered with shape (XH.sum(), 4).
+    # rot/rotXH were also pre-sliced above. So no further masking needed.
+    try:
+        from ._jit_kernels import _w_withquaternion_kernel, is_numba_available
+        if is_numba_available() and XX.sum() > 0:
+            ri_xx = np.ascontiguousarray(ri, dtype=np.float64)
+            riXH_xh = (np.ascontiguousarray(riXH, dtype=np.float64)
+                       if XH.sum() > 0 else np.zeros((0, 4)))
+            rot_xx = np.ascontiguousarray(rot, dtype=np.float64)
+            rotXH_xh = (np.ascontiguousarray(rotXH, dtype=np.float64)
+                        if rotXH.shape[0] > 0 else np.zeros((0, 3, 3)))
+            _w_withquaternion_kernel(
+                ri_xx, riXH_xh, rot_xx, rotXH_xh,
+                np.asarray(HH), np.asarray(XH), np.asarray(XX),
+                w, wXH,
+            )
+            return _w_withquaternion_e1b_e2a(
+                tore, ni, nj, xij, HH, XH, XX, w, wXH, wHH,
+            )
+    except ImportError:
+        pass
 
     # 1) preslice rot blocks into row‐views
     #    so r0[:,i] == rot[:,0,i],    etc.
