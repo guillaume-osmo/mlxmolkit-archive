@@ -355,7 +355,12 @@ Full nvMolKit pipeline: DG (4D) → 4D→3D collapse → setReferenceValues → 
 
 - [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) — NVIDIA's CUDA implementation (Apache 2.0)
 - [shivampatel10/mlxmolkit](https://github.com/shivampatel10/mlxmolkit) — TPM threadgroup kernels and MMFF Metal implementation
+- [PYSEQM](https://github.com/lanl/PYSEQM) — LANL semi-empirical reference (BSD-3 Clause); the NumPy port in `mlxmolkit/rm1/_pyseqm_port/` is a mechanical torch→numpy translation of selected modules
 - [RDKit blog: Butina clustering with nvMolKit](https://greglandrum.github.io/rdkit-blog/posts/2026-02-28-nvmolkit-clustering.html)
 - [MLX](https://github.com/ml-explore/mlx) — Apple's ML framework with Metal kernel support
 - [MMFF94](https://doi.org/10.1002/(SICI)1096-987X(199604)17:5/6<490::AID-JCC1>3.0.CO;2-P) — Halgren, J. Comput. Chem. 1996
 - [Butina, D. (1999)](https://doi.org/10.1021/ci9803381) — Performance of Kier-Hall and molecular connectivity indices
+
+## Acknowledgements
+
+Portions of the PM6_D / SCF / TETCI development were assisted by Claude (Anthropic). All commits are authored by the maintainer; Claude was used as a research/refactoring aide.
