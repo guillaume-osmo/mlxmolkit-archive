@@ -70,9 +70,9 @@ def rotate_integrals_to_molecular_frame(
     R_vec = coordB - coordA
     R = np.linalg.norm(R_vec)
     if R < 1e-10:
-        nA = pA.n_basis
-        nB = pB.n_basis
-        return np.zeros((nA * (nA + 1) // 2, nB * (nB + 1) // 2)), np.zeros((4, 4)), np.zeros((4, 4))
+        nA = min(pA.n_basis, 4)
+        nB = min(pB.n_basis, 4)
+        return np.zeros((4, 4, 4, 4)), np.zeros((4, 4)), np.zeros((4, 4))
 
     # Unit vector from A to B (MOPAC convention: negative for rotation)
     v = -R_vec / R
@@ -86,8 +86,9 @@ def rotate_integrals_to_molecular_frame(
     # Local-frame integrals
     ri, core, pair_type = two_center_integrals(pA, pB, R)
 
-    nA = pA.n_basis
-    nB = pB.n_basis
+    # Clamp to sp block (d-orbitals handled separately in SCF)
+    nA = min(pA.n_basis, 4)
+    nB = min(pB.n_basis, 4)
 
     # Rotate to molecular frame
     # w is stored as (kk,ll | mm,nn) with kk>=ll, mm>=nn, indexed linearly

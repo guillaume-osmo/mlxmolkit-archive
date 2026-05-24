@@ -85,7 +85,7 @@ def rm1_from_smiles(
         Result dict with energies, or None if 3D generation fails.
         Extra keys: 'smiles', 'atoms', 'coords', 'n_atoms'
     """
-    from .scf import rm1_energy
+    from .scf import nddo_energy
     from .methods import get_params
 
     result_3d = _smiles_to_3d(smiles, seed=seed)
@@ -107,12 +107,12 @@ def rm1_from_smiles(
             grad_tol=opt_grad_tol, method=method,
         )
         coords = opt_result['coords']
-        result = rm1_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
+        result = nddo_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
         result['opt_converged'] = opt_result['converged']
         result['opt_n_iter'] = opt_result['n_iter']
         result['opt_grad_rms'] = opt_result['grad_rms']
     else:
-        result = rm1_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
+        result = nddo_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
 
     result['smiles'] = smiles
     result['atoms'] = atoms
@@ -145,7 +145,7 @@ def rm1_from_smiles_batch(
     Returns:
         List of result dicts (None for failed molecules).
     """
-    from .scf import rm1_energy_batch
+    from .scf import nddo_energy_batch
     from .methods import get_params
 
     if verbose:
@@ -178,7 +178,7 @@ def rm1_from_smiles_batch(
         return [None] * len(smiles_list)
 
     # Step 2: Batch RM1 SCF
-    batch_results = rm1_energy_batch(
+    batch_results = nddo_energy_batch(
         mol_data, max_iter=max_iter, conv_tol=conv_tol,
         use_metal=use_metal, verbose=verbose, method=method,
     )

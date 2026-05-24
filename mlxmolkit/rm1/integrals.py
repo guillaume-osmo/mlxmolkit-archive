@@ -14,7 +14,7 @@ Units: eV for energies, Bohr for distances (internal), Angstrom for input.
 from __future__ import annotations
 
 import numpy as np
-from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, EV_TO_KCAL
+from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, EV_TO_KCAL, principal_qn
 
 # Physical constants
 EV = 27.21  # Hartree to eV (MOPAC convention)
@@ -39,7 +39,7 @@ def _charge_separations(p: ElementParams) -> tuple[float, float]:
         # da² = (ev/hsp)² - (ev/gsp)²  ... approximately
         # More precisely, from MOPAC's gettab.f:
         # dd[i] = (2*qn+1) * sqrt( s_exp * p_exp ) / ((s_exp + p_exp)^2 * sqrt(3))
-        qn = 2 if p.Z > 2 else 1  # principal quantum number
+        qn = principal_qn(p.Z)  # PYSEQM convention: row of periodic table
         n2 = 2 * qn + 1
         ss = p.zeta_s
         pp = p.zeta_p
@@ -52,7 +52,7 @@ def _charge_separations(p: ElementParams) -> tuple[float, float]:
 
     # Quadrupole: qa from gpp, gp2
     if p.gpp > 0 and p.gp2 > 0:
-        qn = 2 if p.Z > 2 else 1
+        qn = principal_qn(p.Z)
         n2 = 2 * qn + 1
         pp = p.zeta_p
         # qa² from Slater quadrupole integral

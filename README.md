@@ -1,9 +1,58 @@
 # mlxmolkit — GPU-accelerated molecular toolkit on Apple Silicon
 
-Port of [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to Apple Metal via [MLX](https://github.com/ml-explore/mlx). Two pipelines:
+Port of [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to Apple Metal via [MLX](https://github.com/ml-explore/mlx). Three pipelines:
 
 1. **Molecular Clustering** — Morgan FP → Tanimoto similarity → Butina clustering
 2. **3D Conformer Generation** — DG (4D) → ETK (3D) → MMFF94 optimization
+3. **PM6_D semi-empirical SCF** — full d-orbital NDDO (S/P/Cl/Br/I) with PM6-D3H4 corrections
+
+## What's new
+
+Semi-empirical SCF on Apple Silicon — **7 methods** (RM1, AM1, PM3, PM6,
+PM6_SP, PM6_D, AM1\*) plus PM6-D3H4 post-SCF corrections — **bit-exact to
+PYSEQM** for PM6_D, with no PYSEQM/PyTorch runtime dependency. Every
+entry point is covered by `tests/test_{methods_api,pm6_d_native,pm6_d3h4,pyseqm_port,rm1_scf}.py`
+(83 tests total).
+
+| Method | Coverage | HoF (H2O, kcal/mol) | Status |
+|---|---|---:|---|
+| RM1 | H, C, N, O, F, P, S, Cl, Br, I | -57.81 | tested |
+| AM1 | H, C, N, O | -59.22 | tested |
+| PM3 | H, C, N, O, F, P, S, Cl, Br, I | -53.19 | tested |
+| PM6 / PM6_SP | H, C, N, O, F, P, S, Cl, Br, I (sp-only) | -54.19 | tested |
+| PM6_D | + d-orbitals on P, S, Cl, Br | bit-exact vs PYSEQM | tested |
+| AM1\* / RM1\* | H, C, N, O (\*-variants) | -53.71 / -54.47 | tested |
+| PM6-D3H4 | D3 dispersion + H4 H-bond + HH repulsion | post-SCF correction | tested |
+
+- **PM6_D SCF in pure NumPy** — per-pair W tensor matches PYSEQM to 2.66e-15 (machine epsilon). 27/27 SCF charge tests pass against frozen PYSEQM/MOPAC references.
+- **Full d-orbital support** — P, S, Cl (qn=3) and Br (qn=4) with the 22-integral local frame, rotated to molecular frame via Wigner D-matrices. Covers YH, YX, YY pair types.
+- **PM6-D3H4 post-SCF corrections** — Grimme D3 dispersion + Rezáč–Hobza H4 hydrogen-bond + HH-repulsion.
+- **DIIS + adaptive damping SCF** — converges reliably on hard cases (CCl4, SF6, DMSO) where plain mixing freezes the wrong basin.
+- **numba JIT + einsum hot kernels** — `w_withquaternion`, `GenerateRotationMatrix`, `Rotate2Center2Electron` accelerated; ~2× end-to-end per pair (3.3 → 1.6 ms per S-C pair on M3 Max).
+- **Bit-exactness regression suite** — 23 frozen-reference tests guard the numerical invariants of the vendored PYSEQM port.
+
+### Public API
+
+```python
+from mlxmolkit.rm1 import (
+    # SCF
+    nddo_energy, nddo_energy_batch,
+    # PM6-D3H4 corrections
+    pm6_d3h4_correction, d3_energy, h4_energy, hh_repulsion,
+    # Parameters
+    METHOD_PARAMS, get_params, ElementParams,
+)
+
+# Bit-exact primitives (vendored from PYSEQM)
+from mlxmolkit.rm1._pyseqm_port import (
+    diatom_overlap_matrixD, two_elec_two_center_int,
+    qn_int, qnD_int,
+)
+
+# Example: PM6_D total energy with D3H4 corrections
+result = nddo_energy(atoms=[16, 1, 1], coords=[[0,0,0], [0.97,0,0.93], [-0.97,0,0.93]], method='PM6_D')
+correction = pm6_d3h4_correction(atoms=[16, 1, 1], coords=...)
+```
 
 ## Installation
 
@@ -44,15 +93,13 @@ result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
 
 ## Performance
 
-### Conformer Generation (1000 distinct SPICE molecules, Apple M3 Max)
+### Conformer Generation (N=20 molecules, k=50 conformers = 1000 total)
 
-Benchmark uses 1000 distinct drug-like molecules from SPICE-2.0.1 (see `data/benchmark_1000_smiles.csv`).
-
-| Scale | Pipeline | Time | Throughput |
-|-------|----------|------|-----------|
-| N=100 x k=50 | DG only | 5.6s | **900 conf/s** |
-| N=100 x k=50 | DG + ETKDGv2 | 6.6s | **761 conf/s** |
-| N=100 x k=50 | DG + ETK + MMFF | 6.6s | **758 conf/s** |
+| Pipeline | Time | Throughput | GPU Memory |
+|----------|------|-----------|------------|
+| DG only | 0.13s | 7,549 conf/s | 2.6 MB |
+| DG + ETK | 0.16s | 6,228 conf/s | 2.6 MB |
+| DG + ETK + MMFF | 0.52s | 1,908 conf/s | 5.1 MB |
 
 ### Conformer Memory Scaling (DG + ETK + MMFF, batch=500)
 
@@ -65,17 +112,26 @@ Benchmark uses 1000 distinct drug-like molecules from SPICE-2.0.1 (see `data/ben
 
 GPU memory stays constant regardless of total conformers thanks to divide-and-conquer batching.
 
-### Scale Tests (1000 distinct molecules, Apple M3 Max)
+### Scale Tests
 
-| Scale | Pipeline | Time | Throughput |
-|-------|----------|------|-----------|
-| N=1000, k=10 | DG only | 11.5s | **870 conf/s** |
-| N=1000, k=10 | DG + ETKDGv2 | 14.9s | **672 conf/s** |
-| N=1000, k=10 | DG + ETK + MMFF | 15.0s | **664 conf/s** |
+| Scale | Pipeline | Time | Throughput | Convergence |
+|-------|----------|------|-----------|-------------|
+| N=1000, k=10 | DG + ETK | 5.0s | **2,017 conf/s** | 99.7% |
+| N=1000, k=10 | DG + ETK + MMFF | 8.0s | **1,250 conf/s** | 99.7% |
+| N=10000, k=1 | DG + ETK | 17.7s | **565 conf/s** | 99.6% |
+| N=10000, k=1 | DG + ETK + MMFF | 37.9s | **264 conf/s** | 99.6% |
+| **N=10000, k=10** | **DG + ETK** | **38.1s** | **2,625 conf/s** | **99.7%** |
+| **N=10000, k=10** | **DG + ETK + MMFF** | **67.9s** | **1,473 conf/s** | **99.7%** |
 
-All stages on Metal (including MMFF94 — zero RDKit post-processing).
+100,000 conformers in a single GPU batch. All stages on Metal (including MMFF94 — zero RDKit post-processing).
 
-### Batch Size Impact
+### Batch Size Impact (N=20, k=50, C=1000)
+
+| Batch | Batches | Time | conf/s |
+|------:|--------:|-----:|-------:|
+| 100 | 10 | 0.62s | 1,610 |
+| 500 | 2 | 0.29s | 3,394 |
+| 1000+ | 1 | 0.22s | 4,442 |
 
 Larger batches = fewer kernel launches = higher throughput. Auto-sizing (default) picks the largest batch that fits in free memory.
 
@@ -123,9 +179,7 @@ The divide-and-conquer queue automatically splits into multiple batches when tot
 | 100k | 4.87s | 0.97s | **5.84s** | — | 1.3 MB |
 | 150k+ | blockwise | — | scales | — | bounded |
 
-### ETKDG Variant Comparison (N=20, k=50, same molecule)
-
-Throughput for homogeneous batches (all conformers of the same molecule, best case):
+### ETKDG Variant Comparison (N=20, k=50)
 
 | Variant | conf/s | Convergence |
 |---------|--------|-------------|
@@ -136,8 +190,6 @@ Throughput for homogeneous batches (all conformers of the same molecule, best ca
 | ETKDGv2 | 6,228 | 96.6% |
 | ETKDGv3 | 6,636 | 96.6% |
 | srETKDGv3 | 6,678 | 96.6% |
-
-Note: throughput is lower for diverse molecule batches due to variable atom counts and padding overhead. The Scale Tests section above shows realistic numbers for heterogeneous batches.
 
 ## Architecture
 
@@ -352,7 +404,12 @@ Full nvMolKit pipeline: DG (4D) → 4D→3D collapse → setReferenceValues → 
 
 - [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) — NVIDIA's CUDA implementation (Apache 2.0)
 - [shivampatel10/mlxmolkit](https://github.com/shivampatel10/mlxmolkit) — TPM threadgroup kernels and MMFF Metal implementation
+- [PYSEQM](https://github.com/lanl/PYSEQM) — LANL semi-empirical reference (BSD-3 Clause); the NumPy port in `mlxmolkit/rm1/_pyseqm_port/` is a mechanical torch→numpy translation of selected modules
 - [RDKit blog: Butina clustering with nvMolKit](https://greglandrum.github.io/rdkit-blog/posts/2026-02-28-nvmolkit-clustering.html)
 - [MLX](https://github.com/ml-explore/mlx) — Apple's ML framework with Metal kernel support
 - [MMFF94](https://doi.org/10.1002/(SICI)1096-987X(199604)17:5/6<490::AID-JCC1>3.0.CO;2-P) — Halgren, J. Comput. Chem. 1996
 - [Butina, D. (1999)](https://doi.org/10.1021/ci9803381) — Performance of Kier-Hall and molecular connectivity indices
+
+## Acknowledgements
+
+Portions of the PM6_D / SCF / TETCI development were assisted by Claude (Anthropic). All commits are authored by the maintainer; Claude was used as a research/refactoring aide.
