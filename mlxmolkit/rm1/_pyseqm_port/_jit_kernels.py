@@ -157,3 +157,107 @@ def _w_withquaternion_kernel(ri, riXH, rot, rotXH, HH_mask, XH_mask, XX_mask, w,
 
 def is_numba_available() -> bool:
     return NUMBA_AVAILABLE
+
+
+@njit(cache=True, fastmath=True)
+def _generate_rotation_matrix_kernel(P, D, matrix):
+    """Fill the (B, 15, 45) rotation matrix from the precomputed P (3x3)
+    and D (5x5) tables. matrix is zero-initialized on entry."""
+    INDX = np.array([0, 1, 3, 6, 10, 15, 21, 28, 36], dtype=np.int64)
+    B = P.shape[0]
+    for b in range(B):
+        Pb = P[b]
+        Db = D[b]
+        Mb = matrix[b]
+
+        # S-S
+        Mb[0, 0] = 1.0
+        # P-S
+        for K in range(3):
+            KL = INDX[K + 1]
+            Mb[0, KL] = Pb[K, 0]
+            Mb[1, KL] = Pb[K, 1]
+            Mb[2, KL] = Pb[K, 2]
+        # P-P diagonal
+        for K in range(3):
+            KL = INDX[K + 1] + K + 1
+            Mb[0, KL] = Pb[K, 0] * Pb[K, 0]
+            Mb[1, KL] = Pb[K, 0] * Pb[K, 1]
+            Mb[2, KL] = Pb[K, 1] * Pb[K, 1]
+            Mb[3, KL] = Pb[K, 0] * Pb[K, 2]
+            Mb[4, KL] = Pb[K, 1] * Pb[K, 2]
+            Mb[5, KL] = Pb[K, 2] * Pb[K, 2]
+        # P-P off-diagonal
+        for K in range(1, 3):
+            for L in range(K):
+                KL = INDX[K + 1] + L + 1
+                Mb[0, KL] = Pb[K, 0] * Pb[L, 0] * 2.0
+                Mb[1, KL] = Pb[K, 0] * Pb[L, 1] + Pb[K, 1] * Pb[L, 0]
+                Mb[2, KL] = Pb[K, 1] * Pb[L, 1] * 2.0
+                Mb[3, KL] = Pb[K, 0] * Pb[L, 2] + Pb[K, 2] * Pb[L, 0]
+                Mb[4, KL] = Pb[K, 1] * Pb[L, 2] + Pb[K, 2] * Pb[L, 1]
+                Mb[5, KL] = Pb[K, 2] * Pb[L, 2] * 2.0
+        # D-S
+        for K in range(5):
+            KL = INDX[K + 4]
+            Mb[0, KL] = Db[K, 0]
+            Mb[1, KL] = Db[K, 1]
+            Mb[2, KL] = Db[K, 2]
+            Mb[3, KL] = Db[K, 3]
+            Mb[4, KL] = Db[K, 4]
+        # D-P
+        for K in range(5):
+            for L in range(3):
+                KL = INDX[K + 4] + L + 1
+                Mb[0, KL] = Db[K, 0] * Pb[L, 0]
+                Mb[1, KL] = Db[K, 0] * Pb[L, 1]
+                Mb[2, KL] = Db[K, 0] * Pb[L, 2]
+                Mb[3, KL] = Db[K, 1] * Pb[L, 0]
+                Mb[4, KL] = Db[K, 1] * Pb[L, 1]
+                Mb[5, KL] = Db[K, 1] * Pb[L, 2]
+                Mb[6, KL] = Db[K, 2] * Pb[L, 0]
+                Mb[7, KL] = Db[K, 2] * Pb[L, 1]
+                Mb[8, KL] = Db[K, 2] * Pb[L, 2]
+                Mb[9, KL] = Db[K, 3] * Pb[L, 0]
+                Mb[10, KL] = Db[K, 3] * Pb[L, 1]
+                Mb[11, KL] = Db[K, 3] * Pb[L, 2]
+                Mb[12, KL] = Db[K, 4] * Pb[L, 0]
+                Mb[13, KL] = Db[K, 4] * Pb[L, 1]
+                Mb[14, KL] = Db[K, 4] * Pb[L, 2]
+        # D-D diagonal
+        for K in range(5):
+            KL = INDX[K + 4] + K + 4
+            Mb[0, KL] = Db[K, 0] * Db[K, 0]
+            Mb[1, KL] = Db[K, 0] * Db[K, 1]
+            Mb[2, KL] = Db[K, 1] * Db[K, 1]
+            Mb[3, KL] = Db[K, 0] * Db[K, 2]
+            Mb[4, KL] = Db[K, 1] * Db[K, 2]
+            Mb[5, KL] = Db[K, 2] * Db[K, 2]
+            Mb[6, KL] = Db[K, 0] * Db[K, 3]
+            Mb[7, KL] = Db[K, 1] * Db[K, 3]
+            Mb[8, KL] = Db[K, 2] * Db[K, 3]
+            Mb[9, KL] = Db[K, 3] * Db[K, 3]
+            Mb[10, KL] = Db[K, 0] * Db[K, 4]
+            Mb[11, KL] = Db[K, 1] * Db[K, 4]
+            Mb[12, KL] = Db[K, 2] * Db[K, 4]
+            Mb[13, KL] = Db[K, 3] * Db[K, 4]
+            Mb[14, KL] = Db[K, 4] * Db[K, 4]
+        # D-D off-diagonal
+        for K in range(5):
+            for L in range(K):
+                KL = INDX[K + 4] + L + 4
+                Mb[0, KL] = Db[K, 0] * Db[L, 0] * 2.0
+                Mb[1, KL] = Db[K, 0] * Db[L, 1] + Db[K, 1] * Db[L, 0]
+                Mb[2, KL] = Db[K, 1] * Db[L, 1] * 2.0
+                Mb[3, KL] = Db[K, 0] * Db[L, 2] + Db[K, 2] * Db[L, 0]
+                Mb[4, KL] = Db[K, 1] * Db[L, 2] + Db[K, 2] * Db[L, 1]
+                Mb[5, KL] = Db[K, 2] * Db[L, 2] * 2.0
+                Mb[6, KL] = Db[K, 0] * Db[L, 3] + Db[K, 3] * Db[L, 0]
+                Mb[7, KL] = Db[K, 1] * Db[L, 3] + Db[K, 3] * Db[L, 1]
+                Mb[8, KL] = Db[K, 2] * Db[L, 3] + Db[K, 3] * Db[L, 2]
+                Mb[9, KL] = Db[K, 3] * Db[L, 3] * 2.0
+                Mb[10, KL] = Db[K, 0] * Db[L, 4] + Db[K, 4] * Db[L, 0]
+                Mb[11, KL] = Db[K, 1] * Db[L, 4] + Db[K, 4] * Db[L, 1]
+                Mb[12, KL] = Db[K, 2] * Db[L, 4] + Db[K, 4] * Db[L, 2]
+                Mb[13, KL] = Db[K, 3] * Db[L, 4] + Db[K, 4] * Db[L, 3]
+                Mb[14, KL] = Db[K, 4] * Db[L, 4] * 2.0
