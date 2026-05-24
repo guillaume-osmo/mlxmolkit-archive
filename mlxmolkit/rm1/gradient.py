@@ -14,10 +14,20 @@ from .scf import rm1_energy, rm1_energy_batch
 def nddo_gradient(
     atoms: list[int],
     coords: np.ndarray,
-    step: float = 0.001,
+    step: float = 0.0005,
     method: str = 'RM1',
+    analytical: bool = True,
 ) -> tuple[float, np.ndarray]:
-    """Compute energy and numerical gradient (single molecule)."""
+    """Compute energy and gradient (single molecule).
+
+    Uses analytical (frozen-density) gradient by default — 6x faster.
+    """
+    if analytical:
+        from .anal_grad import analytical_gradient
+        result, grad = analytical_gradient(atoms, coords, method=method)
+        return result['energy_eV'], grad
+
+    # Numerical fallback
     coords = np.asarray(coords, dtype=np.float64)
     n_atoms = len(atoms)
 
@@ -261,12 +271,93 @@ def nddo_optimize(
     method: str = 'RM1',
     verbose: bool = False,
 ) -> dict:
-    """L-BFGS geometry optimization (single molecule). See nddo_optimize_batch."""
-    results = nddo_optimize_batch(
-        [(atoms, coords)], max_iter=max_iter, grad_tol=grad_tol,
-        method=method, verbose=verbose,
-    )
-    return results[0]
+    """L-BFGS geometry optimization using analytical gradient."""
+    from .anal_grad import analytical_gradient
+
+    coords = np.asarray(coords, dtype=np.float64).copy()
+    n_atoms = len(atoms)
+    n_vars = n_atoms * 3
+
+    m = 8
+    s_hist, y_hist, rho_hist = [], [], []
+
+    result, grad = analytical_gradient(atoms, coords, method=method)
+    energy = result['energy_eV']
+    grad_flat = grad.flatten()
+
+    for iteration in range(max_iter):
+        g_rms = np.sqrt(np.mean(grad_flat ** 2))
+        if verbose and (iteration % 5 == 0 or g_rms < grad_tol):
+            print(f"  opt {iteration:3d}: E={energy:.6f}, Hf={result['heat_of_formation_kcal']:.2f}, |g|={g_rms:.5f}")
+
+        if g_rms < grad_tol:
+            return {
+                'coords': coords, 'energy_eV': energy,
+                'heat_of_formation_kcal': result['heat_of_formation_kcal'],
+                'gradient': grad, 'grad_rms': g_rms,
+                'opt_converged': True, 'opt_n_iter': iteration + 1, 'converged': True,
+                'method': method, **{k: v for k, v in result.items() if k not in ('coords',)},
+            }
+
+        # L-BFGS direction
+        q = grad_flat.copy()
+        alphas = []
+        for k in range(len(s_hist) - 1, -1, -1):
+            a = rho_hist[k] * np.dot(s_hist[k], q)
+            alphas.append(a)
+            q -= a * y_hist[k]
+
+        gamma = (np.dot(s_hist[-1], y_hist[-1]) / np.dot(y_hist[-1], y_hist[-1])
+                 if s_hist else 0.1)
+        r = gamma * q
+        alphas.reverse()
+        for k in range(len(s_hist)):
+            beta = rho_hist[k] * np.dot(y_hist[k], r)
+            r += (alphas[k] - beta) * s_hist[k]
+
+        direction = -r
+        if np.dot(grad_flat, direction) > 0:
+            direction = -grad_flat
+            step = 0.05
+        else:
+            step = 1.0
+
+        # Backtracking line search
+        for ls in range(15):
+            new_coords = coords + step * direction.reshape(n_atoms, 3)
+            new_result, new_grad = analytical_gradient(atoms, new_coords, method=method)
+            if new_result['energy_eV'] <= energy + 1e-4 * step * np.dot(grad_flat, direction):
+                break
+            step *= 0.5
+        else:
+            step = 1e-4
+            new_coords = coords + step * direction.reshape(n_atoms, 3)
+            new_result, new_grad = analytical_gradient(atoms, new_coords, method=method)
+
+        old_grad = grad_flat.copy()
+        s_k = step * direction
+        coords = new_coords
+        result = new_result
+        energy = result['energy_eV']
+        grad = new_grad
+        grad_flat = grad.flatten()
+
+        y_k = grad_flat - old_grad
+        sy = np.dot(s_k, y_k)
+        if sy > 1e-10:
+            s_hist.append(s_k)
+            y_hist.append(y_k)
+            rho_hist.append(1.0 / sy)
+            if len(s_hist) > m:
+                s_hist.pop(0); y_hist.pop(0); rho_hist.pop(0)
+
+    return {
+        'coords': coords, 'energy_eV': energy,
+        'heat_of_formation_kcal': result['heat_of_formation_kcal'],
+        'gradient': grad, 'grad_rms': np.sqrt(np.mean(grad_flat ** 2)),
+        'opt_converged': False, 'opt_n_iter': max_iter, 'converged': True,
+        'method': method, **{k: v for k, v in result.items() if k not in ('coords',)},
+    }
 
 
 # Backward-compatible aliases

@@ -223,11 +223,35 @@ class MetalFockContext:
         self._kernel = _get_fock_batch_kernel()
 
     def build_fock(self, P: np.ndarray) -> np.ndarray:
-        """Build Fock from density P. Only P is transferred each call."""
-        P_gpu = mx.array(P.flatten().astype(np.float32))
+        """Build Fock from density P. Only P is transferred each call.
+
+        NumPy in / NumPy out. For all-MLX SCF loops use :meth:`build_fock_mlx`
+        instead — it avoids the per-iteration GPU→CPU round-trip.
+        """
+        P_mx = mx.array(P.flatten().astype(np.float32))
+        F_mx = self._kernel_call(P_mx)
+        mx.eval(F_mx)
+        return np.array(F_mx).reshape(self.N, self.MB, self.MB).astype(np.float64)
+
+    def build_fock_mlx(self, P_mx: mx.array) -> mx.array:
+        """Build Fock from density P (mx.array in, mx.array out, no host copy).
+
+        ``P_mx`` may be ``(N, MB, MB)`` or pre-flattened ``(N*MB*MB,)``;
+        returns ``(N, MB, MB)`` ``mx.array`` of dtype ``float32``.
+        """
+        if P_mx.ndim == 3:
+            P_flat = mx.reshape(P_mx, (self.n_elements,))
+        else:
+            P_flat = P_mx
+        if P_flat.dtype != mx.float32:
+            P_flat = P_flat.astype(mx.float32)
+        F_flat = self._kernel_call(P_flat)
+        return mx.reshape(F_flat, (self.N, self.MB, self.MB))
+
+    def _kernel_call(self, P_flat_mx: mx.array) -> mx.array:
         outputs = self._kernel(
             inputs=[
-                self._H_core, P_gpu, self._w,
+                self._H_core, P_flat_mx, self._w,
                 self._atom_params, self._atom_map, self._type_map,
                 self._atom_starts, self._n_atoms_arr, self._n_basis_arr,
                 self._config,
@@ -237,8 +261,7 @@ class MetalFockContext:
             grid=(self.n_elements, 1, 1),
             threadgroup=(min(256, self.n_elements), 1, 1),
         )
-        mx.eval(outputs[0])
-        return np.array(outputs[0]).reshape(self.N, self.MB, self.MB).astype(np.float64)
+        return outputs[0]
 
 
 def build_fock_batch_metal(batch) -> np.ndarray:

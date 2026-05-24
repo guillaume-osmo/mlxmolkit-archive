@@ -17,7 +17,7 @@ Reference: repp.f in MOPAC, two_elec_two_center_int_local_frame.py in PYSEQM.
 from __future__ import annotations
 
 import numpy as np
-from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR
+from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, principal_qn
 
 EV = 27.21  # Hartree to eV (MOPAC convention)
 
@@ -35,7 +35,9 @@ def _compute_multipole_params(p: ElementParams) -> tuple[float, float, float, fl
     if p.n_basis == 1:
         return 0.0, 0.0, rho0, 0.0, 0.0
 
-    qn = 2 if p.Z > 2 else 1
+    # PYSEQM uses periodic-row qn: 2 for C-F, 3 for P-Cl, 4 for Br, 5 for I.
+    # Earlier this was hardcoded to 2 for all Z>2 → broke S/Cl/Br/I multipoles.
+    qn = principal_qn(p.Z)
     zs = p.zeta_s
     zp = p.zeta_p
 

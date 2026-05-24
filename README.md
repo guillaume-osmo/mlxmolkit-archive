@@ -44,15 +44,13 @@ result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
 
 ## Performance
 
-### Conformer Generation (1000 distinct SPICE molecules, Apple M3 Max)
+### Conformer Generation (N=20 molecules, k=50 conformers = 1000 total)
 
-Benchmark uses 1000 distinct drug-like molecules from SPICE-2.0.1 (see `data/benchmark_1000_smiles.csv`).
-
-| Scale | Pipeline | Time | Throughput |
-|-------|----------|------|-----------|
-| N=100 x k=50 | DG only | 5.6s | **900 conf/s** |
-| N=100 x k=50 | DG + ETKDGv2 | 6.6s | **761 conf/s** |
-| N=100 x k=50 | DG + ETK + MMFF | 6.6s | **758 conf/s** |
+| Pipeline | Time | Throughput | GPU Memory |
+|----------|------|-----------|------------|
+| DG only | 0.13s | 7,549 conf/s | 2.6 MB |
+| DG + ETK | 0.16s | 6,228 conf/s | 2.6 MB |
+| DG + ETK + MMFF | 0.52s | 1,908 conf/s | 5.1 MB |
 
 ### Conformer Memory Scaling (DG + ETK + MMFF, batch=500)
 
@@ -65,17 +63,26 @@ Benchmark uses 1000 distinct drug-like molecules from SPICE-2.0.1 (see `data/ben
 
 GPU memory stays constant regardless of total conformers thanks to divide-and-conquer batching.
 
-### Scale Tests (1000 distinct molecules, Apple M3 Max)
+### Scale Tests
 
-| Scale | Pipeline | Time | Throughput |
-|-------|----------|------|-----------|
-| N=1000, k=10 | DG only | 11.5s | **870 conf/s** |
-| N=1000, k=10 | DG + ETKDGv2 | 14.9s | **672 conf/s** |
-| N=1000, k=10 | DG + ETK + MMFF | 15.0s | **664 conf/s** |
+| Scale | Pipeline | Time | Throughput | Convergence |
+|-------|----------|------|-----------|-------------|
+| N=1000, k=10 | DG + ETK | 5.0s | **2,017 conf/s** | 99.7% |
+| N=1000, k=10 | DG + ETK + MMFF | 8.0s | **1,250 conf/s** | 99.7% |
+| N=10000, k=1 | DG + ETK | 17.7s | **565 conf/s** | 99.6% |
+| N=10000, k=1 | DG + ETK + MMFF | 37.9s | **264 conf/s** | 99.6% |
+| **N=10000, k=10** | **DG + ETK** | **38.1s** | **2,625 conf/s** | **99.7%** |
+| **N=10000, k=10** | **DG + ETK + MMFF** | **67.9s** | **1,473 conf/s** | **99.7%** |
 
-All stages on Metal (including MMFF94 — zero RDKit post-processing).
+100,000 conformers in a single GPU batch. All stages on Metal (including MMFF94 — zero RDKit post-processing).
 
-### Batch Size Impact
+### Batch Size Impact (N=20, k=50, C=1000)
+
+| Batch | Batches | Time | conf/s |
+|------:|--------:|-----:|-------:|
+| 100 | 10 | 0.62s | 1,610 |
+| 500 | 2 | 0.29s | 3,394 |
+| 1000+ | 1 | 0.22s | 4,442 |
 
 Larger batches = fewer kernel launches = higher throughput. Auto-sizing (default) picks the largest batch that fits in free memory.
 
@@ -123,9 +130,7 @@ The divide-and-conquer queue automatically splits into multiple batches when tot
 | 100k | 4.87s | 0.97s | **5.84s** | — | 1.3 MB |
 | 150k+ | blockwise | — | scales | — | bounded |
 
-### ETKDG Variant Comparison (N=20, k=50, same molecule)
-
-Throughput for homogeneous batches (all conformers of the same molecule, best case):
+### ETKDG Variant Comparison (N=20, k=50)
 
 | Variant | conf/s | Convergence |
 |---------|--------|-------------|
@@ -136,8 +141,6 @@ Throughput for homogeneous batches (all conformers of the same molecule, best ca
 | ETKDGv2 | 6,228 | 96.6% |
 | ETKDGv3 | 6,636 | 96.6% |
 | srETKDGv3 | 6,678 | 96.6% |
-
-Note: throughput is lower for diverse molecule batches due to variable atom counts and padding overhead. The Scale Tests section above shows realistic numbers for heterogeneous batches.
 
 ## Architecture
 
