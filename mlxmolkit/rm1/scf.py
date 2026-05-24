@@ -260,41 +260,24 @@ def _build_fock(H, P, info, atoms, coords):
                     F[pk, pl] += P[pk, pl] * pp_fac_off
                     F[pl, pk] += P[pl, pk] * pp_fac_off
 
-            # d-orbital cross terms via W integrals.
-            # IMPORTANT: PYSEQM uses TAIL exponents AND a 243-element W
-            # assembly formula that differs from mlxmolkit's w_integrals.py
-            # (mlxmolkit version off by ~30 eV on the 11 R-parameters).
-            # We delegate to PYSEQM's calc_integral for now (BSD-3, cited);
-            # this fixes PH3/HCl native to MOPAC-accuracy. The pure-mlxmolkit
-            # port of calc_integral is documented in NATIVE_STATUS.md.
+            # d-orbital cross terms via W integrals (pure NumPy).
+            # Native compute_w_integrals matches PYSEQM's calc_integral to
+            # machine precision (~1e-14) after the IntRep/IntRf2 table fix.
+            # Uses TAIL exponents (PM6_TAIL_EXPONENTS) — the PYSEQM
+            # convention for d-orbital atoms. No PyTorch dependency.
             from .fock_d import fock_d_one_center, TRIL_I, TRIL_J
             from .tetci_multipole_pyseqm import PM6_TAIL_EXPONENTS
-            try:
-                import torch
-                from seqm.seqm_functions.build_two_elec_one_center_int_D import calc_integral as _py_calc
-                if p.Z in PM6_TAIL_EXPONENTS:
-                    zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
-                else:
-                    zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d
-                z_t = torch.tensor([int(p.Z)])
-                P0_t = torch.zeros((1, 9, 9), dtype=torch.float64)
-                W_t = _py_calc(
-                    torch.tensor([zs_t], dtype=torch.float64),
-                    torch.tensor([zp_t], dtype=torch.float64),
-                    torch.tensor([zd_t], dtype=torch.float64),
-                    z_t, 1, torch.tensor([0]), P0_t,
-                    torch.tensor([getattr(p, 'F0SD', 0.0)], dtype=torch.float64),
-                    torch.tensor([getattr(p, 'G2SD', 0.0)], dtype=torch.float64),
-                )
-                W = W_t.detach().cpu().numpy()[0]
-            except ImportError:
-                from .w_integrals import compute_w_integrals
-                from .params import principal_qn
-                qn_sp = principal_qn(p.Z)
-                W = compute_w_integrals(
-                    p.zeta_s, p.zeta_p, p.zeta_d, qn_sp, qn_sp,
-                    getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0),
-                )
+            from .w_integrals import compute_w_integrals
+            from .params import principal_qn
+            qn_sp = principal_qn(p.Z)
+            if p.Z in PM6_TAIL_EXPONENTS:
+                zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
+            else:
+                zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d
+            W = compute_w_integrals(
+                zs_t, zp_t, zd_t, qn_sp, qn_sp,
+                getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0),
+            )
             # W integrals: ADDITIVE d-orbital contribution on top of sp formulas
             # W encodes s-d, p-d, and d-d cross-terms (NOT sp-sp replacement)
             F = fock_d_one_center(F, P, W, starts[i], n_basis=9)

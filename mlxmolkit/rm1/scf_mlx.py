@@ -45,33 +45,23 @@ from .params import principal_qn
 def _precompute_one_center_W(p):
     """Return the 243-element one-center W tensor for a d-orbital atom.
 
-    Uses PYSEQM's calc_integral (BSD-3, tail exponents).
+    Pure NumPy via compute_w_integrals — matches PYSEQM's calc_integral to
+    machine precision (~1e-14). No PyTorch dependency.
     """
     if p.n_basis != 9:
         return None
     from .tetci_multipole_pyseqm import PM6_TAIL_EXPONENTS
-    try:
-        import torch
-        prev = torch.get_default_dtype()
-        torch.set_default_dtype(torch.float64)
-        from seqm.seqm_functions.build_two_elec_one_center_int_D import calc_integral
-        if p.Z in PM6_TAIL_EXPONENTS:
-            zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
-        else:
-            zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d
-        P0 = torch.zeros((1, 9, 9), dtype=torch.float64)
-        W_t = calc_integral(
-            torch.tensor([zs_t], dtype=torch.float64),
-            torch.tensor([zp_t], dtype=torch.float64),
-            torch.tensor([zd_t], dtype=torch.float64),
-            torch.tensor([int(p.Z)]), 1, torch.tensor([0]), P0,
-            torch.tensor([getattr(p, 'F0SD', 0.0)], dtype=torch.float64),
-            torch.tensor([getattr(p, 'G2SD', 0.0)], dtype=torch.float64),
-        )
-        torch.set_default_dtype(prev)
-        return W_t.detach().cpu().numpy()[0]
-    except ImportError:
-        return None
+    from .w_integrals import compute_w_integrals
+    from .params import principal_qn
+    qn = principal_qn(p.Z)
+    if p.Z in PM6_TAIL_EXPONENTS:
+        zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
+    else:
+        zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d
+    return compute_w_integrals(
+        zs_t, zp_t, zd_t, qn, qn,
+        getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0),
+    )
 
 
 def _precompute_pair_w_sp(pA, pB, coordA, coordB):
