@@ -1,9 +1,20 @@
 # mlxmolkit — GPU-accelerated molecular toolkit on Apple Silicon
 
-Port of [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to Apple Metal via [MLX](https://github.com/ml-explore/mlx). Two pipelines:
+Port of [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to Apple Metal via [MLX](https://github.com/ml-explore/mlx). Three pipelines:
 
 1. **Molecular Clustering** — Morgan FP → Tanimoto similarity → Butina clustering
 2. **3D Conformer Generation** — DG (4D) → ETK (3D) → MMFF94 optimization
+3. **PM6_D semi-empirical SCF** — full d-orbital NDDO (S/P/Cl/Br/I) with PM6-D3H4 corrections
+
+## What's new
+
+- **PM6_D SCF in pure NumPy** — no PYSEQM/PyTorch runtime dependency. Per-pair W tensor matches PYSEQM to 2.66e-15 (machine epsilon). 27/27 SCF charge tests pass against frozen PYSEQM/MOPAC references.
+- **Full d-orbital support** — P, S, Cl (qn=3) and Br (qn=4) with the 22-integral local frame, rotated to molecular frame via Wigner D-matrices. Covers YH, YX, YY pair types.
+- **PM6-D3H4 post-SCF corrections** — Grimme D3 dispersion + Rezáč–Hobza H4 hydrogen-bond + HH-repulsion.
+- **DIIS + adaptive damping SCF** — converges reliably on hard cases (CCl4, SF6, DMSO) where plain mixing freezes the wrong basin.
+- **numba JIT + einsum hot kernels** — `w_withquaternion`, `GenerateRotationMatrix`, `Rotate2Center2Electron` accelerated; ~2× end-to-end per pair.
+- **MLX GPU SCF prototypes** — single-mol Metal SCF (`scf_gpu.py`) and batched B-mol SCF (`scf_batched_gpu.py`) via mlx-addons.
+- **Bit-exactness regression suite** — 23 frozen-reference tests in `tests/test_pyseqm_port.py` guard the numerical invariants of the vendored port.
 
 ## Installation
 
