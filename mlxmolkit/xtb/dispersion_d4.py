@@ -34,6 +34,7 @@ from __future__ import annotations
 import numpy as np
 
 GFN2_D4_PARAMS = {"s6": 1.0, "s8": 2.7, "a1": 0.52, "a2": 5.0, "s9": 5.0}
+_ANG_TO_BOHR = 1.8897259886
 
 
 def d4_dispersion_gfn2(
@@ -78,10 +79,36 @@ def _d4_simple_dftd4(atoms, coords_ang) -> float:
             "Install via 'conda install -c conda-forge dftd4-python' "
             "or 'pip install dftd4'."
         ) from e
-    _ANG_TO_BOHR = 1.8897259886
     nums = np.asarray(atoms, dtype=np.int32)
     pos_bohr = np.asarray(coords_ang, dtype=np.float64) * _ANG_TO_BOHR
     m = DispersionModel(nums, pos_bohr)
     p = DampingParam(**GFN2_D4_PARAMS)
     res = m.get_dispersion(p, grad=False)
     return float(res["energy"])
+
+
+def d4_dispersion_gradient_gfn2(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    backend: str = "simple-dftd4",
+) -> np.ndarray:
+    """GFN2 D4 dispersion gradient in Hartree / Angstrom."""
+
+    if backend != "simple-dftd4":
+        raise ValueError(f"gradient backend not available: {backend!r}")
+    try:
+        from dftd4.interface import DispersionModel, DampingParam
+    except ImportError as e:
+        raise ImportError(
+            "simple-dftd4 backend requires the 'dftd4' Python package. "
+            "Install via 'conda install -c conda-forge dftd4-python' "
+            "or 'pip install dftd4'."
+        ) from e
+
+    nums = np.asarray(atoms, dtype=np.int32)
+    pos_bohr = np.asarray(coords_ang, dtype=np.float64) * _ANG_TO_BOHR
+    m = DispersionModel(nums, pos_bohr)
+    p = DampingParam(**GFN2_D4_PARAMS)
+    res = m.get_dispersion(p, grad=True)
+    return np.asarray(res["gradient"], dtype=np.float64) * _ANG_TO_BOHR

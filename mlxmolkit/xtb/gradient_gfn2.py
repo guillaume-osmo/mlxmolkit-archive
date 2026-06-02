@@ -10,22 +10,20 @@ Two paths:
 * :func:`gfn2_gradient` (``method='analytical'``) — analytical
   band/SCC piece (Pulay + HF-diag + HF-offdiag with GFN2's
   ``K · ζ · h_avg · Π · S`` form + Coulomb + V·∂S·P cross +
-  closed-form repulsion), with finite differences on AES, D4, and
-  solvation (closed-form energies; no SCF needed → far cheaper than
-  the 6N+1 SCF cost). Default.
+  closed-form repulsion), with a one-pass AES derivative and finite
+  differences on D4/solvation wrapper pieces. Default.
 
-Note on AES: the *fully* analytical AES gradient (xtb's ``aniso_grad``)
-needs ``∂dpint/∂r`` + ``∂qpint/∂r`` + ``∂radCN/∂r`` kernels — those
-are deferred to a future commit. The current FD-on-AES path gives
-FD-floor accuracy (~1e-6 Ha/Å) at ``2N + 1`` extra closed-form energy
-evals (no SCF).
+Note on AES: the AES term uses an analytical Mulliken multipole chain
+(``∂dpint/∂r`` + ``∂qpint/∂r``) plus explicit pair/damping/CN-coordinate
+derivatives. The optional C++ extension makes the multipole derivative
+kernel practical for medium-size organics.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from .dispersion_d4 import d4_dispersion_gfn2
+from .dispersion_d4 import d4_dispersion_gfn2, d4_dispersion_gradient_gfn2
 from .gradient_coulomb import coulomb_gradient
 from .gradient_gfn0 import cn_gradient
 from .gradient_hf_diag import hf_diagonal_gradient
@@ -35,6 +33,12 @@ from .multipole_grad import multipole_gradient, shift_multipole_grad
 from .overlap_grad import overlap_gradient
 from .params_gfn2 import GFN2_PARAMS
 from .scf_gfn2 import gfn2_energy
+
+try:
+    from .multipole_integrals_cpp import CPP_AVAILABLE, overlap_gradient_cpp
+except Exception:  # pragma: no cover - optional extension
+    CPP_AVAILABLE = False
+    overlap_gradient_cpp = None
 
 
 _ANG_TO_BOHR = 1.8897259886
@@ -217,6 +221,9 @@ def gfn2_gradient_analytical(
     S_sao = res["S"]
     S_cao = res["S_cao"]
     T = res["T_cao_to_sao"]
+    T_is_identity = (
+        T.shape[0] == T.shape[1] and np.array_equal(T, np.eye(T.shape[0]))
+    )
     cao_basis = res["cao_basis"]
     sao_basis = res["sao_basis"]
     cao_bf_shells = res["cao_bf_shells"]
@@ -229,13 +236,20 @@ def gfn2_gradient_analytical(
     coords_bohr = coords * _ANG_TO_BOHR
 
     # ----- 1. Pulay term: -trace(W · ∂S/∂r), in SAO basis -----
-    dSA_cao, dSB_cao = overlap_gradient(cao_basis)
+    if CPP_AVAILABLE:
+        dSA_cao, dSB_cao = overlap_gradient_cpp(cao_basis)
+    else:
+        dSA_cao, dSB_cao = overlap_gradient(cao_basis)
     n_sao = T.shape[0]
-    dSA_sao = np.zeros((3, n_sao, n_sao))
-    dSB_sao = np.zeros((3, n_sao, n_sao))
-    for ax in range(3):
-        dSA_sao[ax] = T @ dSA_cao[ax] @ T.T
-        dSB_sao[ax] = T @ dSB_cao[ax] @ T.T
+    if T_is_identity:
+        dSA_sao = dSA_cao
+        dSB_sao = dSB_cao
+    else:
+        dSA_sao = np.zeros((3, n_sao, n_sao))
+        dSB_sao = np.zeros((3, n_sao, n_sao))
+        for ax in range(3):
+            dSA_sao[ax] = T @ dSA_cao[ax] @ T.T
+            dSB_sao[ax] = T @ dSB_cao[ax] @ T.T
 
     W = energy_weighted_density(C, eigvals, n_occ)
     sao_atom_of = np.array([b.atom_idx for b in sao_basis], dtype=np.int64)
@@ -267,7 +281,7 @@ def gfn2_gradient_analytical(
     g_hf_diag_b = g_hf_diag_a / _ANG_TO_BOHR
 
     # ----- 3. HF off-diagonal in CAO -----
-    P_cao_eff = T.T @ P_sao @ T
+    P_cao_eff = P_sao if T_is_identity else T.T @ P_sao @ T
     g_hf_off_b = hf_offdiag_gradient_gfn2(
         atoms, coords, cao_basis, cao_bf_shells,
         P_cao_eff, S_cao, cn_local, dcn_dr, dSA_cao, dSB_cao,
@@ -318,23 +332,30 @@ def gfn2_gradient_analytical(
     # ----- 5. Repulsion (analytical) -----
     g_rep_a = _gfn2_repulsion_gradient(atoms, coords)
 
-    # ----- 6/7. AES + D4 (FD on full E_aes recompute) -----
-    # FD recomputes everything downstream of P (dipm/qp via Mulliken
-    # from perturbed dpint/qpint, gab3/gab5 from radcn(CN), rij). The
-    # dipm/qp chain DOES contribute to dE_total/dR (E_aes is not
-    # variational in those quantities — they're Mulliken-derived from
-    # P, not independent variational parameters). Captures the full
-    # ∂E_aes/∂R; ~6e-3 Ha/Å residual on H2O empirically.
-    g_aes_a = _fd_grad_scalar(
-        atoms, coords,
-        lambda c: _aes_full_energy_at(atoms, c, P_sao, qsh, shell_atom),
-        h=fd_h_aux,
+    # ----- 6/7. AES + D4 -----
+    # AES is one-pass: analytical Mulliken multipole chain plus explicit
+    # pair/damping/CN-coordinate derivatives. D4 is still FD through the
+    # external dftd4 wrapper.
+    from .gradient_aes_gfn2 import aes_gradient_frozen_density_state
+
+    g_aes_a = aes_gradient_frozen_density_state(
+        atoms,
+        coords,
+        P_sao,
+        qsh,
+        shell_atom,
+        S_sao,
+        res["dpint"],
+        res["qpint"],
+        aoat,
+        cao_basis,
+        T,
+        dSA_sao,
+        dSB_sao,
+        cn=cn_local,
+        dcn_dr=dcn_dr,
     )
-    g_d4_a = _fd_grad_scalar(
-        atoms, coords,
-        lambda c: d4_dispersion_gfn2(atoms, c, cn=cn_local, q=res["atom_charges"]),
-        h=fd_h_aux,
-    )
+    g_d4_a = d4_dispersion_gradient_gfn2(atoms, coords)
 
     # NOTE on the F_aes band gradient cancellation: in mlxmolkit's
     # GFN2 SCF, E_aes is from aniso_electro (not fockelectro), but the
@@ -379,7 +400,7 @@ def gfn2_gradient_analytical(
             "aes": g_aes_a,
             "dispersion": g_d4_a,
         },
-        "n_calls": 1 + 6 * n_atoms * 3,  # 1 SCF + FD on AES + D4 + band_aes
+        "n_calls": 1 + 6 * n_atoms,  # 1 SCF + FD on D4
     }
 
 

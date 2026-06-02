@@ -53,18 +53,19 @@ def hf_offdiag_gradient_gfn2(
 ) -> np.ndarray:
     """GFN2 off-diagonal H0 chain rule on ``K · ζ · h_avg · Π · S``."""
     n_atoms = len(atoms_list)
-    n_basis = len(cao_basis)
     coords = np.asarray(coords_ang, dtype=np.float64)
     coords_bohr = coords * _ANG_TO_BOHR
 
+    bf_atom = np.array([bf.atom_idx for bf in cao_basis], dtype=np.int64)
+    bf_l = np.array([sh.l for sh in cao_bf_shells], dtype=np.int64)
+    bf_h = np.array([sh.h for sh in cao_bf_shells], dtype=np.float64)
+    bf_kcn = np.array([sh.kcn for sh in cao_bf_shells], dtype=np.float64)
+    bf_zeta = np.array([sh.zeta for sh in cao_bf_shells], dtype=np.float64)
+    bf_kpoly = np.array([sh.k_poly for sh in cao_bf_shells], dtype=np.float64)
+
     # Per-CAO-BF self-energy + ∂selfE/∂CN. GFN2's kCN is already eV/CN.
-    selfE_eV = np.zeros(n_basis, dtype=np.float64)
-    d_selfE_d_cn = np.zeros(n_basis, dtype=np.float64)
-    for mu in range(n_basis):
-        s_mu = cao_bf_shells[mu]
-        A = cao_basis[mu].atom_idx
-        selfE_eV[mu] = s_mu.h - s_mu.kcn * cn[A]
-        d_selfE_d_cn[mu] = -s_mu.kcn  # ∂selfE_μ / ∂CN_A in eV/CN
+    selfE_eV = bf_h - bf_kcn * cn[bf_atom]
+    d_selfE_d_cn = -bf_kcn  # ∂selfE_μ / ∂CN_A in eV/CN
 
     g_glob = GFN2_GLOBALS
     en_atoms = np.array(
@@ -81,73 +82,76 @@ def hf_offdiag_gradient_gfn2(
 
     grad = np.zeros((n_atoms, 3), dtype=np.float64)
 
-    for mu in range(n_basis):
-        bm = cao_basis[mu]
-        s_mu = cao_bf_shells[mu]
-        A = bm.atom_idx
-        for nu in range(n_basis):
-            if mu == nu:
-                continue
-            bn = cao_basis[nu]
-            B = bn.atom_idx
-            if A == B:
-                continue
-            s_nu = cao_bf_shells[nu]
-            l_mu = s_mu.l
-            l_nu = s_nu.l
+    A = bf_atom[:, None]
+    B = bf_atom[None, :]
+    mask = A != B
 
-            # K_AB · ζ_ij — both geometry-independent.
-            d_chi = en_atoms[A] - en_atoms[B]
-            den2 = d_chi * d_chi
-            enpoly = 1.0 + enscale_ij * den2
-            K_AB = _shell_kscale(l_mu, l_nu) * enpoly
-            zi = s_mu.zeta
-            zj = s_nu.zeta
-            zeta_ij = (2.0 * np.sqrt(zi * zj) / (zi + zj)) ** g_glob.wexp
-            K_eff = K_AB * zeta_ij  # the constant prefactor in front of h_avg·Π·S
+    k_lut = np.empty((4, 4), dtype=np.float64)
+    for l1 in range(4):
+        for l2 in range(4):
+            k_lut[l1, l2] = _shell_kscale(l1, l2)
 
-            # Geometry: u, Π, R_AB.
-            R_vec_bohr = coords_bohr[A] - coords_bohr[B]
-            R_AB = float(np.linalg.norm(R_vec_bohr))
-            r_sum_bohr = float(r_A_bohr[A] + r_A_bohr[B])
-            if r_sum_bohr < 1e-12 or R_AB < 1e-12:
-                continue
-            u = float(np.sqrt(R_AB / r_sum_bohr))
-            alpha_mu = 0.01 * s_mu.k_poly
-            alpha_nu = 0.01 * s_nu.k_poly
-            pi_A = 1.0 + alpha_mu * u
-            pi_B = 1.0 + alpha_nu * u
-            Pi = pi_A * pi_B
+    # K_AB · ζ_ij — both geometry-independent except for atom labels.
+    d_chi = en_atoms[A] - en_atoms[B]
+    enpoly = 1.0 + enscale_ij * d_chi * d_chi
+    zi = bf_zeta[:, None]
+    zj = bf_zeta[None, :]
+    zeta_ij = (2.0 * np.sqrt(zi * zj) / (zi + zj)) ** g_glob.wexp
+    K_eff = k_lut[bf_l[:, None], bf_l[None, :]] * enpoly * zeta_ij
 
-            h_avg_h = 0.5 * (selfE_eV[mu] + selfE_eV[nu]) * _HARTREE_PER_EV
-            S_munu = float(S_cao[mu, nu])
-            P_munu = float(P_cao[mu, nu])
+    # Geometry: u, Π, R_AB.
+    bf_coords = coords_bohr[bf_atom]
+    R_vec = bf_coords[:, None, :] - bf_coords[None, :, :]
+    R = np.linalg.norm(R_vec, axis=2)
+    r_sum = r_A_bohr[A] + r_A_bohr[B]
+    safe = mask & (R > 1e-12) & (r_sum > 1e-12)
+    R_safe = np.where(safe, R, 1.0)
+    r_sum_safe = np.where(safe, r_sum, 1.0)
+    u = np.sqrt(R_safe / r_sum_safe)
+    alpha_mu = 0.01 * bf_kpoly[:, None]
+    alpha_nu = 0.01 * bf_kpoly[None, :]
+    Pi = (1.0 + alpha_mu * u) * (1.0 + alpha_nu * u)
 
-            # Term 1: K_eff · ∂h_avg/∂r · Π · S · P
-            common = K_eff * Pi * S_munu * P_munu
-            half_ha_per_ev = 0.5 * _HARTREE_PER_EV
-            coef_A = common * half_ha_per_ev * d_selfE_d_cn[mu]
-            coef_B = common * half_ha_per_ev * d_selfE_d_cn[nu]
-            grad += coef_A * dcn_dr[A, :, :] / _ANG_TO_BOHR
-            grad += coef_B * dcn_dr[B, :, :] / _ANG_TO_BOHR
+    h_avg_h = 0.5 * (selfE_eV[:, None] + selfE_eV[None, :]) * _HARTREE_PER_EV
+    pair_sp = np.where(safe, S_cao * P_cao, 0.0)
 
-            # Term 2: K_eff · h_avg · ∂Π/∂r · S · P
-            du_dR = 1.0 / (2.0 * u * r_sum_bohr)
-            dPi_dR = du_dR * (
-                (alpha_mu + alpha_nu) + 2.0 * alpha_mu * alpha_nu * u
-            )
-            unit_AB = R_vec_bohr / R_AB
-            term2_A = K_eff * h_avg_h * dPi_dR * S_munu * P_munu * unit_AB
-            grad[A] += term2_A
-            grad[B] -= term2_A
+    # Term 1: K_eff · ∂h_avg/∂r · Π · S · P
+    common = K_eff * Pi * pair_sp
+    half_ha_per_ev = 0.5 * _HARTREE_PER_EV
+    cn_coef = np.bincount(
+        bf_atom,
+        weights=np.sum(common, axis=1) * half_ha_per_ev * d_selfE_d_cn,
+        minlength=n_atoms,
+    )
+    cn_coef += np.bincount(
+        bf_atom,
+        weights=np.sum(common, axis=0) * half_ha_per_ev * d_selfE_d_cn,
+        minlength=n_atoms,
+    )
 
-            # Term 3: K_eff · h_avg · Π · ∂S/∂r · P
-            pref3 = K_eff * h_avg_h * Pi * P_munu
-            grad[A, 0] += pref3 * dSA[0, mu, nu]
-            grad[A, 1] += pref3 * dSA[1, mu, nu]
-            grad[A, 2] += pref3 * dSA[2, mu, nu]
-            grad[B, 0] += pref3 * dSB[0, mu, nu]
-            grad[B, 1] += pref3 * dSB[1, mu, nu]
-            grad[B, 2] += pref3 * dSB[2, mu, nu]
+    # Term 2: K_eff · h_avg · ∂Π/∂r · S · P
+    dPi_dR = (
+        ((alpha_mu + alpha_nu) + 2.0 * alpha_mu * alpha_nu * u)
+        / (2.0 * u * r_sum_safe)
+    )
+    unit = R_vec / R_safe[:, :, None]
+    term2 = (K_eff * h_avg_h * dPi_dR * pair_sp)[:, :, None] * unit
+    row_term2 = np.sum(term2, axis=1)
+    col_term2 = np.sum(term2, axis=0)
+    for ax in range(3):
+        grad[:, ax] += np.bincount(
+            bf_atom,
+            weights=row_term2[:, ax] - col_term2[:, ax],
+            minlength=n_atoms,
+        )
 
+    # Term 3: K_eff · h_avg · Π · ∂S/∂r · P
+    pref3 = np.where(safe, K_eff * h_avg_h * Pi * P_cao, 0.0)
+    for ax in range(3):
+        row = np.sum(pref3 * dSA[ax], axis=1)
+        col = np.sum(pref3 * dSB[ax], axis=0)
+        grad[:, ax] += np.bincount(bf_atom, weights=row, minlength=n_atoms)
+        grad[:, ax] += np.bincount(bf_atom, weights=col, minlength=n_atoms)
+
+    grad += np.tensordot(cn_coef, dcn_dr, axes=(0, 0)) / _ANG_TO_BOHR
     return grad

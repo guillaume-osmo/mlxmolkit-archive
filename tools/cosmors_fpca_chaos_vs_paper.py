@@ -74,12 +74,17 @@ def main() -> None:
     # === Stage 1: paper-subset FPCA ===
     from rdkit import Chem
 
-    canon_to_row = {}
+    canon_to_row: dict[str, int] = {}
+    canon_no_stereo_to_row: dict[str, int] = {}
     for i, smi in enumerate(canonical_smiles):
         if smi:
             m = Chem.MolFromSmiles(smi)
             if m:
                 canon_to_row[Chem.MolToSmiles(m)] = i
+                # Also index stereo-stripped form as fallback for paper
+                # mols whose stereo isomer in CHAOS differs.
+                ns = Chem.MolToSmiles(m, isomericSmiles=False)
+                canon_no_stereo_to_row.setdefault(ns, i)
 
     cache = json.loads(args.cache.read_text())
     paper = pd.read_excel(args.paper_xlsx, sheet_name="Database", header=0)
@@ -100,7 +105,12 @@ def main() -> None:
         canon = Chem.MolToSmiles(m)
         row_idx = canon_to_row.get(canon)
         if row_idx is None:
-            continue
+            # Fallback: match without stereochemistry (FPCA is essentially
+            # stereo-invariant for the small mols where this matters).
+            canon_no_stereo = Chem.MolToSmiles(m, isomericSmiles=False)
+            row_idx = canon_no_stereo_to_row.get(canon_no_stereo)
+            if row_idx is None:
+                continue
         paper_match.append({
             "name": name, "cas": cas, "smiles": smi, "canon": canon,
             "chaos_row": row_idx,

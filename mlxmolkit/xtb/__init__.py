@@ -69,6 +69,20 @@ from .cosmo_sigma import (  # noqa: F401
     write_cosmo_file,
     OPENCOSMORS25A_PARAMS,
 )
+from .sigma_features import (  # noqa: F401
+    DEFAULT_SIGMA_GRID_E_PER_A2,
+    sigma_feature_tensors,
+)
+from .cosmors_activity import (  # noqa: F401
+    ActivityResult,
+    activity_coefficients,
+    estimate_delta_h_fusion_walden,
+    ideal_solid_solubility_ln_x,
+    make_cosmors,
+    solubility_in_solvent_mixture,
+    solute_solvent_mixture_x,
+    WALDEN_DELTA_S_FUSION_J_MOL_K,
+)
 
 __all__ = [
     "gfn2_alpb_water_optimize",
@@ -112,4 +126,14 @@ __all__ = [
     "is_complex_case",
     "cosmors_sigma_potential_auto",
     "OPENCOSMORS25A_PARAMS",
+    "DEFAULT_SIGMA_GRID_E_PER_A2",
+    "sigma_feature_tensors",
+    "ActivityResult",
+    "activity_coefficients",
+    "estimate_delta_h_fusion_walden",
+    "ideal_solid_solubility_ln_x",
+    "make_cosmors",
+    "solubility_in_solvent_mixture",
+    "solute_solvent_mixture_x",
+    "WALDEN_DELTA_S_FUSION_J_MOL_K",
 ]

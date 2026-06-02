@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=64", "wheel", "numpy>=1.24.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -42,10 +42,10 @@ Repository = "https://github.com/guillaume-osmo/mlxmolkit"
 Issues = "https://github.com/guillaume-osmo/mlxmolkit/issues"
 
 [tool.setuptools.packages.find]
-include = ["mlxmolkit", "mlxmolkit.solvers"]
+include = ["mlxmolkit", "mlxmolkit.*"]
 
 [tool.setuptools.package-data]
-mlxmolkit = ["*.metal"]
+mlxmolkit = ["*.metal", "xtb/params/*.npz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -233,8 +233,6 @@ def multipole_gradient(
     for mu in range(n):
         bm = basis[mu]
         for nu in range(n):
-            if mu == nu:
-                continue
             bn = basis[nu]
             for i in range(len(bm.alphas)):
                 for j in range(len(bn.alphas)):

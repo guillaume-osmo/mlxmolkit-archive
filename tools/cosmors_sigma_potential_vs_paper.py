@@ -195,6 +195,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--xlsx", type=Path, default=REPO_ROOT / "data" / "d5ra08246c1.xlsx")
     parser.add_argument("--n", type=int, default=20)
+    parser.add_argument("--skip", type=int, default=0,
+                        help="skip the first N matching rows before starting (use to pull the next batch)")
     parser.add_argument("--max-heavy", type=int, default=10)
     parser.add_argument("--backend", choices=["tmcosmo", "orca", "orca-multi", "orca-auto"], default="tmcosmo",
                         help="orca-multi: RDKit→g-xTB-screen→ORCA on each survivor, Boltzmann-weighted. "
@@ -218,6 +220,7 @@ def main() -> None:
 
     # Resolve SMILES + filter serially first (PubChem rate-limited, fast).
     tasks: list[dict] = []
+    skipped = 0
     from rdkit import Chem
     for _, row in df.iterrows():
         if len(tasks) >= args.n:
@@ -233,6 +236,9 @@ def main() -> None:
             if not smiles_passes(smi, args.max_heavy):
                 continue
         except Exception:
+            continue
+        if skipped < args.skip:
+            skipped += 1
             continue
         m = Chem.MolFromSmiles(smi)
         mu_paper = row.iloc[3:64].to_numpy(dtype=np.float64).tolist()

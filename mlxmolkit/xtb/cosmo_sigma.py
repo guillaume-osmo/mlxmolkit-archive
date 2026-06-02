@@ -262,6 +262,7 @@ def gxtb_optimize_geometry(
     workdir: Path | None = None,
     keep_workdir: bool = False,
     acc: float = 0.1,
+    timeout: float = 600.0,
 ) -> tuple[np.ndarray, float]:
     """Run ``xtb --gxtb --opt`` and return the optimized coords and energy.
 
@@ -278,6 +279,7 @@ def gxtb_optimize_geometry(
             [str(xyz.name), "--gxtb", "--opt", "--acc", str(acc),
              "--chrg", str(charge), "--uhf", str(uhf)],
             xtb_path=xtb_path,
+            timeout=timeout,
         )
         opt_xyz = workdir / "xtbopt.xyz"
         if not opt_xyz.exists():
@@ -336,6 +338,7 @@ def hybrid_gxtb_gfn2_cosmo(
     workdir: Path | None = None,
     keep_workdir: bool = False,
     acc: float = 0.1,
+    gxtb_timeout: float = 600.0,
 ) -> dict[str, object]:
     """Hybrid g-xTB(opt) + GFN2(tmcosmo) pipeline.
 
@@ -347,7 +350,7 @@ def hybrid_gxtb_gfn2_cosmo(
         atoms, coords_ang,
         charge=charge, uhf=uhf, xtb_path=xtb_path,
         workdir=workdir / "step1_gxtb_opt" if workdir else None,
-        keep_workdir=keep_workdir, acc=acc,
+        keep_workdir=keep_workdir, acc=acc, timeout=gxtb_timeout,
     )
     cosmo = gfn2_tmcosmo_singlepoint(
         atoms, coords_opt,
@@ -375,6 +378,7 @@ def hybrid_gxtb_gfn2_cosmo_from_smiles(
     workdir: Path | None = None,
     keep_workdir: bool = False,
     acc: float = 0.1,
+    gxtb_timeout: float = 600.0,
 ) -> dict[str, object]:
     """End-to-end: SMILES → RDKit embed → g-xTB opt → GFN2 tmcosmo → parsed segments."""
 
@@ -404,6 +408,7 @@ def hybrid_gxtb_gfn2_cosmo_from_smiles(
     out = hybrid_gxtb_gfn2_cosmo(
         atoms, coords, solvent=solvent, charge=charge, uhf=uhf,
         xtb_path=xtb_path, workdir=workdir, keep_workdir=keep_workdir, acc=acc,
+        gxtb_timeout=gxtb_timeout,
     )
     out["smiles"] = smiles
     return out
@@ -638,32 +643,135 @@ def generate_rdkit_conformers(
 
 
 def cosmosegments_from_orcacosmo(path: Path | str) -> CosmoSegments:
-    """Adapter: read an ORCA ``.orcacosmo`` via opencosmorspy and return a
-    ``CosmoSegments`` shaped for the σ-potential entry points."""
+    """Read an ORCA ``.orcacosmo`` file into :class:`CosmoSegments`.
 
-    from opencosmorspy.input_parsers import SigmaProfileParser
-    from rdkit.Chem import GetPeriodicTable
+    ORCA writes the COSMO block in atomic units: atom/segment coordinates and
+    radii in Bohr, surface areas in Bohr², and segment charges in e. The rest
+    of the σ-potential code expects coordinates in Bohr but areas in Å² and
+    σ in e/Å², so only area/radius/volume need unit conversion here.
+    """
 
-    BOHR_PER_A = 1.0 / 0.52917721092
-    spp = SigmaProfileParser(str(path))
-    pt = GetPeriodicTable()
-    atom_z = [pt.GetAtomicNumber(s.title()) for s in spp["atm_elmnt"]]
+    path = Path(path)
+    text = path.read_text()
+    lines = text.splitlines()
+
+    e_total = float("nan")
+    for line in lines:
+        if "FINAL SINGLE POINT ENERGY" in line:
+            parts = line.split()
+            if parts:
+                e_total = float(parts[-1])
+            break
+
+    cosmo_start = None
+    for i, line in enumerate(lines):
+        if line.strip() == "#COSMO":
+            cosmo_start = i
+            break
+    if cosmo_start is None:
+        raise ValueError(f"no #COSMO block found in {path}")
+
+    def _leading_number(line: str) -> float:
+        return float(line.split("#", 1)[0].split()[0])
+
+    n_atoms = int(_leading_number(lines[cosmo_start + 1]))
+    n_segments = int(_leading_number(lines[cosmo_start + 2]))
+
+    area_bohr2 = float("nan")
+    volume_bohr3 = float("nan")
+    dielectric_energy = float("nan")
+    for line in lines[cosmo_start:]:
+        stripped = line.strip()
+        if stripped == "#COSMO_corrected":
+            break
+        if "# Volume" in line:
+            volume_bohr3 = _leading_number(line)
+        elif "# Area" in line:
+            area_bohr2 = _leading_number(line)
+        elif "# CPCM dielectric energy" in line:
+            dielectric_energy = _leading_number(line)
+
+    coord_header = None
+    surf_header = None
+    for i in range(cosmo_start, len(lines)):
+        stripped = lines[i].strip()
+        if stripped == "#COSMO_corrected":
+            break
+        if "CARTESIAN COORDINATES" in stripped:
+            coord_header = i
+        elif "SURFACE POINTS" in stripped:
+            surf_header = i
+            break
+    if coord_header is None or surf_header is None:
+        raise ValueError(f"incomplete #COSMO block in {path}")
+
+    atom_coords: list[list[float]] = []
+    atom_radii_bohr: list[float] = []
+    atom_z: list[int] = []
+    i = coord_header + 1
+    while i < surf_header and len(atom_z) < n_atoms:
+        parts = lines[i].split()
+        if len(parts) >= 5 and not lines[i].lstrip().startswith("#"):
+            try:
+                atom_coords.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                atom_radii_bohr.append(float(parts[3]))
+                atom_z.append(int(float(parts[4])))
+            except ValueError:
+                pass
+        i += 1
+    if len(atom_z) != n_atoms:
+        raise ValueError(f"expected {n_atoms} atoms in {path}, parsed {len(atom_z)}")
+
+    seg_atom: list[int] = []
+    seg_xyz: list[list[float]] = []
+    seg_area_a2: list[float] = []
+    seg_charge: list[float] = []
+    seg_sigma: list[float] = []
+    seg_potential: list[float] = []
+
+    i = surf_header + 1
+    while i < len(lines) and len(seg_atom) < n_segments:
+        stripped = lines[i].strip()
+        if stripped == "#COSMO_corrected":
+            break
+        parts = lines[i].split()
+        if len(parts) >= 10 and not lines[i].lstrip().startswith("#"):
+            try:
+                x, y, zc = float(parts[0]), float(parts[1]), float(parts[2])
+                area_a2 = float(parts[3]) * _ANG2_PER_BOHR2
+                potential = float(parts[4])
+                charge = float(parts[5])
+                atom_idx = int(float(parts[9])) + 1  # ORCA is 0-based; CosmoSegments uses 1-based.
+            except ValueError:
+                i += 1
+                continue
+            seg_xyz.append([x, y, zc])
+            seg_area_a2.append(area_a2)
+            seg_charge.append(charge)
+            seg_sigma.append(charge / area_a2 if area_a2 > 0.0 else 0.0)
+            seg_potential.append(potential)
+            seg_atom.append(atom_idx)
+        i += 1
+    if len(seg_atom) != n_segments:
+        raise ValueError(f"expected {n_segments} surface points in {path}, parsed {len(seg_atom)}")
+
     return CosmoSegments(
         epsilon=float("inf"), fepsi=1.0,
-        area=float(spp["area"]), volume=float(spp["volume"]),
-        total_screening_charge=0.0,
-        total_energy_hartree=float("nan"),
-        dielectric_energy_hartree=float("nan"),
-        atom_radii=np.asarray(spp["atm_rad"]),
-        atom_coords_bohr=np.asarray(spp["atm_pos"]) * BOHR_PER_A,
+        area=area_bohr2 * _ANG2_PER_BOHR2,
+        volume=volume_bohr3 * _ANG3_PER_BOHR3,
+        total_screening_charge=float(np.sum(seg_charge)),
+        total_energy_hartree=e_total,
+        dielectric_energy_hartree=dielectric_energy,
+        atom_radii=np.asarray(atom_radii_bohr, dtype=np.float64) * 0.52917721092,
+        atom_coords_bohr=np.asarray(atom_coords, dtype=np.float64),
         atom_z=atom_z,
-        segments_atom=np.asarray(spp["seg_atm_nr"], dtype=np.intp),
-        segments_xyz_bohr=np.asarray(spp["seg_pos"]) * BOHR_PER_A,
-        segments_charge=np.asarray(spp["seg_charge"]),
-        segments_area=np.asarray(spp["seg_area"]),
-        segments_sigma=np.asarray(spp["seg_sigma_raw"]),
-        segments_potential=np.asarray(spp["seg_potential"]),
-        cosmo_text="",
+        segments_atom=np.asarray(seg_atom, dtype=np.intp),
+        segments_xyz_bohr=np.asarray(seg_xyz, dtype=np.float64),
+        segments_charge=np.asarray(seg_charge, dtype=np.float64),
+        segments_area=np.asarray(seg_area_a2, dtype=np.float64),
+        segments_sigma=np.asarray(seg_sigma, dtype=np.float64),
+        segments_potential=np.asarray(seg_potential, dtype=np.float64),
+        cosmo_text=text,
     )
 
 

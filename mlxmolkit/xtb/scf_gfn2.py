@@ -280,13 +280,20 @@ def gfn2_energy(
     S_cao, dpint_cao, qpint_cao = multipole_matrices(cao_basis)
     sao_basis, T = sao_basis_metadata(cao_basis)
     n_basis = T.shape[0]
+    T_is_identity = (
+        T.shape[0] == T.shape[1] and np.array_equal(T, np.eye(T.shape[0]))
+    )
     # SAO-projected multipole integrals: dpint_sao[k] = T · dpint_cao[k] · T^T.
-    dpint = np.zeros((3, n_basis, n_basis), dtype=np.float64)
-    qpint = np.zeros((6, n_basis, n_basis), dtype=np.float64)
-    for k in range(3):
-        dpint[k] = T @ dpint_cao[k] @ T.T
-    for k in range(6):
-        qpint[k] = T @ qpint_cao[k] @ T.T
+    if T_is_identity:
+        dpint = dpint_cao
+        qpint = qpint_cao
+    else:
+        dpint = np.zeros((3, n_basis, n_basis), dtype=np.float64)
+        qpint = np.zeros((6, n_basis, n_basis), dtype=np.float64)
+        for k in range(3):
+            dpint[k] = T @ dpint_cao[k] @ T.T
+        for k in range(6):
+            qpint[k] = T @ qpint_cao[k] @ T.T
 
     # 2. Shell layout.
     (bf_shells, bf_to_shell, shell_atom, shell_l, z_ref,
@@ -307,14 +314,19 @@ def gfn2_energy(
         atoms_list, coords, cao_basis, S_cao, cn, cao_bf_shells,
     )
     np.fill_diagonal(H0_cao_offdiag, 0.0)
-    S = T @ S_cao @ T.T
-    H0 = T @ H0_cao_offdiag @ T.T
-    selfE_eV = np.zeros(n_basis, dtype=np.float64)
-    for mu_sao, b in enumerate(sao_basis):
-        for mu_cao, bc in enumerate(cao_basis):
-            if bc.shell_id == b.shell_id:
-                selfE_eV[mu_sao] = selfE_eV_cao[mu_cao]
-                break
+    if T_is_identity:
+        S = S_cao
+        H0 = H0_cao_offdiag
+        selfE_eV = selfE_eV_cao
+    else:
+        S = T @ S_cao @ T.T
+        H0 = T @ H0_cao_offdiag @ T.T
+        selfE_eV = np.zeros(n_basis, dtype=np.float64)
+        for mu_sao, b in enumerate(sao_basis):
+            for mu_cao, bc in enumerate(cao_basis):
+                if bc.shell_id == b.shell_id:
+                    selfE_eV[mu_sao] = selfE_eV_cao[mu_cao]
+                    break
     H0 = H0 + np.diag(selfE_eV * _HARTREE_PER_EV)
 
     # 5. Coulomb matrix.
@@ -329,12 +341,12 @@ def gfn2_energy(
     )
     mx.eval(q_mx)
     q_at_init = np.asarray(q_mx).astype(np.float64)
-    qsh = np.zeros(n_shell, dtype=np.float64)
-    for ish in range(n_shell):
-        a = shell_atom[ish]
-        z_atom_ref = sum(z_ref[k] for k in range(n_shell) if shell_atom[k] == a)
-        if z_atom_ref > 1e-9:
-            qsh[ish] = q_at_init[a] * z_ref[ish] / z_atom_ref
+    z_atom_ref = np.bincount(shell_atom, weights=z_ref, minlength=n_atoms)
+    qsh = np.where(
+        z_atom_ref[shell_atom] > 1e-9,
+        q_at_init[shell_atom] * z_ref / z_atom_ref[shell_atom],
+        0.0,
+    )
 
     # 7. SCF.
     P = np.zeros((n_basis, n_basis), dtype=np.float64)
@@ -417,9 +429,7 @@ def gfn2_energy(
 
         # Optional ALPB(water) Born potential: V_born_atom[a] = kEps · M·q_at[a]
         if alpb_M is not None:
-            q_at_iter = np.zeros(n_atoms)
-            for ish in range(n_shell):
-                q_at_iter[shell_atom[ish]] += qsh[ish]
+            q_at_iter = np.bincount(shell_atom, weights=qsh, minlength=n_atoms)
             V_born_atom = alpb_kEps * (alpb_M @ q_at_iter)
             # Distribute per-atom Born potential to all shells of that atom.
             V_sh = V_sh + V_born_atom[shell_atom]
@@ -431,9 +441,7 @@ def gfn2_energy(
         # current P, then derive vs/vd/vq potentials and add to F.
         # On iter 0, P is zero so dipm = qp = 0 and AES is zero —
         # consistent with monopole-only initialization.
-        q_at_iter = np.zeros(n_atoms)
-        for ish in range(n_shell):
-            q_at_iter[shell_atom[ish]] += qsh[ish]
+        q_at_iter = np.bincount(shell_atom, weights=qsh, minlength=n_atoms)
         dipm, qp_aes = mmompop(P, S, dpint, qpint, aoat, coords_bohr)
         vs, vd, vq = setvsdq(
             atoms_list, coords_bohr, q_at_iter, dipm, qp_aes, gab3, gab5,
@@ -505,17 +513,13 @@ def gfn2_energy(
     shell_third_shift = qsh ** 2 * shell_third
     V_sh = shell_shift + shell_third_shift
     if alpb_M is not None:
-        q_at_iter = np.zeros(n_atoms)
-        for ish in range(n_shell):
-            q_at_iter[shell_atom[ish]] += qsh[ish]
+        q_at_iter = np.bincount(shell_atom, weights=qsh, minlength=n_atoms)
         V_born_atom = alpb_kEps * (alpb_M @ q_at_iter)
         V_sh = V_sh + V_born_atom[shell_atom]
     V_bf = V_sh[bf_to_shell]
     F = H0 - 0.5 * (V_bf[:, None] + V_bf[None, :]) * S
     # Re-build AES with converged P to get the energy below.
-    q_at = np.zeros(n_atoms)
-    for ish in range(n_shell):
-        q_at[shell_atom[ish]] += qsh[ish]
+    q_at = np.bincount(shell_atom, weights=qsh, minlength=n_atoms)
     dipm, qp_aes = mmompop(P, S, dpint, qpint, aoat, coords_bohr)
     from scipy.linalg import eigh as _scipy_eigh
     eigvals_h, C = _scipy_eigh(F, S)

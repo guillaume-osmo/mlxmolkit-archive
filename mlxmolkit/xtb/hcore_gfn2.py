@@ -80,17 +80,16 @@ def build_hcore_gfn2(
     n_basis = len(basis)
     g = GFN2_GLOBALS
 
-    # Per-BF CN-shifted self-energy.
-    selfE_eV = np.zeros(n_basis, dtype=np.float64)
-    for mu in range(n_basis):
-        s_mu = bf_shells[mu]
-        A = basis[mu].atom_idx
-        # GFN2: selfE_eff = h - kCN · CN  (kCN already in eV/CN).
-        selfE_eV[mu] = s_mu.h - s_mu.kcn * cn[A]
+    bf_atom = np.array([bf.atom_idx for bf in basis], dtype=np.int64)
+    bf_l = np.array([sh.l for sh in bf_shells], dtype=np.int64)
+    bf_h = np.array([sh.h for sh in bf_shells], dtype=np.float64)
+    bf_kcn = np.array([sh.kcn for sh in bf_shells], dtype=np.float64)
+    bf_zeta = np.array([sh.zeta for sh in bf_shells], dtype=np.float64)
+    bf_kpoly = np.array([sh.k_poly for sh in bf_shells], dtype=np.float64)
 
-    H0 = np.zeros((n_basis, n_basis), dtype=np.float64)
-    for mu in range(n_basis):
-        H0[mu, mu] = selfE_eV[mu] * _HARTREE_PER_EV
+    # Per-BF CN-shifted self-energy.
+    # GFN2: selfE_eff = h - kCN · CN  (kCN already in eV/CN).
+    selfE_eV = bf_h - bf_kcn * cn[bf_atom]
 
     en_atoms = np.array(
         [GFN2_PARAMS[int(Z)].en for Z in atoms], dtype=np.float64
@@ -102,40 +101,35 @@ def build_hcore_gfn2(
 
     enscale_ij = 0.005 * (g.enshell + g.enshell)   # = +0.020 for GFN2
 
-    for mu in range(n_basis):
-        bm = basis[mu]
-        s_mu = bf_shells[mu]
-        A = bm.atom_idx
-        for nu in range(mu + 1, n_basis):
-            bn = basis[nu]
-            s_nu = bf_shells[nu]
-            B = bn.atom_idx
-            if A == B:
-                # Same-atom CAO off-diagonal stays zero (xtb's
-                # hamiltonian.F90:307+ only sets SAO diagonals on the
-                # same-atom pass).
-                continue
-            l_mu = s_mu.l
-            l_nu = s_nu.l
-            # h0scal — GFN2 has pairParam = 1 everywhere.
-            d_chi = en_atoms[A] - en_atoms[B]
-            den2 = d_chi * d_chi
-            enpoly = 1.0 + enscale_ij * den2
-            K_AB = _shell_kscale(l_mu, l_nu) * enpoly
-            # Slater-exponent ratio with wExp = 0.5.
-            zi = s_mu.zeta
-            zj = s_nu.zeta
-            zeta_ij = (2.0 * np.sqrt(zi * zj) / (zi + zj)) ** g.wexp
+    A = bf_atom[:, None]
+    B = bf_atom[None, :]
+    mask = A != B
 
-            R_AB_bohr = float(np.linalg.norm(coords[A] - coords[B]))
-            r_sum_bohr = r_A_bohr[A] + r_A_bohr[B]
-            sqrt_term = float(np.sqrt(R_AB_bohr / max(r_sum_bohr, 1e-12)))
-            pi_A = 1.0 + 0.01 * s_mu.k_poly * sqrt_term
-            pi_B = 1.0 + 0.01 * s_nu.k_poly * sqrt_term
-            Pi = pi_A * pi_B
+    k_lut = np.empty((4, 4), dtype=np.float64)
+    for l1 in range(4):
+        for l2 in range(4):
+            k_lut[l1, l2] = _shell_kscale(l1, l2)
 
-            h_avg = 0.5 * (selfE_eV[mu] + selfE_eV[nu]) * _HARTREE_PER_EV
-            H0[mu, nu] = K_AB * zeta_ij * h_avg * Pi * float(S[mu, nu])
-            H0[nu, mu] = H0[mu, nu]
+    # h0scal — GFN2 has pairParam = 1 everywhere.
+    d_chi = en_atoms[A] - en_atoms[B]
+    enpoly = 1.0 + enscale_ij * d_chi * d_chi
+    K_AB = k_lut[bf_l[:, None], bf_l[None, :]] * enpoly
+
+    # Slater-exponent ratio with wExp = 0.5.
+    zi = bf_zeta[:, None]
+    zj = bf_zeta[None, :]
+    zeta_ij = (2.0 * np.sqrt(zi * zj) / (zi + zj)) ** g.wexp
+
+    bf_coords = coords[bf_atom]
+    R_AB_bohr = np.linalg.norm(bf_coords[:, None, :] - bf_coords[None, :, :], axis=2)
+    r_sum_bohr = r_A_bohr[A] + r_A_bohr[B]
+    sqrt_term = np.sqrt(R_AB_bohr / np.maximum(r_sum_bohr, 1e-12))
+    pi_A = 1.0 + 0.01 * bf_kpoly[:, None] * sqrt_term
+    pi_B = 1.0 + 0.01 * bf_kpoly[None, :] * sqrt_term
+    Pi = pi_A * pi_B
+
+    h_avg = 0.5 * (selfE_eV[:, None] + selfE_eV[None, :]) * _HARTREE_PER_EV
+    H0 = np.where(mask, K_AB * zeta_ij * h_avg * Pi * S, 0.0)
+    np.fill_diagonal(H0, selfE_eV * _HARTREE_PER_EV)
 
     return H0, selfE_eV
