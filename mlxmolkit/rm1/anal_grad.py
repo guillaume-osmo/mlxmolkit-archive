@@ -59,15 +59,15 @@ def analytical_gradient(
             coords_m[a, d] -= step
 
             # Compute E with displaced geometry but FROZEN density P
-            E_p = _energy_frozen_density(atoms, coords_p, P, PARAMS)
-            E_m = _energy_frozen_density(atoms, coords_m, P, PARAMS)
+            E_p = _energy_frozen_density(atoms, coords_p, P, PARAMS, method)
+            E_m = _energy_frozen_density(atoms, coords_m, P, PARAMS, method)
 
             gradient[a, d] = (E_p - E_m) / (2.0 * step)
 
     return result, gradient
 
 
-def _energy_frozen_density(atoms, coords, P, PARAMS):
+def _energy_frozen_density(atoms, coords, P, PARAMS, method='RM1'):
     """Compute total energy with frozen density matrix P at new geometry.
 
     E = 0.5 · tr(P · (H + F)) + E_nuc
@@ -84,7 +84,12 @@ def _energy_frozen_density(atoms, coords, P, PARAMS):
     # Electronic energy
     E_elec = 0.5 * np.sum(P * (H + F))
 
-    # Nuclear repulsion
-    E_nuc = compute_nuclear_repulsion(atoms, coords, param_dict=PARAMS)
+    # Nuclear repulsion — PM6 variants use the PWCCT core-core (must match scf.py so the
+    # frozen-density gradient is consistent with the energy it differentiates).
+    if method in ('PM6', 'PM6_SP', 'PM6_D'):
+        from .pwcct import pm6_nuclear_repulsion
+        E_nuc = pm6_nuclear_repulsion(atoms, coords, PARAMS)
+    else:
+        E_nuc = compute_nuclear_repulsion(atoms, coords, param_dict=PARAMS)
 
     return E_elec + E_nuc
