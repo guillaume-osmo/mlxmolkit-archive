@@ -1138,7 +1138,14 @@ def rm1_energy_batch_mlx(
                 f"Non-finite F_eigh_input at iteration {iteration} for batch indices {bad}; "
                 f"max abs entry = {np.nanmax(np.abs(F_check)):.3e}"
             )
-        eigvals, C = mx.linalg.eigh(F_eigh_input, stream=mx.cpu)            # (N, MB), (N, MB, MB)
+        # mlx-addons batched_eigh: routes N<=32 to Metal GPU Jacobi,
+        # else falls back to mx.linalg.eigh (CPU). For small basis
+        # (typical NDDO, MB <= 32) this is a free GPU speedup.
+        try:
+            from mlx_addons.linalg import batched_eigh as _addons_eigh
+            eigvals, C = _addons_eigh(F_eigh_input)
+        except ImportError:
+            eigvals, C = mx.linalg.eigh(F_eigh_input, stream=mx.cpu)        # (N, MB), (N, MB, MB)
 
         # 4. Density: P = 2 * (C * occ_mask[:, None, :]) @ C^T.
         C_occ = C * occ_mask[:, None, :]                                   # zero out unoccupied cols
@@ -1183,7 +1190,11 @@ def rm1_energy_batch_mlx(
     mx.eval(E_elec_mx, F_final, P, eigvals_final if eigvals_final is not None else mx.zeros((1,)))
 
     # Eigenvalues for the final F (one more eigh on the converged Fock).
-    eigvals_padded = mx.linalg.eigh(F_final + pad_diag, stream=mx.cpu)[0]  # (N, MB)
+    try:
+        from mlx_addons.linalg import batched_eigh as _addons_eigh
+        eigvals_padded = _addons_eigh(F_final + pad_diag)[0]
+    except ImportError:
+        eigvals_padded = mx.linalg.eigh(F_final + pad_diag, stream=mx.cpu)[0]  # (N, MB)
     mx.eval(eigvals_padded)
     eigvals_np = np.array(eigvals_padded)
 
