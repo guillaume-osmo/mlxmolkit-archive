@@ -638,23 +638,19 @@ def nddo_energy(
     # Core Hamiltonian
     H = _build_core_hamiltonian(atoms, coords, info)
 
-    # Initial density: diagonalize H_core but FORCE d-orbital coefficients
-    # to zero in the resulting MOs. This gives an sp-only initial density
-    # that respects molecular geometry while preventing d-orbital MOs from
-    # being selected as occupied.
-    H_init = H.copy()
-    # Apply a large basis-space level shift to d-orbital diagonals during
-    # initial guess only — this guarantees d-orbitals are virtual at iter 0.
+    # Initial density: MOPAC-style neutral-atom diagonal guess. Each atom keeps its own
+    # valence electrons, spread uniformly over its s/p orbitals (d starts empty for
+    # main group). Unlike an H_core-diagonalization guess, every atom starts NEUTRAL —
+    # an H_core guess can start deep in a charge-transfer basin and the SCF then
+    # converges to a wrong (higher) root: EtBr did exactly that (q(Br)=+0.22 instead of
+    # MOPAC's -0.16, heat of formation +210 kcal/mol off) while MeBr was fine.
     starts_per_atom = info['atom_basis_start']
-    for i, p in enumerate(params):
-        if p.n_basis > 4:
-            sA = starts_per_atom[i]
-            for k in range(4, p.n_basis):
-                H_init[sA + k, sA + k] += 1000.0  # huge shift to force d virtual
-    _, C_init = np.linalg.eigh(H_init)
     P = np.zeros((n_basis, n_basis))
-    for k in range(n_occ):
-        P += 2.0 * np.outer(C_init[:, k], C_init[:, k])
+    for i, p in enumerate(params):
+        sA = starts_per_atom[i]
+        n_sp = min(p.n_basis, 4)
+        for k in range(n_sp):
+            P[sA + k, sA + k] = p.n_valence / n_sp
 
     # Prepare Metal Fock kernel inputs (precompute once)
     if use_metal:
@@ -773,8 +769,11 @@ def nddo_energy(
     # Electronic energy
     E_elec = 0.5 * np.sum(P * (H + F))
 
-    # Nuclear repulsion — PM6 uses PWCCT, others use AM1-style
-    if method in ('PM6', 'PM6_SP'):
+    # Nuclear repulsion — ALL PM6 variants use the PM6 PWCCT core-core; others AM1-style.
+    # (PM6_D previously fell through to the AM1-style term, corrupting the heat-of-formation
+    #  by ~11 eV even for CHNO molecules with no d-orbitals — the electronic energy/density
+    #  were already correct, only this core-core term was wrong.)
+    if method in ('PM6', 'PM6_SP', 'PM6_D'):
         from .pwcct import pm6_nuclear_repulsion
         E_nuc = pm6_nuclear_repulsion(atoms, coords, PARAMS)
     else:
@@ -792,6 +791,18 @@ def nddo_energy(
     E_binding_eV = E_total - E_isol_total
     E_hof_eV = E_binding_eV + eheat_total / EV_TO_KCAL
 
+    # Mulliken partial charges (NDDO/ZDO): q_A = Z_valence(A) - Σ_{μ∈A} P_μμ.
+    # Returned by default so the toolkit is drop-in usable like OpenMOPAC (which prints
+    # net atomic charges). Sums to ~0 for neutral molecules by construction.
+    charges = np.empty(len(atoms))
+    _mu = 0
+    for _i, _p in enumerate(params):
+        _pop = 0.0
+        for _k in range(_p.n_basis):
+            _pop += P[_mu, _mu]
+            _mu += 1
+        charges[_i] = _p.n_valence - _pop
+
     return {
         'energy_eV': E_total,
         'energy_kcal': E_total * EV_TO_KCAL,
@@ -799,6 +810,7 @@ def nddo_energy(
         'nuclear_eV': E_nuc,
         'heat_of_formation_eV': E_hof_eV,
         'heat_of_formation_kcal': E_hof_eV * EV_TO_KCAL,
+        'charges': charges,
         'converged': converged,
         'n_iter': iteration + 1,
         'eigenvalues': eigenvalues,

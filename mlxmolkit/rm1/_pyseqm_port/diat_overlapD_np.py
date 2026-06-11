@@ -1,5 +1,14 @@
 import numpy as np
 
+# Sign that maps the exact spheroidal reduced overlap (slater_overlap_ref) onto this
+# module's S-variable phase convention. Calibrated against the qn<=4 (Br) branch where
+# the magnitudes already agree. Used only to repair the qn>=5 (iodine) overlaps.
+_REDUCED_REF_SIGNS = {
+    "S111": 1.0, "S121": 1.0, "S131": 1.0, "S211": 1.0, "S221": 1.0, "S222": 1.0,
+    "S231": 1.0, "S232": 1.0, "S311": 1.0, "S321": 1.0, "S322": 1.0,
+    "S331": 1.0, "S332": -1.0, "S333": 1.0,   # only d-d pi differs in phase
+}
+
 
 def diatom_overlap_matrixD(ni, nj, xij, rij, zeta_a, zeta_b, qn_int, qnD_int):
     """
@@ -4685,6 +4694,45 @@ def diatom_overlap_matrixD(ni, nj, xij, rij, zeta_a, zeta_b, qn_int, qnD_int):
             )
             / (5806080)
         )
+
+    #
+    # CORRECTNESS FIX (qn>=5, e.g. iodine): the hardcoded reduced-overlap coefficients for
+    # jcall 9/10/651/752/853 are mis-transcribed in the upstream PYSEQM tables, producing
+    # local overlaps >1 (s-d ~27) -> catastrophic SCF. The di[] assembly/rotation below is
+    # correct; only these scalar values are wrong. Recompute them from the exact
+    # spheroidal reference (slater_overlap_ref) — convention-safe, since these are
+    # rotation-invariant sigma/pi/delta scalars. CHNOS/Cl/Br (qn<=4) are untouched.
+    _mask5 = (qni >= 5) | (qnj >= 5) | (dqni >= 5) | (dqnj >= 5)
+    if np.any(_mask5):
+        from ..slater_overlap_ref import reduced_overlap as _ro
+        _Svars = dict(S111=S111, S121=S121, S131=S131, S211=S211, S221=S221, S222=S222,
+                      S231=S231, S232=S232, S311=S311, S321=S321, S322=S322,
+                      S331=S331, S332=S332, S333=S333)
+        # (var: la, lb, m, zeta-index a, zeta-index b, n-source a, n-source b)
+        #   n-source: 's' -> qn_int row, 'd' -> qnD_int row
+        _spec = {
+            "S111": (0, 0, 0, 0, 0, "s", "s"), "S121": (0, 1, 0, 0, 1, "s", "s"),
+            "S131": (0, 2, 0, 0, 2, "s", "d"), "S211": (1, 0, 0, 1, 0, "s", "s"),
+            "S221": (1, 1, 0, 1, 1, "s", "s"), "S222": (1, 1, 1, 1, 1, "s", "s"),
+            "S231": (1, 2, 0, 1, 2, "s", "d"), "S232": (1, 2, 1, 1, 2, "s", "d"),
+            "S311": (2, 0, 0, 2, 0, "d", "s"), "S321": (2, 1, 0, 2, 1, "d", "s"),
+            "S322": (2, 1, 1, 2, 1, "d", "s"), "S331": (2, 2, 0, 2, 2, "d", "d"),
+            "S332": (2, 2, 1, 2, 2, "d", "d"), "S333": (2, 2, 2, 2, 2, "d", "d"),
+        }
+        # signs that map the spheroidal reference onto this module's S-variable convention,
+        # measured against the qn<=4 (Br) branch; magnitudes already agree.
+        _sgn = _REDUCED_REF_SIGNS
+        for _idx in np.nonzero(_mask5)[0]:
+            na_s, na_d = int(qni[_idx]), int(dqni[_idx])
+            nb_s, nb_d = int(qnj[_idx]), int(dqnj[_idx])
+            R_b = float(rij[_idx])
+            za = zeta_a[_idx]; zb = zeta_b[_idx]
+            for _v, (_la, _lb, _m, _ia, _ib, _nsa, _nsb) in _spec.items():
+                _na = na_d if _nsa == "d" else na_s
+                _nb = nb_d if _nsb == "d" else nb_s
+                if _na == 0 or _nb == 0:
+                    continue
+                _Svars[_v][_idx] = _sgn[_v] * _ro(_na, _la, _nb, _lb, _m, za[_ia], zb[_ib], R_b)
 
     #
     # form di

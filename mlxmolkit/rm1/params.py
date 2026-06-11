@@ -231,18 +231,24 @@ def principal_qn(Z: int) -> int:
 #         + gp2c*gp2 + hspc*hsp
 # Coefficients from PYSEQM Constants (calpar.f90):
 # ================================================================
+# Occupation coefficients, taken verbatim from PYSEQM Constants (const.{ussc,uppc,gssc,
+# gppc,gspc,gp2c,hspc}[Z]) — which match MOPAC calpar.f. The eisol formula is identical to
+# PYSEQM's elec_energy_isolated_atom(), so with matching params eisol matches PYSEQM exactly.
+# The p^5 shell (F/Cl/Br/I) MUST use gppc=0.0, gp2c=10.0 — the previous 0.5/9.5 was a
+# mis-transcription that under-shot eisol by 0.5*(gpp-gp2) per halogen (~16 kcal/mol on Cl)
+# and had been papered over with hardcoded MOPAC correction constants (now removed).
 _EISOL_COEFFICIENTS = {
     # Z: (ussc, uppc, gssc, gppc, gspc, gp2c, hspc)
     1:  (1.0,  0.0,  0.0,   0.0,   0.0,  0.0,   0.0),     # H: 1s^1
     6:  (2.0,  2.0,  1.0,  -0.5,   4.0,  1.5,  -2.0),     # C: 2s^2 2p^2
     7:  (2.0,  3.0,  1.0,  -1.5,   6.0,  4.5,  -3.0),     # N: 2s^2 2p^3
     8:  (2.0,  4.0,  1.0,  -0.5,   8.0,  6.5,  -4.0),     # O: 2s^2 2p^4
-    9:  (2.0,  5.0,  1.0,   0.5,  10.0,  9.5,  -5.0),     # F: 2s^2 2p^5
+    9:  (2.0,  5.0,  1.0,   0.0,  10.0, 10.0,  -5.0),     # F: 2s^2 2p^5
     15: (2.0,  3.0,  1.0,  -1.5,   6.0,  4.5,  -3.0),     # P: 3s^2 3p^3 (same as N)
     16: (2.0,  4.0,  1.0,  -0.5,   8.0,  6.5,  -4.0),     # S: 3s^2 3p^4 (same as O)
-    17: (2.0,  5.0,  1.0,   0.5,  10.0,  9.5,  -5.0),     # Cl: 3s^2 3p^5 (same as F)
-    35: (2.0,  5.0,  1.0,   0.5,  10.0,  9.5,  -5.0),     # Br: same as Cl
-    53: (2.0,  5.0,  1.0,   0.5,  10.0,  9.5,  -5.0),     # I: same as Cl
+    17: (2.0,  5.0,  1.0,   0.0,  10.0, 10.0,  -5.0),     # Cl: 3s^2 3p^5 (p^5 shell)
+    35: (2.0,  5.0,  1.0,   0.0,  10.0, 10.0,  -5.0),     # Br: p^5 shell
+    53: (2.0,  5.0,  1.0,   0.0,  10.0, 10.0,  -5.0),     # I: p^5 shell
 }
 
 

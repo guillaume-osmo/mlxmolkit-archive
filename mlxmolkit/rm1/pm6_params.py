@@ -132,11 +132,15 @@ PM6_FULL_PARAMS: Dict[int, ElementParams] = {
         gauss_K=[-0.03552, 0.0, 0.0, 0.0],
         gauss_L=[1.74439, 0.0, 0.0, 0.0],
         gauss_M=[1.22384, 0.0, 0.0, 0.0],
-        Udd=-23.45792, zeta_d=2.72301, beta_d=-5.25221,
+        # d-row from openmopac/mopac src/models/parameters_for_PM6_C.F90 (udd6/zd6/betad6
+        # for element 53). The previous values (-23.45792 / 2.72301 / -5.25221) were a
+        # mis-transcription and corrupted iodine charges by ~0.04 e.
+        Udd=-28.822603, zeta_d=1.875175, beta_d=-7.676107,
         F0SD=0.0, G2SD=0.0, has_d=True,
     ),
 }
 
-# Compute Eisol
+# Compute Eisol from the (now-correct) p^5 occupation coefficients in params.py.
+# This matches PYSEQM's elec_energy_isolated_atom() exactly — no MOPAC calibration constants.
 for _z, _p in PM6_FULL_PARAMS.items():
     _p.eisol = _compute_eisol(_p)
