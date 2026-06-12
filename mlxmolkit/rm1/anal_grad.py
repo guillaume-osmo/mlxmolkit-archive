@@ -23,6 +23,7 @@ def analytical_gradient(
     coords: np.ndarray,
     method: str = 'RM1',
     step: float = 1e-5,
+    molecular_charge: float = 0.0,
 ) -> tuple[dict, np.ndarray]:
     """Compute energy and gradient.
 
@@ -37,7 +38,14 @@ def analytical_gradient(
     n_atoms = len(atoms)
 
     # Converged SCF
-    result = nddo_energy(atoms, coords, method=method, max_iter=200, conv_tol=1e-8)
+    result = nddo_energy(
+        atoms,
+        coords,
+        method=method,
+        max_iter=200,
+        conv_tol=1e-8,
+        molecular_charge=molecular_charge,
+    )
     P = result['density']
     E0 = result['energy_eV']
 
@@ -59,15 +67,19 @@ def analytical_gradient(
             coords_m[a, d] -= step
 
             # Compute E with displaced geometry but FROZEN density P
-            E_p = _energy_frozen_density(atoms, coords_p, P, PARAMS, method)
-            E_m = _energy_frozen_density(atoms, coords_m, P, PARAMS, method)
+            E_p = _energy_frozen_density(
+                atoms, coords_p, P, PARAMS, method, molecular_charge=molecular_charge
+            )
+            E_m = _energy_frozen_density(
+                atoms, coords_m, P, PARAMS, method, molecular_charge=molecular_charge
+            )
 
             gradient[a, d] = (E_p - E_m) / (2.0 * step)
 
     return result, gradient
 
 
-def _energy_frozen_density(atoms, coords, P, PARAMS, method='RM1'):
+def _energy_frozen_density(atoms, coords, P, PARAMS, method='RM1', molecular_charge: float = 0.0):
     """Compute total energy with frozen density matrix P at new geometry.
 
     E = 0.5 · tr(P · (H + F)) + E_nuc
@@ -77,7 +89,7 @@ def _energy_frozen_density(atoms, coords, P, PARAMS, method='RM1'):
     """
     from .scf import _build_basis_info, _build_core_hamiltonian, _build_fock
 
-    info = _build_basis_info(atoms, PARAMS)
+    info = _build_basis_info(atoms, PARAMS, molecular_charge=molecular_charge)
     H = _build_core_hamiltonian(atoms, coords, info)
     F = _build_fock(H, P, info, atoms, coords)
 

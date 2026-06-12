@@ -26,6 +26,7 @@ class RM1Batch:
     n_basis_arr: np.ndarray    # (N,) int32
     n_occ_arr: np.ndarray      # (N,) int32
     atoms_list: list            # list of atom-number lists
+    molecular_charges: np.ndarray  # (N,) float64
 
     # Padded matrices (N, MB, MB) — MB = max_basis
     H_core: np.ndarray         # (N, MB, MB) core Hamiltonian
@@ -48,6 +49,7 @@ class RM1Batch:
 def prepare_batch(
     molecules: list[tuple[list[int], np.ndarray]],
     param_dict: dict = None,
+    molecular_charges: list[float] | None = None,
 ) -> RM1Batch:
     """Pre-compute all integrals for a batch of molecules.
 
@@ -62,6 +64,27 @@ def prepare_batch(
     """
     if param_dict is None:
         param_dict = RM1_PARAMS
+    normalized_molecules = []
+    tuple_charges = []
+    for molecule in molecules:
+        if len(molecule) == 2:
+            atoms, coords = molecule
+            charge = 0.0
+        elif len(molecule) == 3:
+            atoms, coords, charge = molecule
+        else:
+            raise ValueError("molecules must contain (atoms, coords) or (atoms, coords, charge) tuples")
+        normalized_molecules.append((atoms, coords))
+        tuple_charges.append(float(charge))
+
+    molecules = normalized_molecules
+    if molecular_charges is None:
+        molecular_charges_arr = np.asarray(tuple_charges, dtype=np.float64)
+    else:
+        if len(molecular_charges) != len(molecules):
+            raise ValueError("molecular_charges must match the number of molecules")
+        molecular_charges_arr = np.asarray(molecular_charges, dtype=np.float64)
+
     N = len(molecules)
 
     # Determine max sizes
@@ -95,7 +118,17 @@ def prepare_batch(
         n_at = len(atoms)
         params = [param_dict[z] for z in atoms]
         n_bas = sum(p.n_basis for p in params)
-        n_elec = sum(p.n_valence for p in params)
+        n_elec_float = float(sum(p.n_valence for p in params)) - float(molecular_charges_arr[mol_idx])
+        n_elec = int(round(n_elec_float))
+        if not np.isclose(n_elec_float, n_elec, atol=1.0e-6):
+            raise ValueError(f"molecule {mol_idx} has non-integer electron count: {n_elec_float}")
+        if n_elec < 0:
+            raise ValueError(f"molecule {mol_idx} has negative electron count")
+        if n_elec % 2 != 0:
+            raise ValueError(
+                f"molecule {mol_idx} is open shell ({n_elec} electrons); "
+                "only closed-shell NDDO batches are currently supported"
+            )
         n_occ = n_elec // 2
 
         n_atoms_arr[mol_idx] = n_at
@@ -196,4 +229,5 @@ def prepare_batch(
         atom_starts=atom_starts_all,
         E_nuc=E_nuc_arr,
         coords_list=coords_list,
+        molecular_charges=molecular_charges_arr,
     )

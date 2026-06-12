@@ -17,7 +17,7 @@ def _smiles_to_3d(smiles: str, n_confs: int = 1, seed: int = 42) -> Optional[tup
     """Convert SMILES to 3D coordinates using RDKit ETKDG.
 
     Returns:
-        (atoms, coords) tuple or None if conversion fails
+        (atoms, coords, formal_charge) tuple or None if conversion fails
         atoms: list of atomic numbers
         coords: (n_atoms, 3) array in Angstrom
     """
@@ -31,6 +31,7 @@ def _smiles_to_3d(smiles: str, n_confs: int = 1, seed: int = 42) -> Optional[tup
     if mol is None:
         return None
 
+    formal_charge = float(Chem.GetFormalCharge(mol))
     mol = Chem.AddHs(mol)
 
     params = AllChem.ETKDGv3()
@@ -54,7 +55,7 @@ def _smiles_to_3d(smiles: str, n_confs: int = 1, seed: int = 42) -> Optional[tup
     atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
     coords = np.array([list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())])
 
-    return atoms, coords
+    return atoms, coords, formal_charge
 
 
 def rm1_from_smiles(
@@ -92,7 +93,7 @@ def rm1_from_smiles(
     if result_3d is None:
         return None
 
-    atoms, coords = result_3d
+    atoms, coords, formal_charge = result_3d
 
     # Check all elements are supported
     PARAMS = get_params(method)
@@ -105,19 +106,35 @@ def rm1_from_smiles(
         opt_result = nddo_optimize(
             atoms, coords, max_iter=opt_max_iter,
             grad_tol=opt_grad_tol, method=method,
+            molecular_charge=formal_charge,
         )
         coords = opt_result['coords']
-        result = nddo_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
+        result = nddo_energy(
+            atoms,
+            coords,
+            max_iter=max_iter,
+            conv_tol=conv_tol,
+            method=method,
+            molecular_charge=formal_charge,
+        )
         result['opt_converged'] = opt_result['converged']
         result['opt_n_iter'] = opt_result['n_iter']
         result['opt_grad_rms'] = opt_result['grad_rms']
     else:
-        result = nddo_energy(atoms, coords, max_iter=max_iter, conv_tol=conv_tol, method=method)
+        result = nddo_energy(
+            atoms,
+            coords,
+            max_iter=max_iter,
+            conv_tol=conv_tol,
+            method=method,
+            molecular_charge=formal_charge,
+        )
 
     result['smiles'] = smiles
     result['atoms'] = atoms
     result['coords'] = coords
     result['n_atoms'] = len(atoms)
+    result['formal_charge'] = formal_charge
     return result
 
 
@@ -153,6 +170,7 @@ def rm1_from_smiles_batch(
 
     # Step 1: Generate 3D coordinates for all molecules
     mol_data = []       # (atoms, coords) for valid molecules
+    formal_charges = []
     valid_indices = []   # indices into smiles_list
     failed_indices = []  # indices that failed
 
@@ -161,13 +179,14 @@ def rm1_from_smiles_batch(
         if result_3d is None:
             failed_indices.append(i)
             continue
-        atoms, coords = result_3d
+        atoms, coords, formal_charge = result_3d
         # Check elements
         PARAMS = get_params(method)
         if any(z not in PARAMS for z in atoms):
             failed_indices.append(i)
             continue
         mol_data.append((atoms, coords))
+        formal_charges.append(formal_charge)
         valid_indices.append(i)
 
     if verbose:
@@ -181,6 +200,7 @@ def rm1_from_smiles_batch(
     batch_results = nddo_energy_batch(
         mol_data, max_iter=max_iter, conv_tol=conv_tol,
         use_metal=use_metal, verbose=verbose, method=method,
+        molecular_charges=formal_charges,
     )
 
     # Step 3: Assemble results
@@ -191,6 +211,7 @@ def rm1_from_smiles_batch(
         r['atoms'] = mol_data[j][0]
         r['coords'] = mol_data[j][1]
         r['n_atoms'] = len(mol_data[j][0])
+        r['formal_charge'] = formal_charges[j]
         results[idx] = r
 
     return results

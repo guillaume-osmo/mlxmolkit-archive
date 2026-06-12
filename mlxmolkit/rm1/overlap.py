@@ -107,6 +107,51 @@ def _bintgs(beta: float, n_max: int = 7) -> np.ndarray:
     return b
 
 
+def _pyseqm_sp_overlap_matrix(
+    pA: ElementParams,
+    pB: ElementParams,
+    coordA: np.ndarray,
+    coordB: np.ndarray,
+) -> np.ndarray | None:
+    """Fallback overlap for high-principal-quantum-number sp atoms.
+
+    The native formulas below cover H through third-row sp pairs. Br/I and
+    heavier PM6 parameter-table atoms need the general spheroidal PYSEQM port
+    that is already vendored for the d-orbital path.
+    """
+
+    from ._pyseqm_port.constants_np import qnD_int, qn_int
+    from ._pyseqm_port.diat_overlapD_np import diatom_overlap_matrixD
+
+    R_vec = coordB - coordA
+    R_ang = float(np.linalg.norm(R_vec))
+    if R_ang < 1e-10:
+        return None
+
+    swap = pA.Z < pB.Z
+    if swap:
+        p1, p2, c1, c2 = pB, pA, coordB, coordA
+    else:
+        p1, p2, c1, c2 = pA, pB, coordA, coordB
+
+    R12 = c2 - c1
+    R12_ang = float(np.linalg.norm(R12))
+    xij = np.asarray([R12 / R12_ang], dtype=np.float64)
+    R_bohr = np.asarray([R12_ang * ANG_TO_BOHR], dtype=np.float64)
+    ni = np.asarray([int(p1.Z)], dtype=np.int64)
+    nj = np.asarray([int(p2.Z)], dtype=np.int64)
+    zeta_i = np.asarray([[p1.zeta_s, p1.zeta_p, getattr(p1, "zeta_d", 0.0)]], dtype=np.float64)
+    zeta_j = np.asarray([[p2.zeta_s, p2.zeta_p, getattr(p2, "zeta_d", 0.0)]], dtype=np.float64)
+
+    try:
+        full = diatom_overlap_matrixD(ni, nj, xij, R_bohr, zeta_i, zeta_j, qn_int, qnD_int)[0]
+    except Exception:
+        return None
+
+    overlap = full[: p1.n_basis, : p2.n_basis].copy()
+    return overlap.T if swap else overlap
+
+
 def overlap_molecular_frame(
     pA: ElementParams, pB: ElementParams,
     coordA: np.ndarray, coordB: np.ndarray,
@@ -160,6 +205,9 @@ def overlap_molecular_frame(
     elif qnA == 3 and qnB == 3:
         jcall = 6
     else:
+        fallback = _pyseqm_sp_overlap_matrix(pA, pB, coordA, coordB)
+        if fallback is not None:
+            return fallback
         raise ValueError(f"Unsupported pair: qn=({qnA},{qnB})")
 
     # ================================================================

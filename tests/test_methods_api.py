@@ -10,7 +10,7 @@ for PM6_D is in tests/test_pm6_d_native.py (charges vs PYSEQM/MOPAC).
 import numpy as np
 import pytest
 
-from mlxmolkit.rm1 import nddo_energy, METHOD_PARAMS, pm6_d3h4_correction
+from mlxmolkit.rm1 import nddo_energy, pm6_d3h4_correction
 
 
 H2O_ATOMS = [8, 1, 1]
@@ -42,8 +42,6 @@ def test_h2o_hof_each_method(method, expected_hof_kcal, tol):
                                      "AM1_STAR", "RM1_STAR", "PM6_D"])
 def test_method_returns_expected_keys(method):
     """All methods must return the same dict shape."""
-    if method == "AM1" and 16 in METHOD_PARAMS.get("AM1", {}):
-        pytest.skip("AM1 lacks S parameters")
     r = nddo_energy(H2O_ATOMS, H2O_COORDS, method=method)
     for k in ("energy_eV", "energy_kcal", "electronic_eV", "nuclear_eV",
               "heat_of_formation_eV", "heat_of_formation_kcal", "converged"):
