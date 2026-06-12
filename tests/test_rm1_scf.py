@@ -6,7 +6,9 @@ Validates against PYSEQM reference values (exact to < 0.001 eV).
 import sys; sys.path.insert(0, '.')
 import numpy as np
 import pytest
+import mlx.core as mx
 
+from mlxmolkit.rm1 import scf as scf_mod
 from mlxmolkit.rm1.scf import nddo_energy, nddo_energy_batch
 
 
@@ -112,6 +114,95 @@ def test_batch_molecular_charges_match_single():
     assert batch['n_electrons'] == single['n_electrons']
     assert np.isclose(np.sum(batch['charges']), -1.0, atol=1e-6)
     assert np.allclose(batch['charges'], single['charges'], atol=1e-6)
+
+
+def test_batched_symmetric_eigh_uses_mlx_addons_hook(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_batched_eigh(matrix):
+        calls["n"] += 1
+        return mx.linalg.eigh(matrix, stream=mx.cpu)
+
+    monkeypatch.setattr(scf_mod, "_BATCHED_EIGH_LOOKED_UP", True)
+    monkeypatch.setattr(scf_mod, "_BATCHED_EIGH_FN", fake_batched_eigh)
+
+    matrix = mx.array(np.array([[[2.0, 0.2], [0.2, 1.0]]], dtype=np.float32))
+    eigvals, eigvecs = scf_mod._batched_symmetric_eigh(matrix)
+    mx.eval(eigvals, eigvecs)
+
+    assert calls["n"] == 1
+    np.testing.assert_allclose(np.asarray(eigvals), np.linalg.eigvalsh(np.asarray(matrix)), atol=1e-5)
+
+
+def test_batched_symmetric_eigh_cpu_fallback(monkeypatch):
+    monkeypatch.setattr(scf_mod, "_BATCHED_EIGH_LOOKED_UP", True)
+    monkeypatch.setattr(scf_mod, "_BATCHED_EIGH_FN", None)
+
+    matrix = mx.array(np.array([[[2.0, 0.2], [0.2, 1.0]]], dtype=np.float32))
+    eigvals, eigvecs = scf_mod._batched_symmetric_eigh(matrix)
+    mx.eval(eigvals, eigvecs)
+
+    np.testing.assert_allclose(np.asarray(eigvals), np.linalg.eigvalsh(np.asarray(matrix)), atol=1e-5)
+
+
+def test_metal_batch_path_reports_eigh_backend():
+    atoms, coords = MOLS['H2O']
+
+    result = nddo_energy_batch([(list(atoms), coords)], method='AM1', use_metal=True, max_iter=100)[0]
+
+    assert result['converged']
+    assert result['eigh_backend'] == "mx.linalg.eigh(cpu)" or result['eigh_backend'].startswith(
+        "mlx_addons.linalg.batched_eigh"
+    )
+
+
+def test_sign_density_solver_matches_eigh():
+    """Forced 'sign' solver reproduces eigh charges/energies on known geometries."""
+    mols = [(list(MOLS[k][0]), MOLS[k][1]) for k in ('H2O', 'CH4', 'NH3')]
+
+    res_eigh = scf_mod.rm1_energy_batch_mlx(
+        mols, method='AM1', max_iter=120, conv_tol=1e-6, density_solver='eigh')
+    res_sign = scf_mod.rm1_energy_batch_mlx(
+        mols, method='AM1', max_iter=120, conv_tol=1e-6, density_solver='sign')
+
+    for r_e, r_s in zip(res_eigh, res_sign):
+        assert r_e['converged'] and r_s['converged']
+        assert r_e['density_solver'] == 'eigh'
+        assert r_s['density_solver'] in ('sign', 'eigh(sign_fallback)')
+        np.testing.assert_allclose(r_s['charges'], r_e['charges'], atol=2e-4)
+        assert abs(r_s['energy_eV'] - r_e['energy_eV']) < 5e-3
+
+
+def test_density_solver_auto_dispatch():
+    """'auto' keeps eigh below the GPU Jacobi limit and switches to sign above it."""
+    small = [(list(MOLS['H2O'][0]), MOLS['H2O'][1])]
+    r_small = scf_mod.rm1_energy_batch_mlx(small, method='AM1', max_iter=50)[0]
+    assert r_small['density_solver'] == 'eigh'
+
+    large_atoms = [6] * 9 + [1] * 20
+    large_coords = np.array([[float(i), 0.0, 0.0] for i in range(len(large_atoms))])
+    r_large = scf_mod.rm1_energy_batch_mlx(
+        [(large_atoms, large_coords)], method='AM1', max_iter=3)[0]
+    assert r_large['density_solver'] == 'sign'
+
+
+def test_metal_batch_buckets_by_basis_size():
+    small_atoms, small_coords = MOLS['H2O']
+    large_atoms = [6] * 9 + [1] * 20
+    large_coords = np.array([[float(i), 0.0, 0.0] for i in range(len(large_atoms))])
+
+    results = nddo_energy_batch(
+        [(list(small_atoms), small_coords), (large_atoms, large_coords)],
+        method='AM1',
+        use_metal=True,
+        max_iter=3,
+    )
+
+    assert len(results) == 2
+    assert results[0]['batch_bucket_count'] == 2
+    assert results[1]['batch_bucket_count'] == 2
+    assert results[0]['batch_bucket_max_basis'] <= 32
+    assert results[1]['batch_bucket_max_basis'] > 32
 
 
 if __name__ == '__main__':

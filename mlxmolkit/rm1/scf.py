@@ -12,8 +12,8 @@ Two SCF entry points:
 - :func:`nddo_energy_batch` — original numpy-loop implementation. Each
   molecule diagonalizes / DIISes on the CPU in a Python loop; the Fock
   build is the only batched-on-Metal step.
-- :func:`rm1_energy_batch_mlx` — all-MLX batched SCF: Fock, eigh (CPU
-  stream), DIIS solve (Metal LU via ``mlx_addons.linalg.solve_lu``), and
+- :func:`rm1_energy_batch_mlx` — all-MLX batched SCF: Fock, optional
+  ``mlx_addons.linalg.batched_eigh`` eigensolve, DIIS solve (Metal LU), and
   density update all run on ``mx.array``s without per-iteration host
   round-trips. Same physics, same accepted parameters, batched-first.
 """
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 import numpy as np
+import os
 from .params import RM1_PARAMS, ElementParams, EV_TO_KCAL, ANG_TO_BOHR
 from .methods import get_params, METHOD_PARAMS
 from .integrals import (
@@ -34,6 +35,168 @@ from .two_center_integrals import two_center_integrals, _compute_multipole_param
 from .rotation import rotate_integrals_to_molecular_frame
 from .overlap import overlap_molecular_frame
 from .overlap_d import overlap_d_molecular_frame
+
+
+_BATCHED_EIGH_LOOKED_UP = False
+_BATCHED_EIGH_FN = None
+_BATCHED_EIGH_MAX_N = None
+
+
+def _get_addons_batched_eigh():
+    """Return mlx-addons batched_eigh when available, otherwise None."""
+
+    global _BATCHED_EIGH_LOOKED_UP, _BATCHED_EIGH_FN
+    if os.environ.get("MLXMOLKIT_DISABLE_ADDONS_EIGH", "").lower() in {"1", "true", "yes"}:
+        return None
+    if not _BATCHED_EIGH_LOOKED_UP:
+        try:
+            from mlx_addons.linalg import batched_eigh
+        except (ImportError, AttributeError):
+            batched_eigh = None
+        _BATCHED_EIGH_FN = batched_eigh
+        _BATCHED_EIGH_LOOKED_UP = True
+    return _BATCHED_EIGH_FN
+
+
+def _addons_batched_eigh_max_n() -> int:
+    """Return the largest matrix size handled by the mlx-addons GPU eigh."""
+
+    global _BATCHED_EIGH_MAX_N
+    if _BATCHED_EIGH_MAX_N is None:
+        try:
+            from mlx_addons.linalg import JACOBI_MAX_N
+        except (ImportError, AttributeError):
+            JACOBI_MAX_N = 32
+        _BATCHED_EIGH_MAX_N = int(JACOBI_MAX_N)
+    return _BATCHED_EIGH_MAX_N
+
+
+def _batched_eigh_backend(matrix_size: int | None = None) -> str:
+    if _get_addons_batched_eigh() is not None:
+        if matrix_size is None:
+            return "mlx_addons.linalg.batched_eigh"
+        max_n = _addons_batched_eigh_max_n()
+        if int(matrix_size) <= max_n:
+            return f"mlx_addons.linalg.batched_eigh(gpu_jacobi,n<={max_n})"
+        return f"mlx_addons.linalg.batched_eigh(cpu_fallback,n>{max_n})"
+    return "mx.linalg.eigh(cpu)"
+
+
+def _batched_symmetric_eigh(matrix: mx.array) -> tuple[mx.array, mx.array]:
+    """Batched symmetric eigensolver with an mlx-addons GPU hook."""
+
+    batched_eigh = _get_addons_batched_eigh()
+    if batched_eigh is not None:
+        return batched_eigh(matrix)
+    return mx.linalg.eigh(matrix, stream=mx.cpu)
+
+
+# Degree-5 matrix-sign schedule (Polar Express). Source:
+# autoresearch-mlx/muon_and_beyond_mlx.py `_POLAR_EXPRESS_COEFFS`. For a
+# symmetric matrix the polar factor equals the matrix sign function, so the
+# same schedule drives every eigenvalue of (F - mu I)/s to +-1, giving the
+# aufbau density P = I - sign(F - mu I) in pure batched matmuls.
+_POLAR_EXPRESS_ABC = [
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+    (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+    (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
+    (1.875, -1.25, 0.375),
+]
+
+
+def _power_spectral_bound(A: mx.array, iters: int = 14) -> mx.array:
+    """Per-batch upper bound on ||A||_2 for symmetric A — sync-free.
+
+    Power iteration on A^2 with a deterministic start vector, padded by 5%
+    at the call site. Padded (zero) rows contribute zero eigenvalues and do
+    not disturb the bound.
+    """
+    n = A.shape[-1]
+    v = mx.ones((n, 1), dtype=A.dtype) + 0.01 * mx.arange(n, dtype=A.dtype)[:, None]
+    A2 = A @ A
+    eps = mx.array(1e-30, dtype=A.dtype)
+    for _ in range(iters):
+        v = A2 @ v
+        v = v / mx.maximum(mx.sqrt(mx.sum(v * v, axis=-2, keepdims=True)), eps)
+    Av = A @ v
+    return mx.sqrt(mx.sum(Av * Av, axis=(-2, -1)))
+
+
+def _sign_density(
+    F_sym: mx.array,
+    mu: mx.array,
+    block_mask: mx.array,
+    active_diag: mx.array,
+    pad_unit: mx.array,
+    eye_MB: mx.array,
+    polish: int = 2,
+) -> mx.array:
+    """Aufbau density P = I - sign(F - mu I) via fixed polynomial iteration.
+
+    Mathematically equivalent to the eigh density 2 * C_occ @ C_occ.T
+    whenever mu lies in the HOMO-LUMO gap (sign only depends on which side
+    of mu each eigenvalue falls). All batched matmuls — no eigensolver, no
+    host sync, no n>32 CPU fallback. Padded diagonals are pinned at +1 so
+    they land on the virtual side; padded off-diagonals are hard-masked.
+
+    The caller MUST validate trace(P)/2 == n_occ afterwards: if mu drifts
+    out of the gap the trace is off by an integer (>= 1), which makes the
+    failure detectable by a 0.25 threshold.
+    """
+    A = F_sym * block_mask - mu[:, None, None] * active_diag
+    s = mx.maximum(_power_spectral_bound(A), mx.array(1.0e-3, dtype=A.dtype))
+    X = A / (1.05 * s)[:, None, None] + pad_unit
+    # One Newton-Schulz contraction first: tolerant to |lambda| slightly > 1,
+    # so a marginally low power-iteration bound cannot blow up the schedule.
+    X = 1.5 * X - 0.5 * (X @ (X @ X))
+    for a, b, c in _POLAR_EXPRESS_ABC + [_POLAR_EXPRESS_ABC[-1]] * polish:
+        X2 = X @ X
+        X4 = X2 @ X2
+        X = X @ (a * eye_MB + b * X2 + c * X4)
+    P = (active_diag - X) * block_mask
+    return 0.5 * (P + mx.transpose(P, (0, 2, 1)))
+
+
+def _assert_finite_mx(matrix: mx.array, *, label: str) -> None:
+    """Optional host-side finite check for debugging hard eigensolver crashes."""
+
+    mx.eval(matrix)
+    matrix_np = np.array(matrix)
+    if not np.all(np.isfinite(matrix_np)):
+        bad = np.where(~np.isfinite(matrix_np).all(axis=(-2, -1)))[0]
+        raise RuntimeError(
+            f"Non-finite {label} for batch indices {bad}; "
+            f"max abs entry = {np.nanmax(np.abs(matrix_np)):.3e}"
+        )
+
+
+def _basis_bucket_limit(n_basis: int) -> int:
+    """Compact basis-size bucket for batched SCF padding."""
+
+    n_basis = int(n_basis)
+    gpu_max = _addons_batched_eigh_max_n()
+    if n_basis <= gpu_max:
+        return gpu_max
+    step = 16 if n_basis <= 128 else 32
+    return ((n_basis + step - 1) // step) * step
+
+
+def _bucket_molecule_indices_by_basis(
+    molecules: list[tuple[list[int], np.ndarray]],
+    param_dict: dict[int, ElementParams],
+) -> list[list[int]]:
+    """Group molecules so one large basis does not over-pad the whole batch."""
+
+    buckets: dict[int, list[int]] = {}
+    for index, molecule in enumerate(molecules):
+        atoms = molecule[0]
+        n_basis = sum(param_dict[z].n_basis for z in atoms)
+        buckets.setdefault(_basis_bucket_limit(n_basis), []).append(index)
+    return [buckets[key] for key in sorted(buckets)]
 
 
 def _charged_electron_count(atoms: list[int], params: list[ElementParams], molecular_charge: float = 0.0) -> int:
@@ -848,6 +1011,7 @@ def nddo_energy_batch(
     verbose: bool = False,
     method: str = 'RM1',
     molecular_charges: list[float] | None = None,
+    density_solver: str = 'auto',
 ) -> list[dict]:
     """Compute NDDO energies for N molecules simultaneously.
 
@@ -859,6 +1023,10 @@ def nddo_energy_batch(
         verbose: print convergence info
         method: 'RM1', 'AM1', or 'AM1_STAR'
         molecular_charges: optional net charge per molecule.
+        density_solver: 'eigh' (per-iteration eigensolve), 'sign'
+            (Fermi-shifted matrix-sign density, matmul-only middle
+            iterations), or 'auto' (sign when the padded basis exceeds the
+            GPU Jacobi limit, eigh otherwise).
 
     Returns:
         list of result dicts (same format as nddo_energy)
@@ -872,21 +1040,63 @@ def nddo_energy_batch(
     if N == 0:
         return []
 
+    if use_metal:
+        try:
+            buckets = _bucket_molecule_indices_by_basis(molecules, PARAMS)
+            if len(buckets) > 1:
+                results_by_index: list[dict | None] = [None] * N
+                for bucket_index, indices in enumerate(buckets):
+                    bucket_molecules = [molecules[index] for index in indices]
+                    bucket_charges = (
+                        None
+                        if molecular_charges is None
+                        else [molecular_charges[index] for index in indices]
+                    )
+                    bucket_results = rm1_energy_batch_mlx(
+                        bucket_molecules,
+                        max_iter=max_iter,
+                        conv_tol=conv_tol,
+                        verbose=verbose,
+                        method=method,
+                        molecular_charges=bucket_charges,
+                        density_solver=density_solver,
+                    )
+                    bucket_max_basis = max(int(result["n_basis"]) for result in bucket_results)
+                    for original_index, result in zip(indices, bucket_results):
+                        result["batch_bucket_index"] = bucket_index
+                        result["batch_bucket_count"] = len(buckets)
+                        result["batch_bucket_size"] = len(indices)
+                        result["batch_bucket_max_basis"] = bucket_max_basis
+                        results_by_index[original_index] = result
+                return [result for result in results_by_index if result is not None]
+            return rm1_energy_batch_mlx(
+                molecules,
+                max_iter=max_iter,
+                conv_tol=conv_tol,
+                verbose=verbose,
+                method=method,
+                molecular_charges=molecular_charges,
+                density_solver=density_solver,
+            )
+        except (ImportError, RuntimeError) as exc:
+            if verbose:
+                print(f"  all-MLX batch SCF unavailable; falling back to legacy batch path: {exc}")
+
     # Pre-compute all integrals (CPU, done once)
     batch = prepare_batch(molecules, param_dict=PARAMS, molecular_charges=molecular_charges)
     MB = batch.max_basis
 
-    # Initialize density matrices from core Hamiltonian eigendecomposition
+    # Initial density: MOPAC-style neutral-atom diagonal guess (matches the
+    # single-molecule path; an H_core guess can converge to a wrong root).
     batch.P = np.zeros((N, MB, MB), dtype=np.float64)
     for mol_idx in range(N):
-        nb = batch.n_basis_arr[mol_idx]
-        nocc = batch.n_occ_arr[mol_idx]
-        H = batch.H_core[mol_idx, :nb, :nb]
-        if not np.all(np.isfinite(H)):
-            # NaN in Hcore — skip this molecule (will not converge)
-            continue
-        eigvals, C = np.linalg.eigh(H)
-        batch.P[mol_idx, :nb, :nb] = 2.0 * C[:, :nocc] @ C[:, :nocc].T
+        start = 0
+        for z in batch.atoms_list[mol_idx]:
+            p_z = PARAMS[z]
+            n_sp = min(p_z.n_basis, 4)
+            for k in range(n_sp):
+                batch.P[mol_idx, start + k, start + k] = p_z.n_valence / n_sp
+            start += p_z.n_basis
 
     # DIIS state per molecule
     diis_size = 6
@@ -1060,6 +1270,7 @@ def rm1_energy_batch_mlx(
     verbose: bool = False,
     method: str = 'RM1',
     molecular_charges: list[float] | None = None,
+    density_solver: str = 'auto',
 ) -> list[dict]:
     """All-MLX batched NDDO SCF.
 
@@ -1068,7 +1279,8 @@ def rm1_energy_batch_mlx(
     array stays an ``mx.array`` from start to finish:
 
     - Fock build:   :meth:`MetalFockContext.build_fock_mlx` (no host copy)
-    - eigh:         ``mx.linalg.eigh`` on the CPU stream, batched ``(B, MB, MB)``
+    - eigh:         ``mlx_addons.linalg.batched_eigh`` when installed, else
+                    ``mx.linalg.eigh`` on the CPU stream.
     - DIIS solve:   :func:`mlx_addons.linalg.solve_lu` (Metal LU) on the
                     augmented Pulay system, batched per molecule
     - Density:      ``2 * C_occ @ C_occ.T`` via masked batched matmul
@@ -1104,16 +1316,21 @@ def rm1_energy_batch_mlx(
     batch = prepare_batch(molecules, param_dict=PARAMS, molecular_charges=molecular_charges)
     MB = batch.max_basis
 
-    # Initial density from H_core eigendecomposition (better than zero).
+    # Initial density: MOPAC-style neutral-atom diagonal guess — same as the
+    # single-molecule path. An H_core-eigendecomposition guess can start deep
+    # in a charge-transfer basin and converge the SCF to a wrong (higher)
+    # root; on this batched float32 path it did exactly that (e.g. aspirin
+    # off by ~4.7 e in a Mulliken charge vs the float64 CPU reference, and
+    # 190+ iteration counts for naphthalene/dodecane).
     P_np = np.zeros((N, MB, MB), dtype=np.float32)
     for mol_idx in range(N):
-        nb = batch.n_basis_arr[mol_idx]
-        nocc = batch.n_occ_arr[mol_idx]
-        H = batch.H_core[mol_idx, :nb, :nb]
-        if not np.all(np.isfinite(H)):
-            continue
-        _, C = np.linalg.eigh(H)
-        P_np[mol_idx, :nb, :nb] = (2.0 * C[:, :nocc] @ C[:, :nocc].T).astype(np.float32)
+        start = 0
+        for z in batch.atoms_list[mol_idx]:
+            p_z = PARAMS[z]
+            n_sp = min(p_z.n_basis, 4)
+            for k in range(n_sp):
+                P_np[mol_idx, start + k, start + k] = p_z.n_valence / n_sp
+            start += p_z.n_basis
     batch.P = P_np.astype(np.float64)            # keep numpy copy for compatibility
     P = mx.array(P_np)                            # (N, MB, MB) float32
 
@@ -1140,6 +1357,42 @@ def rm1_energy_batch_mlx(
 
     converged_mask = mx.zeros((N,), dtype=mx.bool_)
     n_iter_arr = np.full(N, max_iter, dtype=np.int32)
+    check_finite = os.environ.get("MLXMOLKIT_SCF_CHECK_FINITE", "").lower() in {"1", "true", "yes"}
+    eigh_backend = _batched_eigh_backend(MB)
+
+    # Active-block mask (used by the sign solver and the final energy sum).
+    basis_active_mask = (arange_MB[None, :] < n_basis_mx[:, None]).astype(mx.float32)  # (N, MB)
+    block_mask = basis_active_mask[:, :, None] * basis_active_mask[:, None, :]          # (N, MB, MB)
+
+    # Resolve the density solver. 'sign' replaces the per-iteration eigensolve
+    # with the Fermi-shifted matrix-sign projector (matmul-only, sync-free);
+    # eigh remains for warmup, periodic mu refresh, and the final pass.
+    env_solver = os.environ.get("MLXMOLKIT_DENSITY_SOLVER", "").lower()
+    if env_solver in {"sign", "eigh"}:
+        density_solver = env_solver
+    if density_solver not in {"auto", "sign", "eigh"}:
+        raise ValueError(f"unknown density_solver: {density_solver!r}")
+    if density_solver == "auto":
+        density_solver = "sign" if MB > _addons_batched_eigh_max_n() else "eigh"
+    use_sign = density_solver == "sign"
+    if verbose:
+        print(f"  SCF eigensolver: {eigh_backend} (density_solver={density_solver})")
+
+    if use_sign:
+        active_diag = basis_active_mask[:, :, None] * eye_MB[None, :, :]   # diag 1 on active
+        pad_unit = basis_pad_mask[:, :, None] * eye_MB[None, :, :]         # diag 1 on padded
+        mu = mx.zeros((N,), dtype=mx.float32)
+        n_occ_f32 = n_occ_mx.astype(mx.float32)
+        sign_warmup = 4          # eigh iterations before the first sign step
+        sign_refresh = 8         # eigh + mu refresh every this many iterations
+        sign_sync_every = 4      # host convergence sync every this many iterations
+        sign_settle_dp = 0.02    # enter sign mode only once max dP drops below this
+        sign_settled = False     # frozen-mu projection is only safe after level
+                                 # ordering stabilizes; until then every iteration
+                                 # uses the exact aufbau eigh
+        force_eigh_next = False
+        converged_np = np.zeros(N, dtype=bool)
+        pending: list[tuple[int, mx.array, mx.array | None, mx.array]] = []
 
     F = None
     eigvals_final = None
@@ -1161,83 +1414,144 @@ def rm1_energy_batch_mlx(
             if len(F_hist) >= 2:
                 F_for_eigh = _pulay_diis_extrap(F_hist, e_hist, solve_lu)
 
-        # 3. Augment padding diagonals to push spurious zero eigenvalues
-        # above the occupied set, then batched eigh on CPU stream.
-        F_eigh_input = F_for_eigh + pad_diag
-        # Sanity-check: NaN/inf in F_eigh_input would crash eigh as a hard
-        # C++ abort. Catching here gives a Python traceback instead.
-        mx.eval(F_eigh_input)
-        F_check = np.array(F_eigh_input)
-        if not np.all(np.isfinite(F_check)):
-            bad = np.where(~np.isfinite(F_check).all(axis=(-2, -1)))[0]
-            raise RuntimeError(
-                f"Non-finite F_eigh_input at iteration {iteration} for batch indices {bad}; "
-                f"max abs entry = {np.nanmax(np.abs(F_check)):.3e}"
-            )
-        # mlx-addons batched_eigh: routes N<=32 to Metal GPU Jacobi,
-        # else falls back to mx.linalg.eigh (CPU). For small basis
-        # (typical NDDO, MB <= 32) this is a free GPU speedup.
-        try:
-            from mlx_addons.linalg import batched_eigh as _addons_eigh
-            eigvals, C = _addons_eigh(F_eigh_input)
-        except ImportError:
-            eigvals, C = mx.linalg.eigh(F_eigh_input, stream=mx.cpu)        # (N, MB), (N, MB, MB)
+        # 3. Density update. Either a batched eigh (padding diagonals
+        # augmented so spurious zero eigenvalues stay above the occupied
+        # set), or — in sign mode between mu refreshes — the matmul-only
+        # spectral projector P = I - sign(F - mu I).
+        use_eigh_iter = (
+            not use_sign
+            or not sign_settled
+            or iteration < sign_warmup
+            or (iteration - sign_warmup) % sign_refresh == 0
+            or force_eigh_next
+        )
+        if use_sign:
+            force_eigh_next = False
+        tr_err = None
+        if use_eigh_iter:
+            F_eigh_input = F_for_eigh + pad_diag
+            if check_finite:
+                _assert_finite_mx(F_eigh_input, label=f"F_eigh_input at iteration {iteration}")
+            eigvals, C = _batched_symmetric_eigh(F_eigh_input)              # (N, MB), (N, MB, MB)
 
-        # 4. Density: P = 2 * (C * occ_mask[:, None, :]) @ C^T.
-        C_occ = C * occ_mask[:, None, :]                                   # zero out unoccupied cols
-        P_new = 2.0 * (C_occ @ mx.transpose(C, (0, 2, 1)))
+            # 4. Density: P = 2 * (C * occ_mask[:, None, :]) @ C^T.
+            C_occ = C * occ_mask[:, None, :]                               # zero out unoccupied cols
+            P_new = 2.0 * (C_occ @ mx.transpose(C, (0, 2, 1)))
+
+            if use_sign:
+                # Refresh the per-molecule chemical potential mu = mid-gap.
+                # Eigenvalues are ascending; padded levels sit at ~1e10, so
+                # a full shell (n_occ == n_basis) is detected and handled.
+                homo_idx = mx.maximum(n_occ_mx - 1, 0)
+                lumo_idx = mx.minimum(n_occ_mx, MB - 1)
+                homo = mx.take_along_axis(eigvals, homo_idx[:, None], axis=1)[:, 0]
+                lumo = mx.take_along_axis(eigvals, lumo_idx[:, None], axis=1)[:, 0]
+                mu = mx.where(lumo > 1.0e6, homo + 1.0, 0.5 * (homo + lumo))
+        else:
+            P_new = _sign_density(F_for_eigh, mu, block_mask, active_diag, pad_unit, eye_MB)
+            # Aufbau guard: if mu drifted out of the gap the trace is off by
+            # an integer — gate convergence on it and trigger an eigh refresh.
+            tr_err = mx.abs(0.5 * mx.trace(P_new, axis1=-2, axis2=-1) - n_occ_f32)
 
         # 5. Per-mol convergence: max-abs density change.
         dP = mx.max(mx.abs(P_new - P), axis=(-2, -1))                       # (N,)
         new_conv = dP < mx.array(conv_tol, dtype=dP.dtype)                  # (N,)
-        # Mark first-time-converged molecules with the current iteration count.
-        first_conv = new_conv & (~converged_mask)
-        if mx.any(first_conv).item():
-            first_conv_np = np.array(first_conv)
-            for idx in np.where(first_conv_np)[0]:
-                n_iter_arr[idx] = iteration + 1
-        converged_mask = converged_mask | new_conv
+        if tr_err is not None:
+            new_conv = new_conv & (tr_err < 0.25)
 
-        # 6. Density mixing for first 2 iterations.
-        if iteration < 2:
-            P = 0.5 * P_new + 0.5 * P
+        if not use_sign:
+            # Mark first-time-converged molecules with the current iteration count.
+            first_conv = new_conv & (~converged_mask)
+            if mx.any(first_conv).item():
+                first_conv_np = np.array(first_conv)
+                for idx in np.where(first_conv_np)[0]:
+                    n_iter_arr[idx] = iteration + 1
+            converged_mask = converged_mask | new_conv
+
+            # 6. Density mixing for first 2 iterations.
+            if iteration < 2:
+                P = 0.5 * P_new + 0.5 * P
+            else:
+                P = P_new
+
+            if verbose and (iteration % 5 == 0):
+                n_conv = int(mx.sum(converged_mask.astype(mx.int32)).item())
+                max_dp = float(mx.max(dP).item())
+                print(f"  SCF iter {iteration + 1}: {n_conv}/{N} converged, max dP = {max_dp:.2e}")
+
+            if bool(mx.all(converged_mask).item()):
+                break
+
+            F = F_for_eigh
+            eigvals_final = eigvals
         else:
-            P = P_new
+            # Chunked host sync: queue lazy convergence/trace arrays and
+            # evaluate every sign_sync_every iterations, so the GPU pipeline
+            # is not stalled by per-iteration .item() round-trips.
+            pending.append((iteration, new_conv, tr_err, mx.max(dP)))
+            if iteration < 2:
+                P = 0.5 * P_new + 0.5 * P
+            else:
+                P = P_new
 
-        if verbose and (iteration % 5 == 0):
-            n_conv = int(mx.sum(converged_mask.astype(mx.int32)).item())
-            max_dp = float(mx.max(dP).item())
-            print(f"  SCF iter {iteration + 1}: {n_conv}/{N} converged, max dP = {max_dp:.2e}")
-
-        if bool(mx.all(converged_mask).item()):
-            break
-
-        F = F_for_eigh
-        eigvals_final = eigvals
+            if len(pending) >= sign_sync_every or iteration == max_iter - 1:
+                eval_targets: list[mx.array] = [P]
+                for _, conv_lazy, tr_lazy, dp_lazy in pending:
+                    eval_targets.append(conv_lazy)
+                    eval_targets.append(dp_lazy)
+                    if tr_lazy is not None:
+                        eval_targets.append(tr_lazy)
+                mx.eval(*eval_targets)
+                trace_violated = False
+                chunk_max_dp = 0.0
+                for it_idx, conv_lazy, tr_lazy, dp_lazy in pending:
+                    conv_np = np.array(conv_lazy)
+                    newly = conv_np & (~converged_np)
+                    n_iter_arr[newly] = it_idx + 1
+                    converged_np |= conv_np
+                    chunk_max_dp = max(chunk_max_dp, float(dp_lazy.item()))
+                    if tr_lazy is not None and bool(np.any(np.array(tr_lazy) >= 0.25)):
+                        trace_violated = True
+                pending.clear()
+                if trace_violated:
+                    # mu left the gap for at least one molecule: drop the
+                    # (possibly poisoned) DIIS history and re-bracket mu.
+                    F_hist.clear()
+                    e_hist.clear()
+                    force_eigh_next = True
+                    sign_settled = False
+                elif not sign_settled and chunk_max_dp < sign_settle_dp:
+                    sign_settled = True
+                if verbose:
+                    print(
+                        f"  SCF iter {iteration + 1}: {int(converged_np.sum())}/{N} converged "
+                        f"(sign{', settled' if sign_settled else ', warming'}, max dP {chunk_max_dp:.2e})"
+                    )
+                if bool(converged_np.all()):
+                    break
 
     # Final Fock with converged density (already an mx.array).
     F_final_raw = metal_ctx.build_fock_mlx(P)
     F_final = 0.5 * (F_final_raw + mx.transpose(F_final_raw, (0, 2, 1)))
 
-    # Per-molecule energy via masked sum (only the active n_basis × n_basis block).
-    basis_active_mask = (arange_MB[None, :] < n_basis_mx[:, None]).astype(mx.float32)  # (N, MB)
-    block_mask = basis_active_mask[:, :, None] * basis_active_mask[:, None, :]          # (N, MB, MB)
+    # Per-molecule energy via masked sum (only the active n_basis × n_basis
+    # block; basis_active_mask / block_mask were built before the SCF loop).
     E_elec_mx = 0.5 * mx.sum(block_mask * P * (H_mx + F_final), axis=(-2, -1))          # (N,)
     mx.eval(E_elec_mx, F_final, P, eigvals_final if eigvals_final is not None else mx.zeros((1,)))
 
     # Eigenvalues for the final F (one more eigh on the converged Fock).
-    try:
-        from mlx_addons.linalg import batched_eigh as _addons_eigh
-        eigvals_padded = _addons_eigh(F_final + pad_diag)[0]
-    except ImportError:
-        eigvals_padded = mx.linalg.eigh(F_final + pad_diag, stream=mx.cpu)[0]  # (N, MB)
+    F_final_eigh_input = F_final + pad_diag
+    if check_finite:
+        _assert_finite_mx(F_final_eigh_input, label="final F_eigh_input")
+    eigvals_padded = _batched_symmetric_eigh(F_final_eigh_input)[0]         # (N, MB)
     mx.eval(eigvals_padded)
     eigvals_np = np.array(eigvals_padded)
 
     P_np_out = np.array(P)
     F_np_out = np.array(F_final)
     E_elec_np = np.array(E_elec_mx)
-    converged_np = np.array(converged_mask)
+    if not use_sign:
+        converged_np = np.array(converged_mask)
 
     results = []
     for mol_idx in range(N):
@@ -1278,7 +1592,45 @@ def rm1_energy_batch_mlx(
             'n_basis': nb,
             'molecular_charge': float(batch.molecular_charges[mol_idx]),
             'n_electrons': int(2 * batch.n_occ_arr[mol_idx]),
+            'eigh_backend': eigh_backend,
+            'density_solver': density_solver,
         })
+
+    if use_sign:
+        # Belt-and-suspenders: any converged molecule whose final density
+        # fails the aufbau trace / idempotency invariants is recomputed on
+        # the reference eigh path. The per-iteration trace gate makes this
+        # rare; this guarantees delivered results meet the eigh standard.
+        bad_indices = []
+        for mol_idx, result in enumerate(results):
+            if not result['converged']:
+                continue
+            density = result['density']
+            tr_err_final = abs(0.5 * float(np.trace(density)) - float(batch.n_occ_arr[mol_idx]))
+            idem_final = float(np.max(np.abs(0.5 * density @ density - density)))
+            if tr_err_final > 0.05 or idem_final > 1.0e-3:
+                bad_indices.append(mol_idx)
+        if bad_indices:
+            if verbose:
+                print(f"  sign-density validation: re-running {len(bad_indices)} molecule(s) via eigh")
+            redo_charges = (
+                None
+                if molecular_charges is None
+                else [molecular_charges[i] for i in bad_indices]
+            )
+            redo = rm1_energy_batch_mlx(
+                [molecules[i] for i in bad_indices],
+                max_iter=max_iter,
+                conv_tol=conv_tol,
+                verbose=verbose,
+                method=method,
+                molecular_charges=redo_charges,
+                density_solver='eigh',
+            )
+            for original_index, redo_result in zip(bad_indices, redo):
+                redo_result['density_solver'] = 'eigh(sign_fallback)'
+                results[original_index] = redo_result
+
     return results
 
 
