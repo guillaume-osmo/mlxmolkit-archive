@@ -36,13 +36,28 @@ from .overlap import overlap_molecular_frame
 from .overlap_d import overlap_d_molecular_frame
 
 
-def _build_basis_info(atoms: list[int], param_dict=None):
+def _charged_electron_count(atoms: list[int], params: list[ElementParams], molecular_charge: float = 0.0) -> int:
+    n_elec_float = float(sum(p.n_valence for p in params)) - float(molecular_charge)
+    n_elec = int(round(n_elec_float))
+    if not np.isclose(n_elec_float, n_elec, atol=1.0e-6):
+        raise ValueError(f"molecular charge must produce an integer electron count: {n_elec_float}")
+    if n_elec < 0:
+        raise ValueError("molecular charge produces a negative electron count")
+    if n_elec % 2 != 0:
+        raise ValueError(
+            "only closed-shell NDDO calculations are currently supported; "
+            f"atoms={atoms} and molecular_charge={molecular_charge} give {n_elec} electrons"
+        )
+    return n_elec
+
+
+def _build_basis_info(atoms: list[int], param_dict=None, molecular_charge: float = 0.0):
     """Build basis function → atom mapping."""
     if param_dict is None:
         param_dict = RM1_PARAMS
     params = [param_dict[z] for z in atoms]
     n_basis = sum(p.n_basis for p in params)
-    n_elec = sum(p.n_valence for p in params)
+    n_elec = _charged_electron_count(atoms, params, molecular_charge)
 
     # basis_to_atom[mu] = atom index
     # basis_type[mu] = 0 (s), 1 (px), 2 (py), 3 (pz)
@@ -580,6 +595,7 @@ def nddo_energy(
     use_metal: bool = False,
     method: str = 'RM1',
     native: bool = False,
+    molecular_charge: float = 0.0,
 ) -> dict:
     """Compute NDDO semi-empirical single-point energy.
 
@@ -589,6 +605,8 @@ def nddo_energy(
         max_iter: max SCF iterations
         conv_tol: density matrix convergence threshold
         method: 'RM1', 'AM1', 'AM1_STAR', 'PM6_SP', 'PM6_D'
+        molecular_charge: net molecular charge used to set the closed-shell
+            electron count.
         native: For ``method='PM6_D'``, force the native mlxmolkit path
             instead of delegating to PYSEQM. The native path matches
             PYSEQM to machine precision on the test set after the
@@ -614,7 +632,7 @@ def nddo_energy(
 
     PARAMS = get_params(method)
     coords = np.asarray(coords, dtype=np.float64)
-    info = _build_basis_info(atoms, PARAMS)
+    info = _build_basis_info(atoms, PARAMS, molecular_charge=molecular_charge)
     n_basis = info['n_basis']
     n_occ = info['n_occ']
 
@@ -817,6 +835,8 @@ def nddo_energy(
         'density': P,
         'n_basis': n_basis,
         'method': method,
+        'molecular_charge': float(molecular_charge),
+        'n_electrons': int(info['n_elec']),
     }
 
 
@@ -827,6 +847,7 @@ def nddo_energy_batch(
     use_metal: bool = True,
     verbose: bool = False,
     method: str = 'RM1',
+    molecular_charges: list[float] | None = None,
 ) -> list[dict]:
     """Compute NDDO energies for N molecules simultaneously.
 
@@ -837,6 +858,7 @@ def nddo_energy_batch(
         use_metal: True for Metal GPU Fock build, False for CPU
         verbose: print convergence info
         method: 'RM1', 'AM1', or 'AM1_STAR'
+        molecular_charges: optional net charge per molecule.
 
     Returns:
         list of result dicts (same format as nddo_energy)
@@ -851,7 +873,7 @@ def nddo_energy_batch(
         return []
 
     # Pre-compute all integrals (CPU, done once)
-    batch = prepare_batch(molecules, param_dict=PARAMS)
+    batch = prepare_batch(molecules, param_dict=PARAMS, molecular_charges=molecular_charges)
     MB = batch.max_basis
 
     # Initialize density matrices from core Hamiltonian eigendecomposition
@@ -1001,6 +1023,16 @@ def nddo_energy_batch(
         # Eigenvalues
         eigvals, _ = np.linalg.eigh(F)
 
+        charges = np.empty(len(atoms))
+        mu = 0
+        for atom_index, atomic_number in enumerate(atoms):
+            atom_params = PARAMS[atomic_number]
+            population = 0.0
+            for _ in range(atom_params.n_basis):
+                population += P[mu, mu]
+                mu += 1
+            charges[atom_index] = atom_params.n_valence - population
+
         results.append({
             'energy_eV': E_total,
             'energy_kcal': E_total * EV_TO_KCAL,
@@ -1011,8 +1043,11 @@ def nddo_energy_batch(
             'converged': bool(converged_arr[mol_idx]),
             'n_iter': int(n_iter_arr[mol_idx]),
             'eigenvalues': eigvals,
+            'charges': charges,
             'density': P,
             'n_basis': int(nb),
+            'molecular_charge': float(batch.molecular_charges[mol_idx]),
+            'n_electrons': int(2 * batch.n_occ_arr[mol_idx]),
         })
 
     return results
@@ -1024,6 +1059,7 @@ def rm1_energy_batch_mlx(
     conv_tol: float = 1e-6,
     verbose: bool = False,
     method: str = 'RM1',
+    molecular_charges: list[float] | None = None,
 ) -> list[dict]:
     """All-MLX batched NDDO SCF.
 
@@ -1065,7 +1101,7 @@ def rm1_energy_batch_mlx(
     if N == 0:
         return []
 
-    batch = prepare_batch(molecules, param_dict=PARAMS)
+    batch = prepare_batch(molecules, param_dict=PARAMS, molecular_charges=molecular_charges)
     MB = batch.max_basis
 
     # Initial density from H_core eigendecomposition (better than zero).
@@ -1217,6 +1253,16 @@ def rm1_energy_batch_mlx(
         E_hof = E_binding + eheat / EV_TO_KCAL
         # Drop the spurious huge eigenvalues from padding.
         eigvals_active = eigvals_np[mol_idx, :nb]
+        charges = np.empty(len(atoms))
+        mu = 0
+        density = P_np_out[mol_idx, :nb, :nb]
+        for atom_index, atomic_number in enumerate(atoms):
+            atom_params = PARAMS[atomic_number]
+            population = 0.0
+            for _ in range(atom_params.n_basis):
+                population += density[mu, mu]
+                mu += 1
+            charges[atom_index] = atom_params.n_valence - population
         results.append({
             'energy_eV': E_total,
             'energy_kcal': E_total * EV_TO_KCAL,
@@ -1227,8 +1273,11 @@ def rm1_energy_batch_mlx(
             'converged': bool(converged_np[mol_idx]),
             'n_iter': int(n_iter_arr[mol_idx]),
             'eigenvalues': eigvals_active,
-            'density': P_np_out[mol_idx, :nb, :nb],
+            'charges': charges,
+            'density': density,
             'n_basis': nb,
+            'molecular_charge': float(batch.molecular_charges[mol_idx]),
+            'n_electrons': int(2 * batch.n_occ_arr[mol_idx]),
         })
     return results
 

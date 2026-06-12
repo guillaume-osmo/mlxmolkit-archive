@@ -17,6 +17,7 @@ def nddo_gradient(
     step: float = 0.0005,
     method: str = 'RM1',
     analytical: bool = True,
+    molecular_charge: float = 0.0,
 ) -> tuple[float, np.ndarray]:
     """Compute energy and gradient (single molecule).
 
@@ -24,14 +25,19 @@ def nddo_gradient(
     """
     if analytical:
         from .anal_grad import analytical_gradient
-        result, grad = analytical_gradient(atoms, coords, method=method)
+        result, grad = analytical_gradient(
+            atoms,
+            coords,
+            method=method,
+            molecular_charge=molecular_charge,
+        )
         return result['energy_eV'], grad
 
     # Numerical fallback
     coords = np.asarray(coords, dtype=np.float64)
     n_atoms = len(atoms)
 
-    result = nddo_energy(atoms, coords, method=method)
+    result = nddo_energy(atoms, coords, method=method, molecular_charge=molecular_charge)
     E0 = result['energy_eV']
 
     grad = np.zeros((n_atoms, 3))
@@ -39,8 +45,8 @@ def nddo_gradient(
         for j in range(3):
             cp = coords.copy(); cp[i, j] += step
             cm = coords.copy(); cm[i, j] -= step
-            Ep = nddo_energy(atoms, cp, method=method)['energy_eV']
-            Em = nddo_energy(atoms, cm, method=method)['energy_eV']
+            Ep = nddo_energy(atoms, cp, method=method, molecular_charge=molecular_charge)['energy_eV']
+            Em = nddo_energy(atoms, cm, method=method, molecular_charge=molecular_charge)['energy_eV']
             grad[i, j] = (Ep - Em) / (2.0 * step)
 
     return E0, grad
@@ -50,6 +56,7 @@ def nddo_gradient_batch(
     molecules: list[tuple[list[int], np.ndarray]],
     step: float = 0.0005,
     method: str = 'RM1',
+    molecular_charges: list[float] | None = None,
 ) -> tuple[np.ndarray, list[np.ndarray]]:
     """Compute energies and numerical gradients for N molecules (batched).
 
@@ -59,21 +66,45 @@ def nddo_gradient_batch(
         energies: (N,) array of energies in eV
         gradients: list of (n_atoms_i, 3) gradient arrays
     """
+    normalized_molecules = []
+    tuple_charges = []
+    for molecule in molecules:
+        if len(molecule) == 2:
+            atoms, coords = molecule
+            charge = 0.0
+        elif len(molecule) == 3:
+            atoms, coords, charge = molecule
+        else:
+            raise ValueError("molecules must contain (atoms, coords) or (atoms, coords, charge) tuples")
+        normalized_molecules.append((atoms, coords))
+        tuple_charges.append(float(charge))
+
+    if molecular_charges is None:
+        charge_values = tuple_charges
+    else:
+        if len(molecular_charges) != len(normalized_molecules):
+            raise ValueError("molecular_charges must match the number of molecules")
+        charge_values = [float(charge) for charge in molecular_charges]
+
+    molecules = normalized_molecules
     N = len(molecules)
 
     # Build all displaced geometries
     # For each molecule: 1 center + 6*n_atoms displaced = 6*n_atoms+1 evals
     all_mols = []
+    all_charges = []
     mol_info = []  # (mol_idx, n_atoms, center_idx, grad_start_idx)
 
     idx = 0
     for mol_idx, (atoms, coords) in enumerate(molecules):
+        charge = charge_values[mol_idx]
         coords = np.asarray(coords, dtype=np.float64)
         n_at = len(atoms)
         center_idx = idx
 
         # Center geometry
         all_mols.append((atoms, coords))
+        all_charges.append(charge)
         idx += 1
 
         grad_start = idx
@@ -82,15 +113,22 @@ def nddo_gradient_batch(
             for j in range(3):
                 cp = coords.copy(); cp[i, j] += step
                 all_mols.append((atoms, cp))
+                all_charges.append(charge)
                 idx += 1
                 cm = coords.copy(); cm[i, j] -= step
                 all_mols.append((atoms, cm))
+                all_charges.append(charge)
                 idx += 1
 
         mol_info.append((mol_idx, n_at, center_idx, grad_start))
 
     # One batch call for ALL displaced geometries
-    results = nddo_energy_batch(all_mols, method=method, use_metal=True)
+    results = nddo_energy_batch(
+        all_mols,
+        method=method,
+        use_metal=True,
+        molecular_charges=all_charges,
+    )
 
     # Extract energies and gradients
     energies = np.zeros(N)
@@ -119,6 +157,7 @@ def nddo_optimize_batch(
     grad_tol: float = 0.005,
     method: str = 'RM1',
     verbose: bool = False,
+    molecular_charges: list[float] | None = None,
 ) -> list[dict]:
     """L-BFGS geometry optimization for N molecules simultaneously.
 
@@ -128,6 +167,26 @@ def nddo_optimize_batch(
     Returns:
         list of result dicts with optimized coords and energies
     """
+    normalized_molecules = []
+    tuple_charges = []
+    for molecule in molecules:
+        if len(molecule) == 2:
+            atoms, coords = molecule
+            charge = 0.0
+        elif len(molecule) == 3:
+            atoms, coords, charge = molecule
+        else:
+            raise ValueError("molecules must contain (atoms, coords) or (atoms, coords, charge) tuples")
+        normalized_molecules.append((atoms, coords))
+        tuple_charges.append(float(charge))
+    if molecular_charges is None:
+        charge_values = tuple_charges
+    else:
+        if len(molecular_charges) != len(normalized_molecules):
+            raise ValueError("molecular_charges must match the number of molecules")
+        charge_values = [float(charge) for charge in molecular_charges]
+
+    molecules = normalized_molecules
     N = len(molecules)
     atoms_list = [atoms for atoms, _ in molecules]
     coords_list = [np.asarray(c, dtype=np.float64).copy() for _, c in molecules]
@@ -143,7 +202,11 @@ def nddo_optimize_batch(
 
     # Initial gradients (batch)
     mols_current = [(atoms_list[i], coords_list[i]) for i in range(N)]
-    energies, gradients = nddo_gradient_batch(mols_current, method=method)
+    energies, gradients = nddo_gradient_batch(
+        mols_current,
+        method=method,
+        molecular_charges=charge_values,
+    )
     grad_flats = [g.flatten() for g in gradients]
 
     for iteration in range(max_iter):
@@ -209,7 +272,12 @@ def nddo_optimize_batch(
             trial_indices.append(i)
 
         if len(trial_mols) > 0:
-            trial_results = nddo_energy_batch(trial_mols, method=method, use_metal=True)
+            trial_results = nddo_energy_batch(
+                trial_mols,
+                method=method,
+                use_metal=True,
+                molecular_charges=[charge_values[i] for i in trial_indices],
+            )
 
             # Accept or reduce step per molecule
             for k, i in enumerate(trial_indices):
@@ -224,7 +292,11 @@ def nddo_optimize_batch(
         # New gradients (batch)
         old_grad_flats = [g.copy() for g in grad_flats]
         mols_current = [(atoms_list[i], coords_list[i]) for i in range(N)]
-        energies, gradients = nddo_gradient_batch(mols_current, method=method)
+        energies, gradients = nddo_gradient_batch(
+            mols_current,
+            method=method,
+            molecular_charges=charge_values,
+        )
         grad_flats = [g.flatten() for g in gradients]
 
         # L-BFGS history update
@@ -249,6 +321,7 @@ def nddo_optimize_batch(
     final_results = nddo_energy_batch(
         [(atoms_list[i], coords_list[i]) for i in range(N)],
         method=method, use_metal=True,
+        molecular_charges=charge_values,
     )
 
     results = []
@@ -270,6 +343,7 @@ def nddo_optimize(
     grad_tol: float = 0.005,
     method: str = 'RM1',
     verbose: bool = False,
+    molecular_charge: float = 0.0,
 ) -> dict:
     """L-BFGS geometry optimization using analytical gradient."""
     from .anal_grad import analytical_gradient
@@ -281,7 +355,12 @@ def nddo_optimize(
     m = 8
     s_hist, y_hist, rho_hist = [], [], []
 
-    result, grad = analytical_gradient(atoms, coords, method=method)
+    result, grad = analytical_gradient(
+        atoms,
+        coords,
+        method=method,
+        molecular_charge=molecular_charge,
+    )
     energy = result['energy_eV']
     grad_flat = grad.flatten()
 
@@ -325,14 +404,24 @@ def nddo_optimize(
         # Backtracking line search
         for ls in range(15):
             new_coords = coords + step * direction.reshape(n_atoms, 3)
-            new_result, new_grad = analytical_gradient(atoms, new_coords, method=method)
+            new_result, new_grad = analytical_gradient(
+                atoms,
+                new_coords,
+                method=method,
+                molecular_charge=molecular_charge,
+            )
             if new_result['energy_eV'] <= energy + 1e-4 * step * np.dot(grad_flat, direction):
                 break
             step *= 0.5
         else:
             step = 1e-4
             new_coords = coords + step * direction.reshape(n_atoms, 3)
-            new_result, new_grad = analytical_gradient(atoms, new_coords, method=method)
+            new_result, new_grad = analytical_gradient(
+                atoms,
+                new_coords,
+                method=method,
+                molecular_charge=molecular_charge,
+            )
 
         old_grad = grad_flat.copy()
         s_k = step * direction

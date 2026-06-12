@@ -89,5 +89,30 @@ def test_density_trace():
             f"{method} Tr(P) = {np.trace(P):.4f} != {n_elec}"
 
 
+def test_molecular_charge_sets_electron_count_for_anions():
+    """Charged closed-shell molecules must not use neutral atom electron counts."""
+    atoms = [8, 1]
+    coords = np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0]])
+
+    for method in ['RM1', 'AM1', 'PM3', 'PM6', 'PM6_SP', 'PM6_D', 'AM1_STAR', 'RM1_STAR']:
+        result = nddo_energy(atoms, coords, method=method, molecular_charge=-1, max_iter=200)
+        assert result['converged'], f"{method} did not converge for OH-"
+        assert result['n_electrons'] == 8
+        assert np.isclose(np.trace(result['density']), 8.0, atol=1e-6)
+        assert np.isclose(np.sum(result['charges']), -1.0, atol=1e-6)
+
+
+def test_batch_molecular_charges_match_single():
+    atoms = [8, 1]
+    coords = np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0]])
+
+    single = nddo_energy(atoms, coords, method='AM1', molecular_charge=-1)
+    batch = nddo_energy_batch([(atoms, coords)], method='AM1', molecular_charges=[-1], use_metal=False)[0]
+
+    assert batch['n_electrons'] == single['n_electrons']
+    assert np.isclose(np.sum(batch['charges']), -1.0, atol=1e-6)
+    assert np.allclose(batch['charges'], single['charges'], atol=1e-6)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
