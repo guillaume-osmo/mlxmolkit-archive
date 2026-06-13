@@ -27,6 +27,8 @@ class GraphMVPLoss:
     total: mx.array
     contrastive: mx.array
     reconstruction: mx.array
+    uniformity: mx.array
+    variance: mx.array
     accuracy_2d_to_3d: mx.array
     accuracy_3d_to_2d: mx.array
 
@@ -88,6 +90,10 @@ class GraphMVPPretrainer(nn.Module):
         temperature: float = 0.1,
         contrastive_weight: float = 1.0,
         reconstruction_weight: float = 1.0,
+        uniformity_weight: float = 0.0,
+        variance_weight: float = 0.0,
+        uniformity_temperature: float = 2.0,
+        variance_target: float = 0.05,
         reconstruction_loss: Literal["l2", "l1", "cosine"] = "l2",
         detach_target: bool = True,
     ) -> GraphMVPLoss:
@@ -106,11 +112,28 @@ class GraphMVPPretrainer(nn.Module):
             loss=reconstruction_loss,
             detach_target=detach_target,
         )
-        total = float(contrastive_weight) * contrastive + float(reconstruction_weight) * reconstruction
+        uniformity = symmetric_sphere_uniformity_loss_mlx(
+            embedding_2d,
+            embedding_3d,
+            temperature=uniformity_temperature,
+        )
+        variance = symmetric_batch_variance_loss_mlx(
+            embedding_2d,
+            embedding_3d,
+            target_std=variance_target,
+        )
+        total = (
+            float(contrastive_weight) * contrastive
+            + float(reconstruction_weight) * reconstruction
+            + float(uniformity_weight) * uniformity
+            + float(variance_weight) * variance
+        )
         return GraphMVPLoss(
             total=total,
             contrastive=contrastive,
             reconstruction=reconstruction,
+            uniformity=uniformity,
+            variance=variance,
             accuracy_2d_to_3d=acc_2d,
             accuracy_3d_to_2d=acc_3d,
         )
@@ -202,12 +225,82 @@ def bidirectional_representation_reconstruction_loss_mlx(
     return 0.5 * (loss_ab + loss_ba)
 
 
+def sphere_uniformity_loss_mlx(
+    embeddings: mx.array,
+    *,
+    temperature: float = 2.0,
+    eps: float = 1.0e-8,
+) -> mx.array:
+    """Uniformity loss on the unit sphere.
+
+    Collapsed embeddings have loss near zero. Well-spread embeddings produce a
+    more negative value, so minimizing this term discourages the common
+    contrastive-pretraining collapse where every molecule maps to one point.
+    """
+
+    embeddings = l2_normalize_mlx(embeddings)
+    n = int(embeddings.shape[0])
+    if n < 2:
+        return mx.array(0.0, dtype=embeddings.dtype)
+    cosine = embeddings @ mx.transpose(embeddings, (1, 0))
+    sqdist = mx.maximum(2.0 - 2.0 * cosine, mx.array(0.0, dtype=embeddings.dtype))
+    mask = 1.0 - mx.eye(n, dtype=embeddings.dtype)
+    values = mx.exp(-float(temperature) * sqdist) * mask
+    denom = mx.maximum(mx.sum(mask), mx.array(float(eps), dtype=embeddings.dtype))
+    return mx.log(mx.sum(values) / denom + mx.array(float(eps), dtype=embeddings.dtype))
+
+
+def symmetric_sphere_uniformity_loss_mlx(
+    view_a: mx.array,
+    view_b: mx.array,
+    *,
+    temperature: float = 2.0,
+) -> mx.array:
+    return 0.5 * (
+        sphere_uniformity_loss_mlx(view_a, temperature=temperature)
+        + sphere_uniformity_loss_mlx(view_b, temperature=temperature)
+    )
+
+
+def batch_variance_loss_mlx(
+    embeddings: mx.array,
+    *,
+    target_std: float = 0.05,
+    eps: float = 1.0e-4,
+) -> mx.array:
+    """Batch variance floor used as a cheap anti-collapse regularizer."""
+
+    n = int(embeddings.shape[0])
+    if n < 2:
+        return mx.array(0.0, dtype=embeddings.dtype)
+    centered = embeddings - mx.mean(embeddings, axis=0, keepdims=True)
+    variance = mx.mean(centered * centered, axis=0)
+    std = mx.sqrt(variance + mx.array(float(eps), dtype=embeddings.dtype))
+    return mx.mean(mx.maximum(float(target_std) - std, mx.array(0.0, dtype=embeddings.dtype)))
+
+
+def symmetric_batch_variance_loss_mlx(
+    view_a: mx.array,
+    view_b: mx.array,
+    *,
+    target_std: float = 0.05,
+) -> mx.array:
+    return 0.5 * (
+        batch_variance_loss_mlx(view_a, target_std=target_std)
+        + batch_variance_loss_mlx(view_b, target_std=target_std)
+    )
+
+
 __all__ = [
     "GraphMVPLoss",
     "GraphMVPPretrainer",
     "RepresentationProjector",
+    "batch_variance_loss_mlx",
     "bidirectional_representation_reconstruction_loss_mlx",
     "dual_info_nce_loss_mlx",
     "info_nce_loss_mlx",
     "representation_reconstruction_loss_mlx",
+    "sphere_uniformity_loss_mlx",
+    "symmetric_batch_variance_loss_mlx",
+    "symmetric_sphere_uniformity_loss_mlx",
 ]

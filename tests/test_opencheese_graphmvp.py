@@ -5,6 +5,8 @@ from opencheese import CheeseEmbeddingConfig, GraphMVPPretrainer, cheese_embeddi
 from opencheese.graphmvp import (
     bidirectional_representation_reconstruction_loss_mlx,
     dual_info_nce_loss_mlx,
+    sphere_uniformity_loss_mlx,
+    symmetric_batch_variance_loss_mlx,
 )
 
 
@@ -54,11 +56,27 @@ def test_graphmvp_pretrainer_loss_is_finite():
     model = GraphMVPPretrainer(_config(), _config())
 
     loss = model(batch_2d, batch_3d, temperature=0.2)
-    mx.eval(loss.total, loss.contrastive, loss.reconstruction)
+    mx.eval(loss.total, loss.contrastive, loss.reconstruction, loss.uniformity, loss.variance)
 
     assert np.isfinite(float(loss.total))
     assert np.isfinite(float(loss.contrastive))
     assert np.isfinite(float(loss.reconstruction))
+    assert np.isfinite(float(loss.uniformity))
+    assert np.isfinite(float(loss.variance))
+
+
+def test_graphmvp_anti_collapse_terms_detect_collapsed_embeddings():
+    collapsed = mx.array([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]], dtype=mx.float32)
+    spread = mx.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], dtype=mx.float32)
+
+    collapsed_uniformity = sphere_uniformity_loss_mlx(collapsed)
+    spread_uniformity = sphere_uniformity_loss_mlx(spread)
+    collapsed_variance = symmetric_batch_variance_loss_mlx(collapsed, collapsed, target_std=0.2)
+    spread_variance = symmetric_batch_variance_loss_mlx(spread, spread, target_std=0.2)
+    mx.eval(collapsed_uniformity, spread_uniformity, collapsed_variance, spread_variance)
+
+    assert float(spread_uniformity) < float(collapsed_uniformity)
+    assert float(spread_variance) < float(collapsed_variance)
 
 
 def test_representation_reconstruction_loss_modes_are_finite():

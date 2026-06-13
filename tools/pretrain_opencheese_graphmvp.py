@@ -149,12 +149,24 @@ def evaluate(
     pad_to: int | None,
     use_charges_3d: bool,
     temperature: float,
+    uniformity_weight: float,
+    variance_weight: float,
+    uniformity_temperature: float,
+    variance_target: float,
     reconstruction_loss: str,
     detach_target: bool,
     seed: int,
 ) -> dict[str, float]:
     if len(positions) == 0:
-        return {"loss": 0.0, "contrastive": 0.0, "reconstruction": 0.0, "acc_2d_to_3d": 0.0, "acc_3d_to_2d": 0.0}
+        return {
+            "loss": 0.0,
+            "contrastive": 0.0,
+            "reconstruction": 0.0,
+            "uniformity": 0.0,
+            "variance": 0.0,
+            "acc_2d_to_3d": 0.0,
+            "acc_3d_to_2d": 0.0,
+        }
     model.eval()
     rng = np.random.default_rng(seed)
     rows = []
@@ -170,15 +182,29 @@ def evaluate(
             batch_2d,
             batch_3d,
             temperature=temperature,
+            uniformity_weight=uniformity_weight,
+            variance_weight=variance_weight,
+            uniformity_temperature=uniformity_temperature,
+            variance_target=variance_target,
             reconstruction_loss=reconstruction_loss,
             detach_target=detach_target,
         )
-        mx.eval(loss.total, loss.contrastive, loss.reconstruction, loss.accuracy_2d_to_3d, loss.accuracy_3d_to_2d)
+        mx.eval(
+            loss.total,
+            loss.contrastive,
+            loss.reconstruction,
+            loss.uniformity,
+            loss.variance,
+            loss.accuracy_2d_to_3d,
+            loss.accuracy_3d_to_2d,
+        )
         rows.append(
             {
                 "loss": float(loss.total),
                 "contrastive": float(loss.contrastive),
                 "reconstruction": float(loss.reconstruction),
+                "uniformity": float(loss.uniformity),
+                "variance": float(loss.variance),
                 "acc_2d_to_3d": float(loss.accuracy_2d_to_3d),
                 "acc_3d_to_2d": float(loss.accuracy_3d_to_2d),
             }
@@ -206,6 +232,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--contrastive-weight", type=float, default=1.0)
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--uniformity-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the unit-sphere uniformity anti-collapse loss.",
+    )
+    parser.add_argument(
+        "--variance-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the batch-variance anti-collapse loss.",
+    )
+    parser.add_argument("--uniformity-temperature", type=float, default=2.0)
+    parser.add_argument("--variance-target", type=float, default=0.05)
     parser.add_argument("--reconstruction-loss", choices=["l2", "l1", "cosine"], default="l2")
     parser.add_argument("--detach-target", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-charges-3d", action="store_true")
@@ -255,6 +295,10 @@ def main() -> None:
             temperature=args.temperature,
             contrastive_weight=args.contrastive_weight,
             reconstruction_weight=args.reconstruction_weight,
+            uniformity_weight=args.uniformity_weight,
+            variance_weight=args.variance_weight,
+            uniformity_temperature=args.uniformity_temperature,
+            variance_target=args.variance_target,
             reconstruction_loss=args.reconstruction_loss,
             detach_target=args.detach_target,
         ).total
@@ -306,6 +350,10 @@ def main() -> None:
             pad_to=pad_to,
             use_charges_3d=bool(args.use_charges_3d),
             temperature=args.temperature,
+            uniformity_weight=args.uniformity_weight,
+            variance_weight=args.variance_weight,
+            uniformity_temperature=args.uniformity_temperature,
+            variance_target=args.variance_target,
             reconstruction_loss=args.reconstruction_loss,
             detach_target=args.detach_target,
             seed=args.seed + 1000 + epoch,
@@ -318,6 +366,10 @@ def main() -> None:
             pad_to=pad_to,
             use_charges_3d=bool(args.use_charges_3d),
             temperature=args.temperature,
+            uniformity_weight=args.uniformity_weight,
+            variance_weight=args.variance_weight,
+            uniformity_temperature=args.uniformity_temperature,
+            variance_target=args.variance_target,
             reconstruction_loss=args.reconstruction_loss,
             detach_target=args.detach_target,
             seed=args.seed + 2000 + epoch,
@@ -328,11 +380,15 @@ def main() -> None:
             "train_loss": train_eval["loss"],
             "train_contrastive": train_eval["contrastive"],
             "train_reconstruction": train_eval["reconstruction"],
+            "train_uniformity": train_eval["uniformity"],
+            "train_variance": train_eval["variance"],
             "train_acc_2d_to_3d": train_eval["acc_2d_to_3d"],
             "train_acc_3d_to_2d": train_eval["acc_3d_to_2d"],
             "valid_loss": valid_eval["loss"],
             "valid_contrastive": valid_eval["contrastive"],
             "valid_reconstruction": valid_eval["reconstruction"],
+            "valid_uniformity": valid_eval["uniformity"],
+            "valid_variance": valid_eval["variance"],
             "valid_acc_2d_to_3d": valid_eval["acc_2d_to_3d"],
             "valid_acc_3d_to_2d": valid_eval["acc_3d_to_2d"],
             "seconds": time.perf_counter() - epoch_start,
@@ -346,7 +402,8 @@ def main() -> None:
             print(
                 f"epoch {epoch:04d}/{args.epochs} step={row['step_loss']:.4f} "
                 f"valid={valid_eval['loss']:.4f} cl={valid_eval['contrastive']:.4f} "
-                f"rr={valid_eval['reconstruction']:.4f} acc={valid_eval['acc_2d_to_3d']:.3f}/"
+                f"rr={valid_eval['reconstruction']:.4f} uni={valid_eval['uniformity']:.4f} "
+                f"var={valid_eval['variance']:.4f} acc={valid_eval['acc_2d_to_3d']:.3f}/"
                 f"{valid_eval['acc_3d_to_2d']:.3f} best={best_valid:.4f}@{best_epoch}",
                 flush=True,
             )
@@ -362,6 +419,12 @@ def main() -> None:
         "last_weights": str(last_path),
         "metrics": str(metrics_path),
         "config": str(config_path),
+        "contrastive_weight": args.contrastive_weight,
+        "reconstruction_weight": args.reconstruction_weight,
+        "uniformity_weight": args.uniformity_weight,
+        "variance_weight": args.variance_weight,
+        "uniformity_temperature": args.uniformity_temperature,
+        "variance_target": args.variance_target,
         "seconds": time.perf_counter() - start_time,
         "final": rows[-1] if rows else {},
     }

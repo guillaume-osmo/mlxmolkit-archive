@@ -894,10 +894,14 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     best_path = args.out_dir / "best.safetensors"
+    best_recall5_path = args.out_dir / "best_recall_at_5.safetensors"
+    best_spearman_path = args.out_dir / "best_spearman.safetensors"
     last_path = args.out_dir / "last.safetensors"
     metrics_path = args.out_dir / "metrics.csv"
     config_path = args.out_dir / "config.json"
     embeddings_path = args.out_dir / "embeddings.npz"
+    embeddings_recall5_path = args.out_dir / "embeddings_recall_at_5.npz"
+    embeddings_spearman_path = args.out_dir / "embeddings_spearman.npz"
 
     config_path.write_text(json.dumps(asdict(config), indent=2, sort_keys=True) + "\n")
     print(
@@ -912,6 +916,10 @@ def main() -> None:
     rows: list[dict[str, float | int]] = []
     best_valid = float("inf")
     best_epoch = 0
+    best_recall5 = -float("inf")
+    best_recall5_epoch = 0
+    best_spearman = -float("inf")
+    best_spearman_epoch = 0
     start_time = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
@@ -1008,12 +1016,21 @@ def main() -> None:
             best_valid = valid_eval["mse"]
             best_epoch = epoch
             model.save_weights(str(best_path))
+        if valid_eval["recall_at_5"] > best_recall5:
+            best_recall5 = valid_eval["recall_at_5"]
+            best_recall5_epoch = epoch
+            model.save_weights(str(best_recall5_path))
+        if valid_eval["spearman"] > best_spearman:
+            best_spearman = valid_eval["spearman"]
+            best_spearman_epoch = epoch
+            model.save_weights(str(best_spearman_path))
         if epoch == 1 or epoch == args.epochs or epoch % max(args.eval_every, 1) == 0:
             print(
                 f"epoch {epoch:04d}/{args.epochs} "
                 f"train_mse={train_eval['mse']:.5f} valid_mse={valid_eval['mse']:.5f} "
                 f"valid_corr={valid_eval['corr']:.3f} valid_spearman={valid_eval['spearman']:.3f} "
-                f"recall5={valid_eval['recall_at_5']:.3f} best={best_valid:.5f}@{best_epoch}",
+                f"recall5={valid_eval['recall_at_5']:.3f} best_mse={best_valid:.5f}@{best_epoch} "
+                f"best_r5={best_recall5:.3f}@{best_recall5_epoch}",
                 flush=True,
             )
 
@@ -1023,6 +1040,12 @@ def main() -> None:
     best_model = CheeseGraphTransformer(config)
     best_model.load_weights(str(best_path))
     save_embeddings(best_model, dataset, embeddings_path, batch_size=args.batch_size, pad_to=pad_to)
+    best_recall5_model = CheeseGraphTransformer(config)
+    best_recall5_model.load_weights(str(best_recall5_path))
+    save_embeddings(best_recall5_model, dataset, embeddings_recall5_path, batch_size=args.batch_size, pad_to=pad_to)
+    best_spearman_model = CheeseGraphTransformer(config)
+    best_spearman_model.load_weights(str(best_spearman_path))
+    save_embeddings(best_spearman_model, dataset, embeddings_spearman_path, batch_size=args.batch_size, pad_to=pad_to)
 
     summary = {
         "dataset": str(args.data),
@@ -1049,8 +1072,16 @@ def main() -> None:
         "best_epoch": best_epoch,
         "best_valid_mse": best_valid,
         "best_weights": str(best_path),
+        "best_recall_at_5_epoch": best_recall5_epoch,
+        "best_valid_recall_at_5": best_recall5,
+        "best_recall_at_5_weights": str(best_recall5_path),
+        "best_spearman_epoch": best_spearman_epoch,
+        "best_valid_spearman": best_spearman,
+        "best_spearman_weights": str(best_spearman_path),
         "last_weights": str(last_path),
         "embeddings": str(embeddings_path),
+        "embeddings_recall_at_5": str(embeddings_recall5_path),
+        "embeddings_spearman": str(embeddings_spearman_path),
         "metrics": str(metrics_path),
         "config": str(config_path),
         "seconds": time.perf_counter() - start_time,

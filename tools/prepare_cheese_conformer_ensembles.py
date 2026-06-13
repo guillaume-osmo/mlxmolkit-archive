@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import signal
 import time
 
 import numpy as np
@@ -21,6 +22,14 @@ DEFAULT_DATASET = Path(
     "cheese_charge_training_am1bcc_resp.npz"
 )
 DEFAULT_OUT = Path("outputs/cheese_projection/cheese_ensembles_1000_k10_q_resp.npz")
+
+
+class MoleculeTimeoutError(TimeoutError):
+    """Raised when a single conformer-generation row exceeds its time budget."""
+
+
+def _raise_molecule_timeout(signum, frame):  # noqa: ARG001
+    raise MoleculeTimeoutError("per-molecule conformer generation timeout")
 
 
 def mol_from_smiles_with_conformers(
@@ -454,6 +463,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-optimize", action="store_true")
     parser.add_argument("--mmff-variant", default="MMFF94")
     parser.add_argument("--max-opt-iters", type=int, default=300)
+    parser.add_argument(
+        "--per-molecule-timeout",
+        type=int,
+        default=0,
+        help="Seconds before skipping one molecule; 0 disables the timeout.",
+    )
     parser.add_argument("--manifest", type=Path, default=None)
     return parser.parse_args()
 
@@ -508,6 +523,11 @@ def main() -> None:
     for out_index, dataset_index in enumerate(source_indices):
         dataset_index = int(dataset_index)
         smiles = str(dataset.smiles[dataset_index])
+        if args.per_molecule_timeout > 0:
+            old_alarm_handler = signal.signal(signal.SIGALRM, _raise_molecule_timeout)
+            signal.alarm(int(args.per_molecule_timeout))
+        else:
+            old_alarm_handler = None
         try:
             z0, _, bond0, total_charge, q = dataset.molecule_arrays(dataset_index, args.target)
             try:
@@ -632,6 +652,12 @@ def main() -> None:
                     "error": errors[-1],
                 }
             )
+        finally:
+            if args.per_molecule_timeout > 0:
+                signal.signal(signal.SIGALRM, signal.SIG_IGN)
+                signal.alarm(0)
+                if old_alarm_handler is not None:
+                    signal.signal(signal.SIGALRM, old_alarm_handler)
         if (out_index + 1) % 50 == 0 or out_index + 1 == len(source_indices):
             print(f"  {out_index + 1}/{len(source_indices)}", flush=True)
 
@@ -653,6 +679,8 @@ def main() -> None:
         "prune_rms_thresh": args.prune_rms_thresh,
         "optimize": not args.no_optimize,
         "mmff_variant": args.mmff_variant,
+        "max_opt_iters": args.max_opt_iters,
+        "per_molecule_timeout": args.per_molecule_timeout,
         "seconds": time.perf_counter() - start_time,
         "n_ok": int(np.sum(ok)),
         "n_failed": int(np.sum(~np.asarray(ok, dtype=bool))),
