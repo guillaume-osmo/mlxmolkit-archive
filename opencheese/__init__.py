@@ -59,6 +59,13 @@ from opencheese.embedding import (
     masked_mean_mlx,
     pair_distance_reconstruction_loss_mlx,
 )
+from opencheese.optimizers import (
+    MuonV2,
+    MuonV2W,
+    gram_newton_schulz,
+    newton_schulz_jordan,
+    polar_express,
+)
 
 __all__ = [
     "CheeseAlignmentConfig",
@@ -110,4 +117,9 @@ __all__ = [
     "local_chiral_volume_features_np",
     "masked_mean_mlx",
     "pair_distance_reconstruction_loss_mlx",
+    "MuonV2",
+    "MuonV2W",
+    "gram_newton_schulz",
+    "newton_schulz_jordan",
+    "polar_express",
 ]

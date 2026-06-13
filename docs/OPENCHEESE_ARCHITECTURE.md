@@ -140,6 +140,142 @@ The teacher artifact above was generated before the metadata-format rename, so
 its stored `format` is still `mlxmolkit.cheese_ensemble_pairwise_teacher`.
 Newly generated teachers use `opencheese.ensemble_pairwise_teacher`.
 
+## Improved shape training recipe
+
+Shape needs a different training recipe than electrostatics. In the current
+500-molecule teacher, the shape channel has a narrow score distribution, so
+plain MSE can look good while top-k retrieval remains mediocre. The improved
+recipe therefore uses:
+
+- `anchor_topk` batches: every training step contains true shape-neighbors,
+  hard negatives, and random negatives for each anchor.
+- `hybrid_shape` loss: calibrated distance MSE + pairwise ranking loss +
+  soft-neighborhood loss + optional InfoNCE/supervised contrastive positives.
+- scaled target distances: `distance_scale * d(similarity)^distance_power`
+  to avoid packing all shape distances into a tiny part of the unit sphere.
+  `d` can be `1 - similarity` or `-log(similarity)`.
+- teacher preprocessing: raw scores, per-anchor z-score scores, or
+  size-residual scores after subtracting a fitted molecular-size baseline.
+- MuonV2W optimizer: MuonV2/Polar Express for transformer hidden matrices and
+  AdamW for embeddings, layer norms, biases, decoders, and small projections.
+- retrieval metrics: Spearman, Recall@5/10, and NDCG@5/10, not MSE alone.
+- `--no-charges` for pure shape-only models when electrostatic charge features
+  may leak target information or add noise.
+
+Raw-teacher fine-tune with ranking/InfoNCE, apples-to-apples against the
+previous shape model:
+
+```bash
+python tools/train_cheese_projection.py \
+  --teacher outputs/cheese_projection/cheese_teacher_500_q_resp_k10_bestpair_principal_carbo.npz \
+  --teacher-channel shape \
+  --teacher-transform raw \
+  --loss-mode hybrid_shape \
+  --distance-transform one_minus_similarity \
+  --init-weights outputs/cheese_projection/embedding_q_resp_shape_carbo_h128_l4_e30_steps64/best.safetensors \
+  --out-dir outputs/cheese_projection/finetune_shape_raw_hybrid_infonce_muonv2_h128_l4_e8_steps64 \
+  --epochs 8 \
+  --steps-per-epoch 64 \
+  --batch-size 64 \
+  --optimizer muonv2w \
+  --lr 5e-5 \
+  --muon-lr 4e-4 \
+  --rank-weight 0.25 \
+  --soft-neighborhood-weight 0.05 \
+  --contrastive-weight 0.10 \
+  --contrastive-positive-threshold 0.75 \
+  --contrastive-positive-top-k 8 \
+  --distance-scale 2.0 \
+  --top-sim-weight 2.0 \
+  --sampler anchor_topk \
+  --anchor-rows 32 \
+  --positive-k 16 \
+  --hard-negative-k 128
+```
+
+Best local validation row:
+
+| Run | Valid MSE | Pearson | Spearman | Recall@5 | Recall@10 | NDCG@5 |
+|---|---:|---:|---:|---:|---:|---:|
+| previous hybrid MuonV2 | 0.014743 | 0.7029 | 0.5805 | 0.348 | 0.472 | 0.9373 |
+| raw + ranking + InfoNCE | 0.014540 | 0.7016 | 0.5829 | 0.360 | 0.476 | 0.9403 |
+| anchor-zscore + neglog + InfoNCE | 0.260630 | 0.5481 | 0.5696 | 0.332 | 0.472 | 0.8185 |
+
+The anchor-zscore run optimizes a transformed target, so its MSE is not directly
+comparable to the raw-score runs. It is useful as a preprocessing experiment,
+not yet the default.
+
+Pure-shape smoke path:
+
+```bash
+python tools/train_cheese_projection.py \
+  --teacher outputs/cheese_projection/cheese_teacher_500_q_resp_k10_bestpair_principal_carbo.npz \
+  --teacher-channel shape \
+  --teacher-transform size_residual \
+  --loss-mode hybrid_shape \
+  --distance-transform neglog_similarity \
+  --optimizer muonv2w \
+  --contrastive-weight 0.10 \
+  --sampler anchor_topk \
+  --no-charges \
+  --out-dir outputs/cheese_projection/shape_size_residual_neglog_infonce_nocharges
+```
+
+Use this from scratch. A checkpoint trained with charge features has a
+different module tree because `charge_projection` is absent in `--no-charges`
+models.
+
+## Better teacher refinement
+
+The fast ensemble teacher is good for dense coverage, but it is still a
+principal-frame approximation. For important shape pairs, refine the teacher by
+running full conformer-pair overlay and replacing only those matrix entries:
+
+```bash
+python tools/refine_opencheese_teacher_hardpairs.py \
+  --teacher outputs/cheese_projection/cheese_teacher_500_q_resp_k10_bestpair_principal_carbo.npz \
+  --ensembles outputs/cheese_projection/cheese_ensembles_1000_k10_q_resp.npz \
+  --select-channel shape \
+  --top-k-per-row 5 \
+  --min-score 0.70 \
+  --max-pairs 100 \
+  --out outputs/cheese_projection/cheese_teacher_500_q_resp_k10_bestpair_refined_toppairs.npz
+```
+
+This creates a hybrid teacher: cheap labels everywhere and expensive
+Roshambo-style labels where retrieval cares most.
+
+For a paper-style conformer ensemble, regenerate with `--n-conformers 20` before
+the teacher/refinement pass:
+
+```bash
+python tools/prepare_cheese_conformer_ensembles.py \
+  --data data/espaloma_charge_zenodo_17308526/recalculated_charges/test_random1000_both_symmetrized_partial_bcc_fill/cheese_charge_training_am1bcc_resp.npz \
+  --target q_resp \
+  --n-conformers 20 \
+  --out outputs/cheese_projection/cheese_ensembles_1000_k20_q_resp.npz
+```
+
+## ESP-grid preprocessing
+
+For electrostatic teachers, the next data upgrade is to cache surface ESP
+values instead of relying only on analytic charge-overlap labels. The helper
+below builds Connolly/MK-style grids for each selected conformer and
+regenerates point-charge ESP values with the MLX/Metal grid kernel:
+
+```bash
+python tools/prepare_opencheese_esp_grid_cache.py \
+  --ensembles outputs/cheese_projection/cheese_ensembles_1000_k10_q_resp.npz \
+  --limit 500 \
+  --max-conformers 10 \
+  --point-density 0.35 \
+  --out outputs/cheese_projection/opencheese_esp_grids_500_k10_q_resp.npz
+```
+
+The grid geometry is still CPU-side Connolly/MK point placement; potential
+evaluation is GPU-side. This cache is the right substrate for a stricter
+field/surface electrostatic teacher.
+
 ## Independence plan
 
 Step 1 is complete in this repository: create `opencheese` and switch training
