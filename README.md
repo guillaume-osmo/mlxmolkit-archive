@@ -86,7 +86,7 @@ result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
 
 ## Features
 
-- **Conformer Generation** — Drop-in replacement for RDKit's ETKDG (`EmbedMolecules`). Supports ETKDG, ETKDGv2, ETKDGv3, srETKDGv3, KDG, ETDG, and pure DG.
+- **Conformer Generation** — Drop-in replacement for RDKit's ETKDG (`EmbedMolecules`). Supports ETKDG, ETKDGv2, ETKDGv3, srETKDGv3, KDG, ETDG, ETDGv2, and pure DG.
 - **MMFF94 Optimization** — GPU-accelerated force field optimization (`MMFFOptimizeMoleculesConfs`). All 7 MMFF energy terms with fused Metal kernel. Full BFGS or L-BFGS in-kernel (zero CPU round-trips).
 - **Molecular Clustering** — Butina clustering at 150k+ molecules with divide-and-conquer memory management.
 - **N x k Parallel** — Generate k conformers for N molecules simultaneously. Constraints shared across conformers (`conf_to_mol` indirection, 50% memory savings).
@@ -97,9 +97,9 @@ result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
 
 | Pipeline | Time | Throughput | GPU Memory |
 |----------|------|-----------|------------|
-| DG only | 0.13s | 7,549 conf/s | 2.6 MB |
-| DG + ETK | 0.16s | 6,228 conf/s | 2.6 MB |
-| DG + ETK + MMFF | 0.52s | 1,908 conf/s | 5.1 MB |
+| DG only | 1.00s | 1,002 conf/s | 2.6 MB |
+| DG + ETK | 1.11s | 900 conf/s | 2.6 MB |
+| DG + ETK + MMFF | 1.63s | 614 conf/s | 5.1 MB |
 
 ### Conformer Memory Scaling (DG + ETK + MMFF, batch=500)
 
@@ -183,13 +183,42 @@ The divide-and-conquer queue automatically splits into multiple batches when tot
 
 | Variant | conf/s | Convergence |
 |---------|--------|-------------|
-| DG | 7,549 | 96.6% |
-| KDG | 7,243 | 96.6% |
-| ETDG | 1,844 | 96.6% |
-| ETKDG | 6,064 | 96.6% |
-| ETKDGv2 | 6,228 | 96.6% |
-| ETKDGv3 | 6,636 | 96.6% |
-| srETKDGv3 | 6,678 | 96.6% |
+| DG | 1,005 | 100.0% |
+| KDG | 910 | 99.1% |
+| ETDG | 1,009 | 100.0% |
+| ETDGv2 | 1,008 | 100.0% |
+| ETKDG | 907 | 99.1% |
+| ETKDGv2 | 904 | 99.1% |
+| ETKDGv3 | 895 | 99.1% |
+| srETKDGv3 | 914 | 100.0% |
+
+### RDKit vs mlxmolkit conformer quality (N=20, k=10)
+
+After the ETK/MMFF packing fixes and batched MLX Horn alignment, the current
+RDKit-vs-mlxmolkit comparison on the CHEESE charge-training subset reports:
+
+| Setting | Value |
+|---------|------:|
+| RDKit reference | ETKDGv3 + MMFF94 |
+| mlxmolkit path | ETKDGv3 + MMFF94 |
+| Mean best shape Carbo | 0.934633 |
+| Mean best electrostatic Carbo | 0.996936 |
+| Mean best combined score | 0.966551 |
+| Median best heavy-atom RMSD | 0.449579 A |
+
+The scoring path aligns all mlxmolkit conformers to all RDKit conformers with
+batched MLX Horn quaternion alignment, then evaluates paired shape Carbo and
+electrostatic Carbo in one MLX tensor pass per molecule. It avoids per-pair CPU
+Kabsch/SVD loops and repeated tiny CHEESE kernel launches.
+
+Reproduce with:
+
+```bash
+python tools/compare_rdkit_mlx_conformers.py \
+  --limit 20 \
+  --n-conformers 10 \
+  --out outputs/cheese_projection/rdkit_vs_mlx_conformers_20_k10_batched_scoring_after_fixes.csv
+```
 
 ## Architecture
 
@@ -211,7 +240,7 @@ SMILES x N
 [Extract 3D] Drop 4th coordinate
     |
 +-- Stage 2: ETK minimize (3D, Metal TPM=32) --------+
-|   CSD torsion + improper + 1-4 distance             |
+|   CSD torsion + improper + 1-2/1-3/1-4 distance     |
 |   Optional parallel_grad for large molecules        |
 +-----------------------------------------------------+
     |
@@ -279,7 +308,7 @@ result = generate_conformers_nk(smiles_list, n_confs_per_mol=10,
 | MMFF94s variant | `mmff_variant="MMFF94s"` | Softer torsion barriers | Conjugated/aromatic molecules |
 | MMFF L-BFGS | `mmff_use_lbfgs=True` | 5x less memory | Molecules >50 atoms |
 | MMFF BFGS (default) | `mmff_use_lbfgs=False` | 2x faster for small mols | Molecules <50 atoms |
-| ETKDG variant | `variant="ETKDGv3"` | 7 variants supported | Choose per use case |
+| ETKDG variant | `variant="ETKDGv3"` | 8 variants supported | Choose per use case |
 
 ### MMFF94 Force Field Variants
 

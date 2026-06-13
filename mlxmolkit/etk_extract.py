@@ -4,7 +4,7 @@ Extract ETKDG torsion parameters from RDKit molecules.
 Extracts:
   - CSD experimental torsion preferences (6-term Fourier)
   - Improper torsion terms (planarity at sp2 centers)
-  - 1-4 distance constraints (from bounds matrix)
+  - 1-2, 1-3, and 1-4 distance constraints (from bounds matrix)
 
 These parameters are used in stage 5 of the ETKDG pipeline, where 3D
 coordinates are refined after 4D→3D collapse to match torsional
@@ -17,6 +17,22 @@ from dataclasses import dataclass
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
+
+
+ETKDG_VARIANTS = {
+    # Mirrors the flags returned by RDKit's rdDistGeom factories.
+    # tuple order:
+    # use_exp_torsion, use_basic_knowledge, use_small_ring_torsions,
+    # use_macrocycle_torsions, use_macrocycle14config, et_version
+    "DG":        (False, False, False, False, False, 1),
+    "KDG":       (False, True,  False, False, False, 1),
+    "ETDG":      (True,  False, False, False, False, 1),
+    "ETDGv2":    (True,  False, False, False, False, 2),
+    "ETKDG":     (True,  True,  False, False, False, 1),
+    "ETKDGv2":   (True,  True,  False, False, False, 2),
+    "ETKDGv3":   (True,  True,  False, True,  True,  2),
+    "srETKDGv3": (True,  True,  True,  False, False, 2),
+}
 
 
 @dataclass
@@ -74,6 +90,22 @@ class BatchedETKSystem:
     improper_weight: np.ndarray      # (n_improper_total,) float32
     improper_term_starts: np.ndarray # (n_mols+1,) int32
 
+    # 1-2 distance constraints (global atom indices)
+    dist12_idx1: np.ndarray
+    dist12_idx2: np.ndarray
+    dist12_lb: np.ndarray
+    dist12_ub: np.ndarray
+    dist12_weight: np.ndarray
+    dist12_term_starts: np.ndarray   # (n_mols+1,) int32
+
+    # 1-3 distance constraints (global atom indices)
+    dist13_idx1: np.ndarray
+    dist13_idx2: np.ndarray
+    dist13_lb: np.ndarray
+    dist13_ub: np.ndarray
+    dist13_weight: np.ndarray
+    dist13_term_starts: np.ndarray   # (n_mols+1,) int32
+
     # 1-4 distance constraints (global atom indices)
     dist14_idx1: np.ndarray
     dist14_idx2: np.ndarray
@@ -93,6 +125,7 @@ def extract_etk_params(
     use_basic_knowledge: bool = True,
     use_small_ring_torsions: bool = False,
     use_macrocycle_torsions: bool = True,
+    use_macrocycle14config: bool = False,
     et_version: int = 2,
     variant: str | None = None,
 ) -> ETKParams:
@@ -101,32 +134,36 @@ def extract_etk_params(
 
     Supports all ETKDG variants via the ``variant`` shortcut or individual flags:
 
-    ========== ============ ================ ========== ==========
-    variant    exp_torsion  basic_knowledge  small_ring et_version
-    ========== ============ ================ ========== ==========
-    DG         False        False            False      —
-    KDG        False        True             False      2
-    ETDG       True         False            False      2
-    ETKDG      True         True             False      1
-    ETKDGv2    True         True             False      2
-    ETKDGv3    True         True             False      3
-    srETKDGv3  True         True             True       3
-    ========== ============ ================ ========== ==========
+    ========== ============ ================ ========== ========== ============ ==========
+    variant    exp_torsion  basic_knowledge  small_ring macrocycle macrocycle14 et_version
+    ========== ============ ================ ========== ========== ============ ==========
+    DG         False        False            False      False      False        —
+    KDG        False        True             False      False      False        1
+    ETDG       True         False            False      False      False        1
+    ETDGv2     True         False            False      False      False        2
+    ETKDG      True         True             False      False      False        1
+    ETKDGv2    True         True             False      False      False        2
+    ETKDGv3    True         True             False      True       True         2
+    srETKDGv3  True         True             True       False      False        2
+    ========== ============ ================ ========== ========== ============ ==========
     """
     # Variant shortcut
-    _VARIANTS = {
-        "DG":        (False, False, False, 2),
-        "KDG":       (False, True,  False, 2),
-        "ETDG":      (True,  False, False, 2),
-        "ETKDG":     (True,  True,  False, 1),
-        "ETKDGv2":   (True,  True,  False, 2),
-        "ETKDGv3":   (True,  True,  False, 3),
-        "srETKDGv3": (True,  True,  True,  3),
-    }
+    torsion_embed_params = None
     if variant is not None:
-        if variant not in _VARIANTS:
-            raise ValueError(f"Unknown variant '{variant}'. Choose from: {list(_VARIANTS)}")
-        use_exp_torsion, use_basic_knowledge, use_small_ring_torsions, et_version = _VARIANTS[variant]
+        if variant not in ETKDG_VARIANTS:
+            raise ValueError(f"Unknown variant '{variant}'. Choose from: {list(ETKDG_VARIANTS)}")
+        (
+            use_exp_torsion,
+            use_basic_knowledge,
+            use_small_ring_torsions,
+            use_macrocycle_torsions,
+            use_macrocycle14config,
+            et_version,
+        ) = ETKDG_VARIANTS[variant]
+        if variant != "DG":
+            factory = getattr(rdDistGeom, variant, None)
+            if factory is not None:
+                torsion_embed_params = factory()
 
     n_atoms = mol.GetNumAtoms()
 
@@ -137,20 +174,21 @@ def extract_etk_params(
 
     if use_exp_torsion or use_basic_knowledge:
         try:
-            kwargs = {}
-            # Check if GetExperimentalTorsions supports these params
-            try:
-                exp_torsions = rdDistGeom.GetExperimentalTorsions(
-                    mol,
-                    useExpTorsionAnglePrefs=use_exp_torsion,
-                    useSmallRingTorsions=use_small_ring_torsions,
-                    useMacrocycleTorsions=use_macrocycle_torsions,
-                    useBasicKnowledge=use_basic_knowledge,
-                    ETversion=et_version,
-                )
-            except TypeError:
-                # Older RDKit: no variant params
-                exp_torsions = rdDistGeom.GetExperimentalTorsions(mol)
+            if torsion_embed_params is not None:
+                exp_torsions = rdDistGeom.GetExperimentalTorsions(mol, torsion_embed_params)
+            else:
+                try:
+                    exp_torsions = rdDistGeom.GetExperimentalTorsions(
+                        mol,
+                        useExpTorsionAnglePrefs=use_exp_torsion,
+                        useSmallRingTorsions=use_small_ring_torsions,
+                        useMacrocycleTorsions=use_macrocycle_torsions,
+                        useBasicKnowledge=use_basic_knowledge,
+                        ETversion=et_version,
+                    )
+                except TypeError:
+                    # Older RDKit: no variant params
+                    exp_torsions = rdDistGeom.GetExperimentalTorsions(mol)
 
             for t in exp_torsions:
                 atoms = list(t["atomIndices"])
@@ -351,6 +389,38 @@ def batch_etk_params(
             imp_idx_parts.append(idx_shifted)
             imp_w_parts.append(p.improper_weight)
 
+    # --- 1-2 distance constraints ---
+    d12_i1_parts, d12_i2_parts = [], []
+    d12_lb_parts, d12_ub_parts, d12_w_parts = [], [], []
+    dist12_term_starts = np.zeros(n_mols + 1, dtype=np.int32)
+
+    for i, p in enumerate(params_list):
+        offset = int(atom_starts[i])
+        n = len(p.dist12_idx1)
+        dist12_term_starts[i + 1] = dist12_term_starts[i] + n
+        if n > 0:
+            d12_i1_parts.append(p.dist12_idx1 + offset)
+            d12_i2_parts.append(p.dist12_idx2 + offset)
+            d12_lb_parts.append(p.dist12_lb)
+            d12_ub_parts.append(p.dist12_ub)
+            d12_w_parts.append(p.dist12_weight)
+
+    # --- 1-3 distance constraints ---
+    d13_i1_parts, d13_i2_parts = [], []
+    d13_lb_parts, d13_ub_parts, d13_w_parts = [], [], []
+    dist13_term_starts = np.zeros(n_mols + 1, dtype=np.int32)
+
+    for i, p in enumerate(params_list):
+        offset = int(atom_starts[i])
+        n = len(p.dist13_idx1)
+        dist13_term_starts[i + 1] = dist13_term_starts[i] + n
+        if n > 0:
+            d13_i1_parts.append(p.dist13_idx1 + offset)
+            d13_i2_parts.append(p.dist13_idx2 + offset)
+            d13_lb_parts.append(p.dist13_lb)
+            d13_ub_parts.append(p.dist13_ub)
+            d13_w_parts.append(p.dist13_weight)
+
     # --- 1-4 distance constraints ---
     d14_i1_parts, d14_i2_parts = [], []
     d14_lb_parts, d14_ub_parts, d14_w_parts = [], [], []
@@ -378,6 +448,18 @@ def batch_etk_params(
         improper_idx=_concat_or_empty(imp_idx_parts, np.int32, (4,)),
         improper_weight=_concat_or_empty(imp_w_parts, np.float32),
         improper_term_starts=improper_term_starts,
+        dist12_idx1=_concat_or_empty(d12_i1_parts, np.int32),
+        dist12_idx2=_concat_or_empty(d12_i2_parts, np.int32),
+        dist12_lb=_concat_or_empty(d12_lb_parts, np.float32),
+        dist12_ub=_concat_or_empty(d12_ub_parts, np.float32),
+        dist12_weight=_concat_or_empty(d12_w_parts, np.float32),
+        dist12_term_starts=dist12_term_starts,
+        dist13_idx1=_concat_or_empty(d13_i1_parts, np.int32),
+        dist13_idx2=_concat_or_empty(d13_i2_parts, np.int32),
+        dist13_lb=_concat_or_empty(d13_lb_parts, np.float32),
+        dist13_ub=_concat_or_empty(d13_ub_parts, np.float32),
+        dist13_weight=_concat_or_empty(d13_w_parts, np.float32),
+        dist13_term_starts=dist13_term_starts,
         dist14_idx1=_concat_or_empty(d14_i1_parts, np.int32),
         dist14_idx2=_concat_or_empty(d14_i2_parts, np.int32),
         dist14_lb=_concat_or_empty(d14_lb_parts, np.float32),

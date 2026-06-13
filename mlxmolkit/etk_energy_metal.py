@@ -1,11 +1,13 @@
 """
 3D ETK (Experimental Torsion Knowledge) energy and gradient on Metal.
 
-Three energy terms for stage 5 of ETKDG:
+Five energy terms for stage 5 of ETKDG:
   1. CSD torsion preferences: 6-term Fourier series
      E = Σ_{k=1}^{6} V_k * (1 + sign_k * cos(k * φ)) / 2
   2. Improper torsion (planarity): E = w * (1 - cos(2ω))
-  3. 1-4 distance constraints: flat-bottom with harmonic penalty
+  3. 1-2 distance constraints: flat-bottom with harmonic penalty
+  4. 1-3 distance constraints: flat-bottom with harmonic penalty
+  5. 1-4 distance constraints: flat-bottom with harmonic penalty
 
 All threads compute both energy AND gradient (parallel scatter).
 One thread per (global_atom, 3D_coord).
@@ -219,6 +221,82 @@ for (uint ii = imp_start; ii < imp_end; ii++) {{
     else grad_val += dE_dw * dp3;
 }}
 
+// ======== 1-2 Distance constraints ========
+uint d12_start = (uint)dist12_starts[mol_id];
+uint d12_end   = (uint)dist12_starts[mol_id + 1];
+
+for (uint di = d12_start; di < d12_end; di++) {{
+    uint a = (uint)d12_i1[di];
+    uint b = (uint)d12_i2[di];
+
+    bool is_a = (a == global_atom);
+    bool is_b = (b == global_atom);
+    if (!is_a && !is_b) continue;
+
+    float dx = pos[a*3+0] - pos[b*3+0];
+    float dy = pos[a*3+1] - pos[b*3+1];
+    float dz = pos[a*3+2] - pos[b*3+2];
+    float d = sqrt(dx*dx + dy*dy + dz*dz + 1e-12f);
+
+    float lb = d12_lb_arr[di];
+    float ub = d12_ub_arr[di];
+    float w = d12_w[di];
+
+    float my_diff;
+    if (coord == 0u) my_diff = dx;
+    else if (coord == 1u) my_diff = dy;
+    else my_diff = dz;
+    if (!is_a) my_diff = -my_diff;
+
+    if (d < lb) {{
+        float diff = d - lb;
+        if (coord == 0u && is_a) e_contrib += w * diff * diff;
+        grad_val += w * 2.0f * diff * my_diff / d;
+    }} else if (d > ub) {{
+        float diff = d - ub;
+        if (coord == 0u && is_a) e_contrib += w * diff * diff;
+        grad_val += w * 2.0f * diff * my_diff / d;
+    }}
+}}
+
+// ======== 1-3 Distance constraints ========
+uint d13_start = (uint)dist13_starts[mol_id];
+uint d13_end   = (uint)dist13_starts[mol_id + 1];
+
+for (uint di = d13_start; di < d13_end; di++) {{
+    uint a = (uint)d13_i1[di];
+    uint b = (uint)d13_i2[di];
+
+    bool is_a = (a == global_atom);
+    bool is_b = (b == global_atom);
+    if (!is_a && !is_b) continue;
+
+    float dx = pos[a*3+0] - pos[b*3+0];
+    float dy = pos[a*3+1] - pos[b*3+1];
+    float dz = pos[a*3+2] - pos[b*3+2];
+    float d = sqrt(dx*dx + dy*dy + dz*dz + 1e-12f);
+
+    float lb = d13_lb_arr[di];
+    float ub = d13_ub_arr[di];
+    float w = d13_w[di];
+
+    float my_diff;
+    if (coord == 0u) my_diff = dx;
+    else if (coord == 1u) my_diff = dy;
+    else my_diff = dz;
+    if (!is_a) my_diff = -my_diff;
+
+    if (d < lb) {{
+        float diff = d - lb;
+        if (coord == 0u && is_a) e_contrib += w * diff * diff;
+        grad_val += w * 2.0f * diff * my_diff / d;
+    }} else if (d > ub) {{
+        float diff = d - ub;
+        if (coord == 0u && is_a) e_contrib += w * diff * diff;
+        grad_val += w * 2.0f * diff * my_diff / d;
+    }}
+}}
+
 // ======== 1-4 Distance constraints ========
 uint d14_start = (uint)dist14_starts[mol_id];
 uint d14_end   = (uint)dist14_starts[mol_id + 1];
@@ -277,6 +355,10 @@ def _get_etk_kernel():
                 "atom_starts",
                 "torsion_idx", "torsion_V", "torsion_signs", "torsion_starts",
                 "improper_i", "improper_w", "improper_starts",
+                "d12_i1", "d12_i2", "d12_lb_arr", "d12_ub_arr", "d12_w",
+                "dist12_starts",
+                "d13_i1", "d13_i2", "d13_lb_arr", "d13_ub_arr", "d13_w",
+                "dist13_starts",
                 "d14_i1", "d14_i2", "d14_lb_arr", "d14_ub_arr", "d14_w",
                 "dist14_starts",
             ],
@@ -332,6 +414,22 @@ def make_etk_energy_grad(
     improper_starts_mx = mx.array(system.improper_term_starts, dtype=mx.int32)
 
     # 1-4 distance terms
+    d12_i1_mx = _ensure_nonempty_1d(system.dist12_idx1, mx.int32)
+    d12_i2_mx = _ensure_nonempty_1d(system.dist12_idx2, mx.int32)
+    d12_lb_mx = _ensure_nonempty_1d(system.dist12_lb, mx.float32)
+    d12_ub_mx = _ensure_nonempty_1d(system.dist12_ub, mx.float32)
+    d12_w_mx = _ensure_nonempty_1d(system.dist12_weight, mx.float32)
+    dist12_starts_mx = mx.array(system.dist12_term_starts, dtype=mx.int32)
+
+    # 1-3 distance terms
+    d13_i1_mx = _ensure_nonempty_1d(system.dist13_idx1, mx.int32)
+    d13_i2_mx = _ensure_nonempty_1d(system.dist13_idx2, mx.int32)
+    d13_lb_mx = _ensure_nonempty_1d(system.dist13_lb, mx.float32)
+    d13_ub_mx = _ensure_nonempty_1d(system.dist13_ub, mx.float32)
+    d13_w_mx = _ensure_nonempty_1d(system.dist13_weight, mx.float32)
+    dist13_starts_mx = mx.array(system.dist13_term_starts, dtype=mx.int32)
+
+    # 1-4 distance terms
     d14_i1_mx = _ensure_nonempty_1d(system.dist14_idx1, mx.int32)
     d14_i2_mx = _ensure_nonempty_1d(system.dist14_idx2, mx.int32)
     d14_lb_mx = _ensure_nonempty_1d(system.dist14_lb, mx.float32)
@@ -348,6 +446,10 @@ def make_etk_energy_grad(
                 atom_starts_mx,
                 torsion_idx_mx, torsion_V_mx, torsion_signs_mx, torsion_starts_mx,
                 improper_idx_mx, improper_w_mx, improper_starts_mx,
+                d12_i1_mx, d12_i2_mx, d12_lb_mx, d12_ub_mx, d12_w_mx,
+                dist12_starts_mx,
+                d13_i1_mx, d13_i2_mx, d13_lb_mx, d13_ub_mx, d13_w_mx,
+                dist13_starts_mx,
                 d14_i1_mx, d14_i2_mx, d14_lb_mx, d14_ub_mx, d14_w_mx,
                 dist14_starts_mx,
             ],

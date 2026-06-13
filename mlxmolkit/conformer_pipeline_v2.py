@@ -262,7 +262,8 @@ def _process_chunk(
     # ---- Stage 3: ETK minimize (3D) ----
     # ETK params already added to batch3 in stage 2c (with updated reference positions)
     etk_e = np.zeros(C, dtype=np.float32)
-    etk_s = np.ones(C, dtype=np.int32)
+    etk_s = np.zeros(C, dtype=np.int32)
+    has_etk = False
     if etk_params_list is not None:
         if batch3.etk_torsion_term_starts is None:
             # Params not added yet (no reference update path)
@@ -271,6 +272,8 @@ def _process_chunk(
         has_etk = (
             (batch3.etk_torsion_term_starts is not None and batch3.etk_torsion_term_starts[-1] > 0)
             or (batch3.etk_improper_term_starts is not None and batch3.etk_improper_term_starts[-1] > 0)
+            or (batch3.etk_dist12_term_starts is not None and batch3.etk_dist12_term_starts[-1] > 0)
+            or (batch3.etk_dist13_term_starts is not None and batch3.etk_dist13_term_starts[-1] > 0)
             or (batch3.etk_dist14_term_starts is not None and batch3.etk_dist14_term_starts[-1] > 0)
         )
         if has_etk:
@@ -281,9 +284,12 @@ def _process_chunk(
 
     # ---- Stage 4: MMFF94 optimization (3D) ----
     mmff_e = np.zeros(C, dtype=np.float32)
+    mmff_converged = np.ones(C, dtype=bool)
+    mmff_ran = False
     if run_mmff and mols_list is not None:
         from rdkit.Chem import AllChem
         chunk_mmff = []
+        mmff_converged[:] = False
         # Use first conformer of each molecule for MMFF param extraction
         conf_cursor = 0
         for chunk_mol_ord, mol_idx in enumerate(mol_order):
@@ -305,11 +311,12 @@ def _process_chunk(
 
         if chunk_mmff is not None:
             chunk_mmff_k = [mol_k[m] for m in mol_order]
-            pos3, mmff_e, _ = mmff_minimize_nk(
+            pos3, mmff_e, mmff_converged = mmff_minimize_nk(
                 chunk_mmff, chunk_mmff_k, pos3,
                 max_iters=mmff_max_iters,
                 use_lbfgs=mmff_use_lbfgs,
             )
+            mmff_ran = True
 
     # ---- Collect results per conformer ----
     results = []
@@ -320,10 +327,16 @@ def _process_chunk(
             n_a = dg_params_list[mol_idx].n_atoms
             s3 = int(batch3.conf_atom_starts[c]) * 3
             p3 = pos3[s3:s3 + n_a * 3].reshape(n_a, 3).copy()
+            energy = float(mmff_e[c]) if mmff_ran else float(dg_e[c]) + float(etk_e[c])
+            converged = (
+                bool(dg_s[c] == 0)
+                and (not has_etk or bool(etk_s[c] == 0))
+                and (not run_mmff or (mmff_ran and bool(mmff_converged[c])))
+            )
             results.append((
                 mol_idx, p3,
-                float(mmff_e[c]) if run_mmff else float(dg_e[c]) + float(etk_e[c]),
-                bool(dg_s[c] == 0),
+                energy,
+                converged,
             ))
             c += 1
 
@@ -354,7 +367,7 @@ def generate_conformers_nk(
 
     Full pipeline: SMILES → DG (4D) → 3D → ETK (3D) → MMFF94 (optional)
 
-    Supports all ETKDG variants: DG, KDG, ETDG, ETKDG, ETKDGv2, ETKDGv3,
+    Supports all ETKDG variants: DG, KDG, ETDG, ETDGv2, ETKDG, ETKDGv2, ETKDGv3,
     srETKDGv3.  The variant controls which ETK terms are active.
 
     Parameters
@@ -372,7 +385,7 @@ def generate_conformers_nk(
     etk_max_iters : int
         L-BFGS iterations for ETK stage. 0 = auto-scale.
     variant : str
-        ETKDG variant: DG, KDG, ETDG, ETKDG, ETKDGv2, ETKDGv3, srETKDGv3.
+        ETKDG variant: DG, KDG, ETDG, ETDGv2, ETKDG, ETKDGv2, ETKDGv3, srETKDGv3.
     run_mmff : bool
         Whether to run MMFF94 force field optimization (default False).
     mmff_max_iters : int
