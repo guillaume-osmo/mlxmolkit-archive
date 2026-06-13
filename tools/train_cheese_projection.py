@@ -757,6 +757,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--valid-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=20260613)
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=None,
+        help="Seed for the train/validation split. Defaults to --seed for backward compatibility.",
+    )
+    parser.add_argument(
+        "--sampler-seed",
+        type=int,
+        default=None,
+        help="Seed for stochastic batch sampling. Defaults to --seed for backward compatibility.",
+    )
     parser.add_argument("--lr", type=float, default=5.0e-4)
     parser.add_argument("--weight-decay", type=float, default=1.0e-4)
     parser.add_argument("--optimizer", choices=["adamw", "muonv2w"], default="adamw")
@@ -823,10 +835,12 @@ def main() -> None:
         teacher_transform=args.teacher_transform,
         zscore_temperature=args.zscore_temperature,
     )
+    split_seed = int(args.seed if args.split_seed is None else args.split_seed)
+    sampler_seed = int(args.seed if args.sampler_seed is None else args.sampler_seed)
     train_positions, valid_positions = split_positions(
         dataset.n_molecules,
         valid_fraction=args.valid_fraction,
-        seed=args.seed,
+        seed=split_seed,
     )
     pad_to = None if args.dynamic_pad else dataset.max_atoms
     config = CheeseEmbeddingConfig(
@@ -908,7 +922,8 @@ def main() -> None:
         f"Training openCHEESE projection n={dataset.n_molecules} train={len(train_positions)} "
         f"valid={len(valid_positions)} target={dataset.target} channel={dataset.teacher_channel} "
         f"transform={args.teacher_transform} loss={args.loss_mode} optimizer={args.optimizer} "
-        f"sampler={args.sampler} charges={not args.no_charges} batch={args.batch_size}"
+        f"sampler={args.sampler} charges={not args.no_charges} batch={args.batch_size} "
+        f"split_seed={split_seed} sampler_seed={sampler_seed}"
         + (f" init={args.init_weights}" if args.init_weights is not None else ""),
         flush=True,
     )
@@ -926,7 +941,7 @@ def main() -> None:
         model.train()
         epoch_start = time.perf_counter()
         step_losses = []
-        rng = np.random.default_rng(args.seed + epoch)
+        rng = np.random.default_rng(sampler_seed + epoch)
 
         if args.sampler == "anchor_topk":
             steps = args.steps_per_epoch if args.steps_per_epoch > 0 else max(1, int(np.ceil(len(train_positions) / args.batch_size)))
@@ -953,8 +968,8 @@ def main() -> None:
                 for _ in range(args.steps_per_epoch)
             ]
         else:
-            row_blocks = list(iter_batches(train_positions, batch_size=args.batch_size, shuffle=True, seed=args.seed + epoch))
-            col_blocks = list(iter_batches(train_positions, batch_size=args.batch_size, shuffle=True, seed=args.seed + 17 * epoch))
+            row_blocks = list(iter_batches(train_positions, batch_size=args.batch_size, shuffle=True, seed=sampler_seed + epoch))
+            col_blocks = list(iter_batches(train_positions, batch_size=args.batch_size, shuffle=True, seed=sampler_seed + 17 * epoch))
             block_pairs = [(row_block, col_block) for row_block in row_blocks for col_block in col_blocks]
 
         for row_positions, col_positions in block_pairs:
@@ -1058,6 +1073,9 @@ def main() -> None:
         "loss_mode": args.loss_mode,
         "optimizer": args.optimizer,
         "sampler": args.sampler,
+        "seed": int(args.seed),
+        "split_seed": split_seed,
+        "sampler_seed": sampler_seed,
         "use_charges": not bool(args.no_charges),
         "distance_transform": args.distance_transform,
         "distance_scale": args.distance_scale,

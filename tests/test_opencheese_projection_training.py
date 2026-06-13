@@ -8,6 +8,7 @@ from tools.train_cheese_projection import (
     anchor_zscore_to_unit,
     projection_metric_loss,
     size_residual_teacher_to_unit,
+    split_positions,
     supervised_contrastive_loss_mlx,
     target_distance_mlx,
 )
@@ -93,3 +94,14 @@ def test_muonv2w_updates_opencheese_model_parameters():
 
     assert polar_express(mx.eye(4, dtype=mx.float32)).shape == (4, 4)
     assert not np.allclose(before, after)
+
+
+def test_split_positions_is_controlled_by_explicit_split_seed():
+    train_a, valid_a = split_positions(20, valid_fraction=0.2, seed=123)
+    train_b, valid_b = split_positions(20, valid_fraction=0.2, seed=123)
+    train_c, valid_c = split_positions(20, valid_fraction=0.2, seed=124)
+
+    assert np.array_equal(train_a, train_b)
+    assert np.array_equal(valid_a, valid_b)
+    assert not np.array_equal(valid_a, valid_c)
+    assert set(train_a).isdisjoint(set(valid_a))
