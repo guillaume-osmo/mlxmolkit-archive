@@ -59,6 +59,15 @@ from opencheese.embedding import (
     masked_mean_mlx,
     pair_distance_reconstruction_loss_mlx,
 )
+from opencheese.graphmvp import (
+    GraphMVPLoss,
+    GraphMVPPretrainer,
+    RepresentationProjector,
+    bidirectional_representation_reconstruction_loss_mlx,
+    dual_info_nce_loss_mlx,
+    info_nce_loss_mlx,
+    representation_reconstruction_loss_mlx,
+)
 from opencheese.optimizers import (
     MuonV2,
     MuonV2W,
@@ -117,6 +126,13 @@ __all__ = [
     "local_chiral_volume_features_np",
     "masked_mean_mlx",
     "pair_distance_reconstruction_loss_mlx",
+    "GraphMVPLoss",
+    "GraphMVPPretrainer",
+    "RepresentationProjector",
+    "bidirectional_representation_reconstruction_loss_mlx",
+    "dual_info_nce_loss_mlx",
+    "info_nce_loss_mlx",
+    "representation_reconstruction_loss_mlx",
     "MuonV2",
     "MuonV2W",
     "gram_newton_schulz",

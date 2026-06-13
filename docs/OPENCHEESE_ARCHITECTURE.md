@@ -329,6 +329,34 @@ against the 3D branch with:
 This would make the projection model less brittle to any single conformer and
 would let the 2D graph branch inherit 3D shape/electrostatic information.
 
+The first MLX-native version is available as:
+
+```bash
+python tools/pretrain_opencheese_graphmvp.py \
+  --ensembles outputs/cheese_projection/cheese_ensembles_1000_k20_diverse_q_resp.npz \
+  --out-dir outputs/cheese_projection/graphmvp_pretrain_k20_h128_l4 \
+  --epochs 50 \
+  --steps-per-epoch 128 \
+  --batch-size 64 \
+  --temperature 0.1 \
+  --contrastive-weight 1.0 \
+  --reconstruction-weight 1.0 \
+  --reconstruction-loss l2
+```
+
+This trains two ordinary openCHEESE `CheeseGraphTransformer` encoders:
+
+- `model_2d`: atom/bond topology with zeroed coordinates, no charges, no chiral
+  features
+- `model_3d`: atom/bond topology plus one sampled conformer from the diverse
+  ensemble
+
+The loss mirrors GraphMVP's core objective: symmetric InfoNCE alignment plus
+2D->3D and 3D->2D representation reconstruction through small projector heads.
+The resulting `model_3d` weights are the natural initialization for shape/ESP
+projection fine-tuning; the `model_2d` branch is useful when downstream inputs
+have no conformer yet.
+
 ## Independence plan
 
 Step 1 is complete in this repository: create `opencheese` and switch training
