@@ -256,6 +256,39 @@ python tools/prepare_cheese_conformer_ensembles.py \
   --out outputs/cheese_projection/cheese_ensembles_1000_k20_q_resp.npz
 ```
 
+The ensemble builder now overgenerates candidates and performs post-MMFF
+diversity selection before writing the cache. This matters: k=20 is useful only
+when those conformers are genuinely different shape/energy basins, not twenty
+copies of the same optimized minimum. Defaults are:
+
+- generate `ceil(k * 4)` candidates, capped by `--max-candidates 200`
+- sort by convergence and MMFF/UFF energy
+- keep conformers within `--selection-energy-window 15.0` kcal/mol
+- greedily select conformers separated by at least
+  `--selection-rms-thresh 0.75` A heavy-atom aligned RMSD
+- write fewer than k conformers if the molecule does not have k distinct
+  low-energy basins
+
+Use `--fill-to-n-conformers` only when a fixed tensor count matters more than
+diversity. The cache stores per-molecule diagnostics:
+`selection_min_pair_rmsd`, `selection_mean_pair_rmsd`,
+`selection_max_relative_energy`, `selection_n_candidates`, and
+`selection_n_energy_eligible`.
+
+For a stricter k=20 teacher:
+
+```bash
+python tools/prepare_cheese_conformer_ensembles.py \
+  --data data/espaloma_charge_zenodo_17308526/recalculated_charges/test_random1000_both_symmetrized_partial_bcc_fill/cheese_charge_training_am1bcc_resp.npz \
+  --target q_resp \
+  --n-conformers 20 \
+  --candidate-multiplier 5 \
+  --max-candidates 200 \
+  --selection-rms-thresh 0.75 \
+  --selection-energy-window 15 \
+  --out outputs/cheese_projection/cheese_ensembles_1000_k20_diverse_q_resp.npz
+```
+
 ## ESP-grid preprocessing
 
 For electrostatic teachers, the next data upgrade is to cache surface ESP
@@ -275,6 +308,26 @@ python tools/prepare_opencheese_esp_grid_cache.py \
 The grid geometry is still CPU-side Connolly/MK point placement; potential
 evaluation is GPU-side. This cache is the right substrate for a stricter
 field/surface electrostatic teacher.
+
+## Related ML Ideas
+
+FuncMol is useful inspiration for future field-level priors, but it is not a
+drop-in conformer initializer for a fixed input graph: it is an unconditional
+all-atom molecular-field generator. Using it directly would require mapping a
+generated field back onto the exact input atom order, bond graph, protonation,
+and stereochemistry.
+
+GraphMVP-style 2D/3D SSL is more directly useful for openCHEESE training. The
+next model-training upgrade should add a 2D-only encoder branch and pretrain it
+against the 3D branch with:
+
+- contrastive 2D graph vs 3D conformer positives for the same molecule
+- representation reconstruction, where 2D latents reconstruct stop-gradient 3D
+  latents and vice versa
+- conformer-view positives from the diverse k-conformer ensemble
+
+This would make the projection model less brittle to any single conformer and
+would let the 2D graph branch inherit 3D shape/electrostatic information.
 
 ## Independence plan
 
