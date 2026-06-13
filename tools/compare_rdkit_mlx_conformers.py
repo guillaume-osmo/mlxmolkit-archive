@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compare RDKit and mlxmolkit conformer ensembles with CHEESE shape/ESP scores."""
+"""Compare RDKit and mlxmolkit conformer ensembles with openCHEESE scores."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import numpy as np
 
 import mlx.core as mx
 
-from mlxmolkit.cheese import (
+from opencheese.descriptors import (
     CheeseBatch,
     cheese_similarity_pairs_mlx,
     horn_align_pairwise_mlx,
