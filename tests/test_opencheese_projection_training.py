@@ -5,6 +5,7 @@ from mlx.utils import tree_map
 from opencheese import CheeseEmbeddingConfig, CheeseGraphTransformer
 from opencheese.optimizers import MuonV2W, polar_express
 from tools.train_cheese_projection import (
+    _retrieval_metrics_np,
     anchor_zscore_to_unit,
     projection_metric_loss,
     size_residual_teacher_to_unit,
@@ -77,6 +78,49 @@ def test_neglog_distance_and_contrastive_loss_are_finite():
     assert float(distance[0, 0]) < 1.0e-5
     assert np.isfinite(float(contrastive))
     assert np.isfinite(float(hybrid))
+
+
+def test_soft_shape_loss_accepts_valid_pair_mask_and_reports_perplexity():
+    embeddings = mx.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]], dtype=mx.float32)
+    target = mx.array(
+        [
+            [1.0, 0.8, 0.2],
+            [0.8, 1.0, 0.25],
+            [0.2, 0.25, 1.0],
+        ],
+        dtype=mx.float32,
+    )
+    valid = mx.array(
+        [
+            [0.0, 1.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=mx.float32,
+    )
+
+    masked_loss = projection_metric_loss(
+        embeddings,
+        embeddings,
+        target,
+        loss_mode="hybrid_shape",
+        soft_neighborhood_weight=0.1,
+        contrastive_weight=0.1,
+        contrastive_positive_top_k=1,
+        valid_pair_mask=valid,
+    )
+    mx.eval(masked_loss)
+    metrics = _retrieval_metrics_np(
+        np.asarray([[0.0, 0.1, 1.0], [0.1, 0.0, 0.9], [1.0, 0.9, 0.0]], dtype=np.float32),
+        np.asarray(target),
+        teacher_temperature=0.2,
+        pred_temperature=0.2,
+    )
+
+    assert np.isfinite(float(masked_loss))
+    assert metrics["teacher_perplexity"] > 1.0
+    assert metrics["soft_kl"] >= 0.0
+    assert 0.0 <= metrics["adaptive_recall"] <= 1.0
 
 
 def test_muonv2w_updates_opencheese_model_parameters():

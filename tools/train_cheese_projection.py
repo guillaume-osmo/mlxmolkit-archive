@@ -274,13 +274,18 @@ def weighted_distance_mse_mlx(
     top_sim_weight: float,
     top_sim_center: float,
     top_sim_temperature: float,
+    valid_pair_mask: mx.array | None = None,
 ) -> mx.array:
     err2 = (pred_distance - target_distance) ** 2
+    if valid_pair_mask is not None:
+        valid = valid_pair_mask.astype(mx.float32)
+    else:
+        valid = mx.ones_like(err2)
     if top_sim_weight <= 0:
-        return mx.mean(err2)
+        return mx.sum(err2 * valid) / mx.maximum(mx.sum(valid), mx.array(1.0, dtype=mx.float32))
     temperature = max(float(top_sim_temperature), 1.0e-6)
     top_gate = mx.sigmoid((target_similarity.astype(mx.float32) - float(top_sim_center)) / temperature)
-    weights = 1.0 + float(top_sim_weight) * top_gate
+    weights = (1.0 + float(top_sim_weight) * top_gate) * valid
     return mx.sum(weights * err2) / mx.maximum(mx.sum(weights), mx.array(1.0, dtype=mx.float32))
 
 
@@ -291,6 +296,7 @@ def pairwise_ranking_loss_mlx(
     min_delta: float,
     margin: float,
     temperature: float,
+    valid_pair_mask: mx.array | None = None,
 ) -> mx.array:
     """Anchor-wise soft pairwise ranking loss.
 
@@ -302,6 +308,9 @@ def pairwise_ranking_loss_mlx(
     sim = target_similarity.astype(mx.float32)
     sim_delta = sim[:, :, None] - sim[:, None, :]
     mask = sim_delta > float(min_delta)
+    if valid_pair_mask is not None:
+        valid = valid_pair_mask.astype(mx.bool_)
+        mask = mask & valid[:, :, None] & valid[:, None, :]
     pred_delta = pred_distance[:, :, None] - pred_distance[:, None, :]
     logits = (pred_delta + float(margin)) / max(float(temperature), 1.0e-6)
     loss = mx.logaddexp(mx.array(0.0, dtype=pred_distance.dtype), logits)
@@ -316,14 +325,24 @@ def soft_neighborhood_loss_mlx(
     *,
     target_temperature: float,
     pred_temperature: float,
+    valid_pair_mask: mx.array | None = None,
 ) -> mx.array:
     """KL-style soft-neighborhood loss for retrieval ordering."""
 
     target_logits = target_similarity.astype(mx.float32) / max(float(target_temperature), 1.0e-6)
-    target_prob = mx.stop_gradient(mx.softmax(target_logits, axis=-1))
     pred_logits = -pred_distance / max(float(pred_temperature), 1.0e-6)
+    if valid_pair_mask is not None:
+        valid = valid_pair_mask.astype(mx.float32)
+        target_logits = mx.where(valid > 0, target_logits, mx.array(-1.0e9, dtype=target_logits.dtype))
+        pred_logits = mx.where(valid > 0, pred_logits, mx.array(-1.0e9, dtype=pred_logits.dtype))
+        active = mx.sum(valid, axis=-1) > 0
+        active_weight = active.astype(mx.float32)
+    else:
+        active_weight = mx.ones((target_similarity.shape[0],), dtype=mx.float32)
+    target_prob = mx.stop_gradient(mx.softmax(target_logits, axis=-1))
     pred_log_prob = pred_logits - mx.logsumexp(pred_logits, axis=-1, keepdims=True)
-    return -mx.mean(mx.sum(target_prob * pred_log_prob, axis=-1))
+    row_loss = -mx.sum(target_prob * pred_log_prob, axis=-1)
+    return mx.sum(row_loss * active_weight) / mx.maximum(mx.sum(active_weight), mx.array(1.0, dtype=mx.float32))
 
 
 def supervised_contrastive_loss_mlx(
@@ -334,20 +353,31 @@ def supervised_contrastive_loss_mlx(
     temperature: float,
     positive_threshold: float,
     positive_top_k: int,
+    valid_pair_mask: mx.array | None = None,
 ) -> mx.array:
     """InfoNCE-style loss using high-teacher-similarity pairs as positives."""
 
     logits = embedding_cosine_similarity_matrix_mlx(row_embeddings, col_embeddings)
     logits = logits / max(float(temperature), 1.0e-6)
+    if valid_pair_mask is not None:
+        valid = valid_pair_mask.astype(mx.float32)
+        logits = mx.where(valid > 0, logits, mx.array(-1.0e9, dtype=logits.dtype))
     logits = logits - mx.max(logits, axis=-1, keepdims=True)
     log_prob = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
     sim = target_similarity.astype(mx.float32)
+    if valid_pair_mask is not None:
+        valid = valid_pair_mask.astype(mx.float32)
+        sim_for_topk = mx.where(valid > 0, sim, mx.array(-1.0e9, dtype=sim.dtype))
+    else:
+        valid = mx.ones_like(sim)
+        sim_for_topk = sim
     positive = sim >= float(positive_threshold)
     if positive_top_k > 0 and sim.shape[1] > 0:
         k = min(int(positive_top_k), int(sim.shape[1]))
-        cutoff = mx.sort(sim, axis=-1)[:, -k]
-        positive = positive | (sim >= cutoff[:, None])
+        cutoff = mx.sort(sim_for_topk, axis=-1)[:, -k]
+        positive = positive | (sim_for_topk >= cutoff[:, None])
+    positive = positive & (valid > 0)
     weights = mx.where(positive, mx.maximum(sim, 0.0), mx.array(0.0, dtype=mx.float32))
     pos_weight = mx.sum(weights, axis=-1)
     row_loss = -mx.sum(weights * log_prob, axis=-1) / mx.maximum(pos_weight, mx.array(1.0, dtype=mx.float32))
@@ -379,11 +409,17 @@ def projection_metric_loss(
     contrastive_temperature: float = 0.07,
     contrastive_positive_threshold: float = 0.75,
     contrastive_positive_top_k: int = 0,
+    valid_pair_mask: mx.array | None = None,
 ) -> mx.array:
     if loss_mode == "cosine_similarity":
         pred = embedding_cosine_similarity_matrix_mlx(row_embeddings, col_embeddings)
         target = 2.0 * target_similarity.astype(mx.float32) - 1.0
-        loss = mx.mean((pred - target) ** 2)
+        err2 = (pred - target) ** 2
+        if valid_pair_mask is not None:
+            valid = valid_pair_mask.astype(mx.float32)
+            loss = mx.sum(err2 * valid) / mx.maximum(mx.sum(valid), mx.array(1.0, dtype=mx.float32))
+        else:
+            loss = mx.mean(err2)
         if contrastive_weight > 0:
             loss = loss + float(contrastive_weight) * supervised_contrastive_loss_mlx(
                 row_embeddings,
@@ -392,6 +428,7 @@ def projection_metric_loss(
                 temperature=contrastive_temperature,
                 positive_threshold=contrastive_positive_threshold,
                 positive_top_k=contrastive_positive_top_k,
+                valid_pair_mask=valid_pair_mask,
             )
         return loss
     if loss_mode in {
@@ -415,6 +452,7 @@ def projection_metric_loss(
             top_sim_weight=top_sim_weight,
             top_sim_center=top_sim_center,
             top_sim_temperature=top_sim_temperature,
+            valid_pair_mask=valid_pair_mask,
         )
         if loss_mode in {"ranked_dissimilarity", "hybrid_shape"} or rank_weight > 0:
             loss = loss + float(rank_weight) * pairwise_ranking_loss_mlx(
@@ -423,6 +461,7 @@ def projection_metric_loss(
                 min_delta=rank_min_delta,
                 margin=rank_margin,
                 temperature=rank_temperature,
+                valid_pair_mask=valid_pair_mask,
             )
         if loss_mode in {"soft_neighborhood", "hybrid_shape"} or soft_neighborhood_weight > 0:
             loss = loss + float(soft_neighborhood_weight) * soft_neighborhood_loss_mlx(
@@ -430,6 +469,7 @@ def projection_metric_loss(
                 target_similarity,
                 target_temperature=soft_target_temperature,
                 pred_temperature=soft_pred_temperature,
+                valid_pair_mask=valid_pair_mask,
             )
         if loss_mode in {"contrastive_shape", "hybrid_shape"} or contrastive_weight > 0:
             loss = loss + float(contrastive_weight) * supervised_contrastive_loss_mlx(
@@ -439,6 +479,7 @@ def projection_metric_loss(
                 temperature=contrastive_temperature,
                 positive_threshold=contrastive_positive_threshold,
                 positive_top_k=contrastive_positive_top_k,
+                valid_pair_mask=valid_pair_mask,
             )
         return loss
     raise ValueError(f"unknown loss_mode {loss_mode!r}")
@@ -471,6 +512,7 @@ def train_loss(
     contrastive_temperature: float,
     contrastive_positive_threshold: float,
     contrastive_positive_top_k: int,
+    valid_pair_mask: mx.array | None = None,
 ) -> mx.array:
     row_output = model(
         row_batch.atomic_numbers,
@@ -510,6 +552,7 @@ def train_loss(
         contrastive_temperature=contrastive_temperature,
         contrastive_positive_threshold=contrastive_positive_threshold,
         contrastive_positive_top_k=contrastive_positive_top_k,
+        valid_pair_mask=valid_pair_mask,
     )
     atom = 0.5 * (
         atom_reconstruction_loss_mlx(row_output.atom_logits, row_batch.atomic_numbers, row_batch.mask)
@@ -547,7 +590,25 @@ def _rankdata_np(x: np.ndarray) -> np.ndarray:
     return ranks
 
 
-def _retrieval_metrics_np(pred_distance: np.ndarray, sim: np.ndarray) -> dict[str, float]:
+def _softmax_np(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float64)
+    if logits.size == 0:
+        return np.empty((0,), dtype=np.float64)
+    shifted = logits - float(np.max(logits))
+    exp = np.exp(shifted)
+    denom = float(np.sum(exp))
+    if denom <= 0 or not np.isfinite(denom):
+        return np.full_like(exp, 1.0 / max(1, exp.size), dtype=np.float64)
+    return exp / denom
+
+
+def _retrieval_metrics_np(
+    pred_distance: np.ndarray,
+    sim: np.ndarray,
+    *,
+    teacher_temperature: float = 0.05,
+    pred_temperature: float = 0.05,
+) -> dict[str, float]:
     n = int(sim.shape[0])
     if n < 3:
         return {
@@ -556,12 +617,28 @@ def _retrieval_metrics_np(pred_distance: np.ndarray, sim: np.ndarray) -> dict[st
             "recall_at_10": 0.0,
             "ndcg_at_5": 0.0,
             "ndcg_at_10": 0.0,
+            "teacher_perplexity": 0.0,
+            "model_perplexity": 0.0,
+            "soft_cross_entropy": 0.0,
+            "soft_entropy": 0.0,
+            "soft_kl": 0.0,
+            "adaptive_recall": 0.0,
+            "soft_mass_at_5": 0.0,
         }
     spearman_values = []
     recall5 = []
     recall10 = []
     ndcg5 = []
     ndcg10 = []
+    teacher_perplexity = []
+    model_perplexity = []
+    soft_cross_entropy = []
+    soft_entropy = []
+    soft_kl = []
+    adaptive_recall = []
+    soft_mass5 = []
+    teacher_tau = max(float(teacher_temperature), 1.0e-6)
+    pred_tau = max(float(pred_temperature), 1.0e-6)
     for i in range(n):
         mask = np.ones(n, dtype=bool)
         mask[i] = False
@@ -583,12 +660,34 @@ def _retrieval_metrics_np(pred_distance: np.ndarray, sim: np.ndarray) -> dict[st
             dcg = float(np.sum(gains * discounts))
             ideal = float(np.sum(np.maximum(truth_scores[truth_order[:kk]], 0.0) * discounts))
             ndcgs.append(dcg / ideal if ideal > 1.0e-12 else 0.0)
+        p_teacher = _softmax_np(truth_scores / teacher_tau)
+        p_model = _softmax_np(pred_scores / pred_tau)
+        entropy = -float(np.sum(p_teacher * np.log(np.clip(p_teacher, 1.0e-12, 1.0))))
+        model_entropy = -float(np.sum(p_model * np.log(np.clip(p_model, 1.0e-12, 1.0))))
+        cross_entropy = -float(np.sum(p_teacher * np.log(np.clip(p_model, 1.0e-12, 1.0))))
+        teacher_perplexity.append(float(np.exp(entropy)))
+        model_perplexity.append(float(np.exp(model_entropy)))
+        soft_entropy.append(entropy)
+        soft_cross_entropy.append(cross_entropy)
+        soft_kl.append(max(0.0, cross_entropy - entropy))
+        adaptive_k = min(truth_scores.size, max(1, int(np.ceil(np.exp(entropy)))))
+        adaptive_truth_top = set(int(x) for x in truth_order[:adaptive_k])
+        adaptive_pred_top = [int(x) for x in pred_order[:adaptive_k]]
+        adaptive_recall.append(len(adaptive_truth_top.intersection(adaptive_pred_top)) / float(adaptive_k))
+        soft_mass5.append(float(np.sum(p_teacher[pred_order[: min(5, truth_scores.size)]])))
     return {
         "spearman": float(np.mean(spearman_values)) if spearman_values else 0.0,
         "recall_at_5": float(np.mean(recall5)) if recall5 else 0.0,
         "recall_at_10": float(np.mean(recall10)) if recall10 else 0.0,
         "ndcg_at_5": float(np.mean(ndcg5)) if ndcg5 else 0.0,
         "ndcg_at_10": float(np.mean(ndcg10)) if ndcg10 else 0.0,
+        "teacher_perplexity": float(np.mean(teacher_perplexity)) if teacher_perplexity else 0.0,
+        "model_perplexity": float(np.mean(model_perplexity)) if model_perplexity else 0.0,
+        "soft_cross_entropy": float(np.mean(soft_cross_entropy)) if soft_cross_entropy else 0.0,
+        "soft_entropy": float(np.mean(soft_entropy)) if soft_entropy else 0.0,
+        "soft_kl": float(np.mean(soft_kl)) if soft_kl else 0.0,
+        "adaptive_recall": float(np.mean(adaptive_recall)) if adaptive_recall else 0.0,
+        "soft_mass_at_5": float(np.mean(soft_mass5)) if soft_mass5 else 0.0,
     }
 
 
@@ -603,6 +702,8 @@ def evaluate_projection(
     distance_transform: str,
     distance_scale: float,
     distance_power: float,
+    teacher_temperature: float = 0.05,
+    pred_temperature: float = 0.05,
 ) -> dict[str, float]:
     if len(positions) == 0:
         return {
@@ -615,6 +716,13 @@ def evaluate_projection(
             "recall_at_10": 0.0,
             "ndcg_at_5": 0.0,
             "ndcg_at_10": 0.0,
+            "teacher_perplexity": 0.0,
+            "model_perplexity": 0.0,
+            "soft_cross_entropy": 0.0,
+            "soft_entropy": 0.0,
+            "soft_kl": 0.0,
+            "adaptive_recall": 0.0,
+            "soft_mass_at_5": 0.0,
             "n_pairs": 0.0,
         }
     embeddings = encode_positions(model, dataset, positions, batch_size=batch_size, pad_to=pad_to)
@@ -643,7 +751,12 @@ def evaluate_projection(
     corr = 0.0
     if pred_flat.size > 1 and float(np.std(pred_flat)) > 1.0e-12 and float(np.std(target_flat)) > 1.0e-12:
         corr = float(np.corrcoef(pred_flat, target_flat)[0, 1])
-    retrieval = _retrieval_metrics_np(retrieval_distance, sim)
+    retrieval = _retrieval_metrics_np(
+        retrieval_distance,
+        sim,
+        teacher_temperature=teacher_temperature,
+        pred_temperature=pred_temperature,
+    )
     out = {
         "mse": float(np.mean(err * err)) if err.size else 0.0,
         "mae": float(np.mean(np.abs(err))) if err.size else 0.0,
@@ -806,6 +919,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft-neighborhood-weight", type=float, default=0.0)
     parser.add_argument("--soft-target-temperature", type=float, default=0.05)
     parser.add_argument("--soft-pred-temperature", type=float, default=0.05)
+    parser.add_argument(
+        "--perplexity-temperature",
+        type=float,
+        default=None,
+        help="Teacher temperature for perplexity/soft-KL metrics. Defaults to --soft-target-temperature.",
+    )
+    parser.add_argument(
+        "--perplexity-pred-temperature",
+        type=float,
+        default=None,
+        help="Model temperature for perplexity/soft-KL metrics. Defaults to --soft-pred-temperature.",
+    )
     parser.add_argument("--contrastive-weight", type=float, default=0.0)
     parser.add_argument("--contrastive-temperature", type=float, default=0.07)
     parser.add_argument("--contrastive-positive-threshold", type=float, default=0.75)
@@ -818,6 +943,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--steps-per-epoch", type=int, default=0, help="0 means all row/column batch blocks")
     parser.add_argument("--dynamic-pad", action="store_true")
+    parser.add_argument(
+        "--include-self-pairs",
+        action="store_true",
+        help="Include i==j pairs in training losses. By default they are excluded for degenerate shape learning.",
+    )
     parser.add_argument("--no-charges", action="store_true", help="Train a pure shape model without charge features.")
     return parser.parse_args()
 
@@ -837,6 +967,12 @@ def main() -> None:
     )
     split_seed = int(args.seed if args.split_seed is None else args.split_seed)
     sampler_seed = int(args.seed if args.sampler_seed is None else args.sampler_seed)
+    perplexity_temperature = float(
+        args.soft_target_temperature if args.perplexity_temperature is None else args.perplexity_temperature
+    )
+    perplexity_pred_temperature = float(
+        args.soft_pred_temperature if args.perplexity_pred_temperature is None else args.perplexity_pred_temperature
+    )
     train_positions, valid_positions = split_positions(
         dataset.n_molecules,
         valid_fraction=args.valid_fraction,
@@ -875,7 +1011,7 @@ def main() -> None:
     else:
         raise ValueError(f"unknown optimizer {args.optimizer!r}")
 
-    def loss_fn(m, row_batch, col_batch, target_similarity):
+    def loss_fn(m, row_batch, col_batch, target_similarity, valid_pair_mask):
         return train_loss(
             m,
             row_batch,
@@ -902,6 +1038,7 @@ def main() -> None:
             contrastive_temperature=args.contrastive_temperature,
             contrastive_positive_threshold=args.contrastive_positive_threshold,
             contrastive_positive_top_k=args.contrastive_positive_top_k,
+            valid_pair_mask=valid_pair_mask,
         )
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
@@ -923,7 +1060,7 @@ def main() -> None:
         f"valid={len(valid_positions)} target={dataset.target} channel={dataset.teacher_channel} "
         f"transform={args.teacher_transform} loss={args.loss_mode} optimizer={args.optimizer} "
         f"sampler={args.sampler} charges={not args.no_charges} batch={args.batch_size} "
-        f"split_seed={split_seed} sampler_seed={sampler_seed}"
+        f"split_seed={split_seed} sampler_seed={sampler_seed} self_pairs={bool(args.include_self_pairs)}"
         + (f" init={args.init_weights}" if args.init_weights is not None else ""),
         flush=True,
     )
@@ -976,7 +1113,13 @@ def main() -> None:
             row_batch = dataset.batch(row_positions, pad_to=pad_to)
             col_batch = dataset.batch(col_positions, pad_to=pad_to)
             target_block = mx.array(dataset.teacher[np.ix_(row_positions, col_positions)], dtype=mx.float32)
-            loss, grads = loss_and_grad(model, row_batch, col_batch, target_block)
+            if args.include_self_pairs:
+                valid_pair_mask = mx.ones(target_block.shape, dtype=mx.float32)
+            else:
+                valid_pair_mask = mx.array(
+                    (np.asarray(row_positions)[:, None] != np.asarray(col_positions)[None, :]).astype(np.float32)
+                )
+            loss, grads = loss_and_grad(model, row_batch, col_batch, target_block, valid_pair_mask)
             optimizer.update(model, grads)
             mx.eval(model.parameters(), optimizer.state, loss)
             step_losses.append(float(loss))
@@ -991,6 +1134,8 @@ def main() -> None:
             distance_transform=args.distance_transform,
             distance_scale=args.distance_scale,
             distance_power=args.distance_power,
+            teacher_temperature=perplexity_temperature,
+            pred_temperature=perplexity_pred_temperature,
         )
         valid_eval = evaluate_projection(
             model,
@@ -1002,6 +1147,8 @@ def main() -> None:
             distance_transform=args.distance_transform,
             distance_scale=args.distance_scale,
             distance_power=args.distance_power,
+            teacher_temperature=perplexity_temperature,
+            pred_temperature=perplexity_pred_temperature,
         )
         row = {
             "epoch": epoch,
@@ -1015,6 +1162,12 @@ def main() -> None:
             "train_recall_at_10": train_eval["recall_at_10"],
             "train_ndcg_at_5": train_eval["ndcg_at_5"],
             "train_ndcg_at_10": train_eval["ndcg_at_10"],
+            "train_teacher_perplexity": train_eval["teacher_perplexity"],
+            "train_model_perplexity": train_eval["model_perplexity"],
+            "train_soft_kl": train_eval["soft_kl"],
+            "train_soft_cross_entropy": train_eval["soft_cross_entropy"],
+            "train_adaptive_recall": train_eval["adaptive_recall"],
+            "train_soft_mass_at_5": train_eval["soft_mass_at_5"],
             "valid_mse": valid_eval["mse"],
             "valid_mae": valid_eval["mae"],
             "valid_rmse": valid_eval["rmse"],
@@ -1024,6 +1177,12 @@ def main() -> None:
             "valid_recall_at_10": valid_eval["recall_at_10"],
             "valid_ndcg_at_5": valid_eval["ndcg_at_5"],
             "valid_ndcg_at_10": valid_eval["ndcg_at_10"],
+            "valid_teacher_perplexity": valid_eval["teacher_perplexity"],
+            "valid_model_perplexity": valid_eval["model_perplexity"],
+            "valid_soft_kl": valid_eval["soft_kl"],
+            "valid_soft_cross_entropy": valid_eval["soft_cross_entropy"],
+            "valid_adaptive_recall": valid_eval["adaptive_recall"],
+            "valid_soft_mass_at_5": valid_eval["soft_mass_at_5"],
             "seconds": time.perf_counter() - epoch_start,
         }
         rows.append(row)
@@ -1044,7 +1203,8 @@ def main() -> None:
                 f"epoch {epoch:04d}/{args.epochs} "
                 f"train_mse={train_eval['mse']:.5f} valid_mse={valid_eval['mse']:.5f} "
                 f"valid_corr={valid_eval['corr']:.3f} valid_spearman={valid_eval['spearman']:.3f} "
-                f"recall5={valid_eval['recall_at_5']:.3f} best_mse={best_valid:.5f}@{best_epoch} "
+                f"recall5={valid_eval['recall_at_5']:.3f} soft_kl={valid_eval['soft_kl']:.3f} "
+                f"ppl={valid_eval['teacher_perplexity']:.1f} best_mse={best_valid:.5f}@{best_epoch} "
                 f"best_r5={best_recall5:.3f}@{best_recall5_epoch}",
                 flush=True,
             )
@@ -1076,6 +1236,7 @@ def main() -> None:
         "seed": int(args.seed),
         "split_seed": split_seed,
         "sampler_seed": sampler_seed,
+        "include_self_pairs": bool(args.include_self_pairs),
         "use_charges": not bool(args.no_charges),
         "distance_transform": args.distance_transform,
         "distance_scale": args.distance_scale,
@@ -1087,6 +1248,8 @@ def main() -> None:
         "contrastive_temperature": args.contrastive_temperature,
         "contrastive_positive_threshold": args.contrastive_positive_threshold,
         "contrastive_positive_top_k": args.contrastive_positive_top_k,
+        "perplexity_temperature": perplexity_temperature,
+        "perplexity_pred_temperature": perplexity_pred_temperature,
         "best_epoch": best_epoch,
         "best_valid_mse": best_valid,
         "best_weights": str(best_path),
