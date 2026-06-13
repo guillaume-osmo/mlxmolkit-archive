@@ -68,12 +68,23 @@ from opencheese.graphmvp import (
     info_nce_loss_mlx,
     representation_reconstruction_loss_mlx,
 )
+from opencheese.gnn_ma import (
+    CrossGraphSoftAlignmentScorer,
+    SoftAlignmentResult,
+    cross_graph_attention_weights_mlx,
+    masked_softmax_mlx,
+)
 from opencheese.optimizers import (
     MuonV2,
     MuonV2W,
     gram_newton_schulz,
     newton_schulz_jordan,
     polar_express,
+)
+from opencheese.surface import (
+    SurfaceCloudResult,
+    lgmol_surface_cloud_from_atoms,
+    surface_sample_indices,
 )
 
 __all__ = [
@@ -133,9 +144,16 @@ __all__ = [
     "dual_info_nce_loss_mlx",
     "info_nce_loss_mlx",
     "representation_reconstruction_loss_mlx",
+    "CrossGraphSoftAlignmentScorer",
+    "SoftAlignmentResult",
+    "cross_graph_attention_weights_mlx",
+    "masked_softmax_mlx",
     "MuonV2",
     "MuonV2W",
     "gram_newton_schulz",
     "newton_schulz_jordan",
     "polar_express",
+    "SurfaceCloudResult",
+    "lgmol_surface_cloud_from_atoms",
+    "surface_sample_indices",
 ]
