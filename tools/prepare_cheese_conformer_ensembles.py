@@ -13,6 +13,7 @@ import time
 import numpy as np
 
 from mlxmolkit.charge_model import bond_matrix_from_rdkit_mol, bond_state_from_rdkit_bond
+from tools.conformer_source import embed_conformers, mmff_optimize_conformers
 from tools.train_charge_model import ChargeTrainingDataset
 
 
@@ -36,7 +37,7 @@ def mol_from_smiles_with_conformers(
     smiles: str,
     *,
     n_conformers: int,
-    min_conformers: int,
+    min_conformers: int = 1,
     seed: int,
     prune_rms_thresh: float,
     max_embed_attempts: int,
@@ -45,48 +46,33 @@ def mol_from_smiles_with_conformers(
     max_opt_iters: int,
 ):
     from rdkit import Chem
-    from rdkit.Chem import AllChem
 
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError("invalid SMILES")
     mol = Chem.AddHs(mol)
 
-    params = AllChem.ETKDGv3()
-    params.randomSeed = int(seed)
-    params.pruneRmsThresh = float(prune_rms_thresh)
-    if hasattr(params, "maxAttempts"):
-        params.maxAttempts = int(max_embed_attempts)
-    params.useRandomCoords = False
-    conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=int(n_conformers), params=params))
-    if len(conf_ids) < int(min_conformers):
-        params.pruneRmsThresh = -1.0
-        params.useRandomCoords = True
-        params.randomSeed = int(seed) + 7919
-        mol.RemoveAllConformers()
-        conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=int(n_conformers), params=params))
+    conf_ids = embed_conformers(
+        mol,
+        n_conformers=n_conformers,
+        min_conformers=min_conformers,
+        seed=seed,
+        prune_rms_thresh=prune_rms_thresh,
+        max_attempts=max_embed_attempts,
+    )
     if not conf_ids:
         raise ValueError("RDKit could not generate conformers")
 
-    energies = np.full((len(conf_ids),), np.nan, dtype=np.float32)
-    converged = np.zeros((len(conf_ids),), dtype=bool)
-    if optimize:
-        if AllChem.MMFFHasAllMoleculeParams(mol):
-            results = AllChem.MMFFOptimizeMoleculeConfs(
-                mol,
-                numThreads=0,
-                maxIters=int(max_opt_iters),
-                mmffVariant=mmff_variant,
-            )
-        else:
-            results = AllChem.UFFOptimizeMoleculeConfs(
-                mol,
-                numThreads=0,
-                maxIters=int(max_opt_iters),
-            )
-        for i, (status, energy) in enumerate(results[: len(conf_ids)]):
-            converged[i] = int(status) == 0
-            energies[i] = float(energy)
+    # catch_errors=False: a force-field failure here propagates so the caller can
+    # retry via the graph-built path.
+    energies, converged = mmff_optimize_conformers(
+        mol,
+        conf_ids,
+        optimize=optimize,
+        mmff_variant=mmff_variant,
+        max_iters=max_opt_iters,
+        catch_errors=False,
+    )
     return mol, conf_ids, energies, converged
 
 
@@ -96,7 +82,7 @@ def mol_from_graph_with_conformers(
     *,
     formal_charge: int,
     n_conformers: int,
-    min_conformers: int,
+    min_conformers: int = 1,
     seed: int,
     prune_rms_thresh: float,
     max_embed_attempts: int,
@@ -105,7 +91,6 @@ def mol_from_graph_with_conformers(
     max_opt_iters: int,
 ):
     from rdkit import Chem
-    from rdkit.Chem import AllChem
 
     rw = Chem.RWMol()
     heavy_indices = []
@@ -143,43 +128,27 @@ def mol_from_graph_with_conformers(
         catchErrors=True,
     )
 
-    params = AllChem.ETKDGv3()
-    params.randomSeed = int(seed)
-    params.pruneRmsThresh = float(prune_rms_thresh)
-    if hasattr(params, "maxAttempts"):
-        params.maxAttempts = int(max_embed_attempts)
-    conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=int(n_conformers), params=params))
-    if len(conf_ids) < int(min_conformers):
-        params.pruneRmsThresh = -1.0
-        params.useRandomCoords = True
-        params.randomSeed = int(seed) + 7919
-        mol.RemoveAllConformers()
-        conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=int(n_conformers), params=params))
+    conf_ids = embed_conformers(
+        mol,
+        n_conformers=n_conformers,
+        min_conformers=min_conformers,
+        seed=seed,
+        prune_rms_thresh=prune_rms_thresh,
+        max_attempts=max_embed_attempts,
+    )
     if not conf_ids:
         raise ValueError("RDKit could not generate conformers from graph")
 
-    energies = np.full((len(conf_ids),), np.nan, dtype=np.float32)
-    converged = np.zeros((len(conf_ids),), dtype=bool)
-    if optimize:
-        try:
-            if AllChem.MMFFHasAllMoleculeParams(mol):
-                results = AllChem.MMFFOptimizeMoleculeConfs(
-                    mol,
-                    numThreads=0,
-                    maxIters=int(max_opt_iters),
-                    mmffVariant=mmff_variant,
-                )
-            else:
-                results = AllChem.UFFOptimizeMoleculeConfs(
-                    mol,
-                    numThreads=0,
-                    maxIters=int(max_opt_iters),
-                )
-            for i, (status, energy) in enumerate(results[: len(conf_ids)]):
-                converged[i] = int(status) == 0
-                energies[i] = float(energy)
-        except Exception:
-            pass
+    # catch_errors=True: a graph-built molecule with quirky valences may have no
+    # usable force field; keep the raw ETKDG geometry rather than failing the row.
+    energies, converged = mmff_optimize_conformers(
+        mol,
+        conf_ids,
+        optimize=optimize,
+        mmff_variant=mmff_variant,
+        max_iters=max_opt_iters,
+        catch_errors=True,
+    )
     return mol, conf_ids, energies, converged
 
 
