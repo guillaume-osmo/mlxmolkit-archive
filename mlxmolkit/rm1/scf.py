@@ -82,9 +82,31 @@ def _batched_eigh_backend(matrix_size: int | None = None) -> str:
     return "mx.linalg.eigh(cpu)"
 
 
-def _batched_symmetric_eigh(matrix: mx.array) -> tuple[mx.array, mx.array]:
+def _scf_sign_min_basis() -> int:
+    """Basis-size threshold where SCF auto mode switches to sign density."""
+
+    value = os.environ.get("MLXMOLKIT_SCF_SIGN_MIN_BASIS", "33")
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return 33
+
+
+def _scf_sign_cpu_eigh_min_basis() -> int:
+    """Use CPU eig refreshes in sign mode at and above this basis size."""
+
+    value = os.environ.get("MLXMOLKIT_SCF_SIGN_CPU_EIGH_MIN_BASIS", "33")
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return 33
+
+
+def _batched_symmetric_eigh(matrix: mx.array, *, force_cpu: bool = False) -> tuple[mx.array, mx.array]:
     """Batched symmetric eigensolver with an mlx-addons GPU hook."""
 
+    if force_cpu:
+        return mx.linalg.eigh(matrix, stream=mx.cpu)
     batched_eigh = _get_addons_batched_eigh()
     if batched_eigh is not None:
         return batched_eigh(matrix)
@@ -178,9 +200,9 @@ def _basis_bucket_limit(n_basis: int) -> int:
     """Compact basis-size bucket for batched SCF padding."""
 
     n_basis = int(n_basis)
-    gpu_max = _addons_batched_eigh_max_n()
-    if n_basis <= gpu_max:
-        return gpu_max
+    exact_eigh_max = min(_addons_batched_eigh_max_n(), _scf_sign_min_basis() - 1)
+    if exact_eigh_max > 0 and n_basis <= exact_eigh_max:
+        return exact_eigh_max
     step = 16 if n_basis <= 128 else 32
     return ((n_basis + step - 1) // step) * step
 
@@ -1380,8 +1402,11 @@ def rm1_energy_batch_mlx(
     if density_solver not in {"auto", "sign", "eigh"}:
         raise ValueError(f"unknown density_solver: {density_solver!r}")
     if density_solver == "auto":
-        density_solver = "sign" if MB > _addons_batched_eigh_max_n() else "eigh"
+        density_solver = "sign" if MB >= _scf_sign_min_basis() else "eigh"
     use_sign = density_solver == "sign"
+    sign_eigh_force_cpu = use_sign and MB >= _scf_sign_cpu_eigh_min_basis()
+    if sign_eigh_force_cpu:
+        eigh_backend = "mx.linalg.eigh(cpu,sign_refresh)"
     if verbose:
         print(f"  SCF eigensolver: {eigh_backend} (density_solver={density_solver})")
 
@@ -1439,7 +1464,10 @@ def rm1_energy_batch_mlx(
             F_eigh_input = F_for_eigh + pad_diag
             if check_finite:
                 _assert_finite_mx(F_eigh_input, label=f"F_eigh_input at iteration {iteration}")
-            eigvals, C = _batched_symmetric_eigh(F_eigh_input)              # (N, MB), (N, MB, MB)
+            eigvals, C = _batched_symmetric_eigh(
+                F_eigh_input,
+                force_cpu=sign_eigh_force_cpu,
+            )                                                              # (N, MB), (N, MB, MB)
 
             # 4. Density: P = 2 * (C * occ_mask[:, None, :]) @ C^T.
             C_occ = C * occ_mask[:, None, :]                               # zero out unoccupied cols
@@ -1550,7 +1578,10 @@ def rm1_energy_batch_mlx(
     F_final_eigh_input = F_final + pad_diag
     if check_finite:
         _assert_finite_mx(F_final_eigh_input, label="final F_eigh_input")
-    eigvals_padded = _batched_symmetric_eigh(F_final_eigh_input)[0]         # (N, MB)
+    eigvals_padded = _batched_symmetric_eigh(
+        F_final_eigh_input,
+        force_cpu=sign_eigh_force_cpu,
+    )[0]                                                                   # (N, MB)
     mx.eval(eigvals_padded)
     eigvals_np = np.array(eigvals_padded)
 
