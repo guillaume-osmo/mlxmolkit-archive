@@ -1308,6 +1308,13 @@ def rm1_energy_batch_mlx(
     from .fock_metal import MetalFockContext
     from mlx_addons.linalg import solve_lu
 
+    # This path runs the SCF in float32, whose density-RMS noise floor is
+    # ~1e-5. A tighter conv_tol (e.g. the 1e-6 default) can never be tripped —
+    # dP oscillates in the float32 noise forever, the loop burns all max_iter,
+    # and every molecule is spuriously reported non-converged. Floor the
+    # tolerance at the achievable float32 limit (charges still match the
+    # float64 single path to ~2e-5 e, far below AM1-BCC's own method error).
+    conv_tol = max(conv_tol, 1e-5)
     PARAMS = get_params(method)
     N = len(molecules)
     if N == 0:
