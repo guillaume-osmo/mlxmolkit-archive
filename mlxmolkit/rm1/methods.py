@@ -551,6 +551,35 @@ def _augment_pm6_full_from_mopac_csv() -> None:
 _augment_pm6_full_from_mopac_csv()
 
 
+def _augment_pm3_from_mopac_csv() -> None:
+    """Extend PM3 to the full main-group set (Z<=53) from the bundled MOPAC CSV. PM3_PARAMS shipped only 10
+    elements (values correct, coverage capped — same omission PM6 had). Standard PM3 is sp-only for main group
+    (unlike PM6), and mlxmolkit's d-orbital integrals are PM6-specific, so PM3 stays sp-only here (n_basis=4,
+    charge-only eheat=0). Existing 10 kept intact. d-orbital PM3 (Al/Si/Ti/Zn/P/S...) would need the PM6 d path."""
+    csv_path = Path(__file__).resolve().parent / "data" / "parameters_PM3_MOPAC.csv"
+    if not csv_path.exists():
+        return
+    with csv_path.open(newline="") as handle:
+        for raw in csv.DictReader(handle, skipinitialspace=True):
+            row = {k.strip(): (v.strip() if v else "") for k, v in raw.items() if k is not None}
+            z = int(row["N"].strip())
+            if z in PM3_PARAMS or z not in _PM6_TORE or abs(_sf(row, "U_ss")) < 1e-6:
+                continue   # skip elements PM3 never parameterized (blank/zero U_ss in the CSV)
+            PM3_PARAMS[z] = ElementParams(
+                Z=z, symbol=row["sym"].strip(), n_basis=(1 if z == 1 else 4),
+                n_valence=_PM6_TORE[z], eheat=0.0,
+                Uss=_sf(row, "U_ss"), Upp=_sf(row, "U_pp"),
+                zeta_s=_sf(row, "zeta_s"), zeta_p=_sf(row, "zeta_p"),
+                beta_s=_sf(row, "beta_s"), beta_p=_sf(row, "beta_p"),
+                gss=_sf(row, "g_ss"), gsp=_sf(row, "g_sp"), gpp=_sf(row, "g_pp"),
+                gp2=_sf(row, "g_p2"), hsp=_sf(row, "h_sp"), alpha=_sf(row, "alpha"),
+                gauss_K=[_sf(row, f"Gaussian{i}_K") for i in (1, 2, 3, 4)],
+                gauss_L=[_sf(row, f"Gaussian{i}_L") for i in (1, 2, 3, 4)],
+                gauss_M=[_sf(row, f"Gaussian{i}_M") for i in (1, 2, 3, 4)])
+
+_augment_pm3_from_mopac_csv()
+
+
 # Method registry.  d-PM6 is the ONLY PM6 exposed: sp-only mis-charges P/S/halogens (drops their d-orbitals).
 METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     'RM1': RM1_PARAMS,
