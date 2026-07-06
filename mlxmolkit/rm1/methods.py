@@ -11,8 +11,10 @@ Parameters are loaded from params.py (RM1) or defined here (AM1, AM1*).
 """
 from __future__ import annotations
 
+import csv
 import numpy as np
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional
 from .params import ElementParams, RM1_PARAMS, _EISOL_COEFFICIENTS, _compute_eisol
 
@@ -64,6 +66,88 @@ AM1_PARAMS: Dict[int, ElementParams] = {
         gauss_M=[0.847918, 1.445071, 0.0, 0.0],
     ),
 }
+
+
+_AM1_EXTRA_VALENCE = {
+    9: 7,
+    14: 4,
+    15: 5,
+    16: 6,
+    17: 7,
+    35: 7,
+    53: 7,
+}
+
+_AM1_EXTRA_EHEAT_KCAL = {
+    # PYSEQM seqm_functions/constants.py, atom heats from MOPAC block.f.
+    9: 18.890,
+    14: 108.390,
+    15: 75.570,
+    16: 66.400,
+    17: 28.990,
+    35: 26.740,
+    53: 25.517,
+}
+
+
+def _float_field(row: Dict[str, str], key: str) -> float:
+    return float(row[key].strip())
+
+
+def _augment_am1_params_from_mopac_csv() -> None:
+    """Add AM1-BCC heavy elements from the bundled PYSEQM/MOPAC AM1 table."""
+    csv_path = Path(__file__).resolve().parent / "data" / "parameters_AM1_MOPAC.csv"
+    if not csv_path.exists():
+        return
+
+    with csv_path.open(newline="") as handle:
+        reader = csv.DictReader(handle, skipinitialspace=True)
+        for raw_row in reader:
+            row = {key.strip(): value for key, value in raw_row.items() if key is not None}
+            z = int(row["N"].strip())
+            if z not in _AM1_EXTRA_VALENCE:
+                continue
+
+            AM1_PARAMS[z] = ElementParams(
+                Z=z,
+                symbol=row["sym"].strip(),
+                n_basis=4,
+                n_valence=_AM1_EXTRA_VALENCE[z],
+                eheat=_AM1_EXTRA_EHEAT_KCAL[z],
+                Uss=_float_field(row, "U_ss"),
+                Upp=_float_field(row, "U_pp"),
+                zeta_s=_float_field(row, "zeta_s"),
+                zeta_p=_float_field(row, "zeta_p"),
+                beta_s=_float_field(row, "beta_s"),
+                beta_p=_float_field(row, "beta_p"),
+                gss=_float_field(row, "g_ss"),
+                gsp=_float_field(row, "g_sp"),
+                gpp=_float_field(row, "g_pp"),
+                gp2=_float_field(row, "g_p2"),
+                hsp=_float_field(row, "h_sp"),
+                alpha=_float_field(row, "alpha"),
+                gauss_K=[
+                    _float_field(row, "Gaussian1_K"),
+                    _float_field(row, "Gaussian2_K"),
+                    _float_field(row, "Gaussian3_K"),
+                    _float_field(row, "Gaussian4_K"),
+                ],
+                gauss_L=[
+                    _float_field(row, "Gaussian1_L"),
+                    _float_field(row, "Gaussian2_L"),
+                    _float_field(row, "Gaussian3_L"),
+                    _float_field(row, "Gaussian4_L"),
+                ],
+                gauss_M=[
+                    _float_field(row, "Gaussian1_M"),
+                    _float_field(row, "Gaussian2_M"),
+                    _float_field(row, "Gaussian3_M"),
+                    _float_field(row, "Gaussian4_M"),
+                ],
+            )
+
+
+_augment_am1_params_from_mopac_csv()
 
 # Compute Eisol for AM1
 for _z, _p in AM1_PARAMS.items():
