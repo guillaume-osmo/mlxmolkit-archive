@@ -42,10 +42,10 @@ Repository = "https://github.com/guillaume-osmo/mlxmolkit"
 Issues = "https://github.com/guillaume-osmo/mlxmolkit/issues"
 
 [tool.setuptools.packages.find]
-include = ["mlxmolkit"]
+include = ["mlxmolkit", "mlxmolkit.*", "opencheese", "opencheese.*"]
 
 [tool.setuptools.package-data]
-mlxmolkit = ["*.metal"]
+mlxmolkit = ["*.metal", "data/bcc/*.json", "rm1/data/*.csv", "rm1/data/*.npz", "rm1/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

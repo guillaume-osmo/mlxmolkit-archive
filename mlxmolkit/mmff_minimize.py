@@ -96,7 +96,6 @@ def _pack_mmff_for_nk(
     vdw_ts = np.zeros(C + 1, dtype=np.int32)
     ele_ts = np.zeros(C + 1, dtype=np.int32)
 
-    deg_to_rad = np.pi / 180.0
     c = 0
     for mol_idx, k in enumerate(conf_counts):
         p = mmff_params_list[mol_idx]
@@ -119,10 +118,12 @@ def _pack_mmff_for_nk(
                 all_bond_params.append(_pack_params(p.bond_kb, p.bond_r0, fb=2))
             if na > 0:
                 all_angle_trips.append(_pack_trips(p.angle_idx1, p.angle_idx2, p.angle_idx3, off))
-                all_angle_params.append(_pack_params(p.angle_ka, p.angle_theta0 * deg_to_rad, p.angle_is_linear.astype(np.float32), fb=3))
+                # The in-kernel MMFF angle implementation computes theta in degrees.
+                all_angle_params.append(_pack_params(p.angle_ka, p.angle_theta0, p.angle_is_linear.astype(np.float32), fb=3))
             if nsb > 0:
                 all_sb_trips.append(_pack_trips(p.strbend_idx1, p.strbend_idx2, p.strbend_idx3, off))
-                all_sb_params.append(_pack_params(p.strbend_r0_ij, p.strbend_r0_kj, p.strbend_theta0 * deg_to_rad, p.strbend_kba_ijk, p.strbend_kba_kji, fb=5))
+                # Stretch-bend also subtracts a degree-valued theta0 in the kernel.
+                all_sb_params.append(_pack_params(p.strbend_r0_ij, p.strbend_r0_kj, p.strbend_theta0, p.strbend_kba_ijk, p.strbend_kba_kji, fb=5))
             if noop > 0:
                 all_oop_quads.append(_pack_quads(p.oop_idx1, p.oop_idx2, p.oop_idx3, p.oop_idx4, off))
                 all_oop_params.append(_f32(p.oop_koop))
@@ -134,8 +135,12 @@ def _pack_mmff_for_nk(
                 all_vdw_params.append(_pack_params(p.vdw_R_star, p.vdw_eps, fb=2))
             if nele > 0:
                 all_ele_pairs.append(_pack_pairs(p.ele_idx1, p.ele_idx2, off))
-                ele_scale = np.where(p.ele_is_1_4 > 0.5, 0.75, 1.0).astype(np.float32)
-                all_ele_params.append(_pack_params(p.ele_charge_term, np.ones(nele, dtype=np.float32), ele_scale, fb=3))
+                all_ele_params.append(_pack_params(
+                    p.ele_charge_term,
+                    np.ones(nele, dtype=np.float32),
+                    p.ele_is_1_4.astype(np.float32),
+                    fb=3,
+                ))
             c += 1
 
     def _cat_or_fb(parts, fb_size):

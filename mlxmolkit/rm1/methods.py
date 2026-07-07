@@ -11,8 +11,10 @@ Parameters are loaded from params.py (RM1) or defined here (AM1, AM1*).
 """
 from __future__ import annotations
 
+import csv
 import numpy as np
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional
 from .params import ElementParams, RM1_PARAMS, _EISOL_COEFFICIENTS, _compute_eisol
 
@@ -64,6 +66,88 @@ AM1_PARAMS: Dict[int, ElementParams] = {
         gauss_M=[0.847918, 1.445071, 0.0, 0.0],
     ),
 }
+
+
+_AM1_EXTRA_VALENCE = {
+    9: 7,
+    14: 4,
+    15: 5,
+    16: 6,
+    17: 7,
+    35: 7,
+    53: 7,
+}
+
+_AM1_EXTRA_EHEAT_KCAL = {
+    # PYSEQM seqm_functions/constants.py, atom heats from MOPAC block.f.
+    9: 18.890,
+    14: 108.390,
+    15: 75.570,
+    16: 66.400,
+    17: 28.990,
+    35: 26.740,
+    53: 25.517,
+}
+
+
+def _float_field(row: Dict[str, str], key: str) -> float:
+    return float(row[key].strip())
+
+
+def _augment_am1_params_from_mopac_csv() -> None:
+    """Add AM1-BCC heavy elements from the bundled PYSEQM/MOPAC AM1 table."""
+    csv_path = Path(__file__).resolve().parent / "data" / "parameters_AM1_MOPAC.csv"
+    if not csv_path.exists():
+        return
+
+    with csv_path.open(newline="") as handle:
+        reader = csv.DictReader(handle, skipinitialspace=True)
+        for raw_row in reader:
+            row = {key.strip(): value for key, value in raw_row.items() if key is not None}
+            z = int(row["N"].strip())
+            if z not in _AM1_EXTRA_VALENCE:
+                continue
+
+            AM1_PARAMS[z] = ElementParams(
+                Z=z,
+                symbol=row["sym"].strip(),
+                n_basis=4,
+                n_valence=_AM1_EXTRA_VALENCE[z],
+                eheat=_AM1_EXTRA_EHEAT_KCAL[z],
+                Uss=_float_field(row, "U_ss"),
+                Upp=_float_field(row, "U_pp"),
+                zeta_s=_float_field(row, "zeta_s"),
+                zeta_p=_float_field(row, "zeta_p"),
+                beta_s=_float_field(row, "beta_s"),
+                beta_p=_float_field(row, "beta_p"),
+                gss=_float_field(row, "g_ss"),
+                gsp=_float_field(row, "g_sp"),
+                gpp=_float_field(row, "g_pp"),
+                gp2=_float_field(row, "g_p2"),
+                hsp=_float_field(row, "h_sp"),
+                alpha=_float_field(row, "alpha"),
+                gauss_K=[
+                    _float_field(row, "Gaussian1_K"),
+                    _float_field(row, "Gaussian2_K"),
+                    _float_field(row, "Gaussian3_K"),
+                    _float_field(row, "Gaussian4_K"),
+                ],
+                gauss_L=[
+                    _float_field(row, "Gaussian1_L"),
+                    _float_field(row, "Gaussian2_L"),
+                    _float_field(row, "Gaussian3_L"),
+                    _float_field(row, "Gaussian4_L"),
+                ],
+                gauss_M=[
+                    _float_field(row, "Gaussian1_M"),
+                    _float_field(row, "Gaussian2_M"),
+                    _float_field(row, "Gaussian3_M"),
+                    _float_field(row, "Gaussian4_M"),
+                ],
+            )
+
+
+_augment_am1_params_from_mopac_csv()
 
 # Compute Eisol for AM1
 for _z, _p in AM1_PARAMS.items():
@@ -423,15 +507,86 @@ for _z, _p in PM6_SP_PARAMS.items():
 # PM6 full with d-orbitals
 from .pm6_params import PM6_FULL_PARAMS
 
+# --- Extend PM6_FULL_PARAMS to the FULL main-group periodic table from the bundled MOPAC CSV (Stewart PM6,
+# via PYSEQM). PM6 uses d-orbitals for Al,Si,P,S,Cl,Sc-Cu,As,Br,Sb,I; the sp-only variant MIS-CHARGES them
+# (e.g. sulfone S, phosphate P under-polarized), so d-PM6 is the ONLY PM6 exposed. Elements already present
+# (energy-calibrated) are kept; new ones are added charge-only (eheat=0 — density charges don't use eheat;
+# heats-of-formation would need the atomic-heat table).
+_PM6_TORE = {1:1,3:1,4:2,5:3,6:4,7:5,8:6,9:7,11:1,12:2,13:3,14:4,15:5,16:6,17:7,19:1,20:2,21:3,22:4,23:5,
+             24:6,25:7,26:8,27:9,28:10,29:11,30:12,31:3,32:4,33:5,34:6,35:7,37:1,38:2,39:3,40:4,41:5,42:6,
+             43:7,44:8,45:9,46:10,47:11,48:12,49:3,50:4,51:5,52:6,53:7}
 
-# Method registry
+def _sf(row, key):                                          # safe float (blank CSV cell -> 0.0)
+    v = row.get(key, "")
+    try:
+        return float(v) if v else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+def _augment_pm6_full_from_mopac_csv() -> None:
+    csv_path = Path(__file__).resolve().parent / "data" / "parameters_PM6_MOPAC.csv"
+    if not csv_path.exists():
+        return
+    with csv_path.open(newline="") as handle:
+        for raw in csv.DictReader(handle, skipinitialspace=True):
+            row = {k.strip(): (v.strip() if v else "") for k, v in raw.items() if k is not None}
+            z = int(row["N"].strip())
+            if z in PM6_FULL_PARAMS or z not in _PM6_TORE or abs(_sf(row, "U_ss")) < 1e-6:
+                continue   # skip elements PM6 never parameterized (blank/zero U_ss in the CSV)
+            has_d = abs(_sf(row, "zeta_d")) > 1e-9
+            PM6_FULL_PARAMS[z] = ElementParams(
+                Z=z, symbol=row["sym"].strip(), n_basis=(1 if z == 1 else (9 if has_d else 4)),
+                n_valence=_PM6_TORE[z], eheat=0.0,
+                Uss=_sf(row, "U_ss"), Upp=_sf(row, "U_pp"), Udd=_sf(row, "U_dd"),  # Udd was missing -> As off 0.2e
+                zeta_s=_sf(row, "zeta_s"), zeta_p=_sf(row, "zeta_p"),
+                beta_s=_sf(row, "beta_s"), beta_p=_sf(row, "beta_p"),
+                gss=_sf(row, "g_ss"), gsp=_sf(row, "g_sp"), gpp=_sf(row, "g_pp"),
+                gp2=_sf(row, "g_p2"), hsp=_sf(row, "h_sp"), alpha=_sf(row, "alpha"),
+                gauss_K=[_sf(row, f"Gaussian{i}_K") for i in (1, 2, 3, 4)],
+                gauss_L=[_sf(row, f"Gaussian{i}_L") for i in (1, 2, 3, 4)],
+                gauss_M=[_sf(row, f"Gaussian{i}_M") for i in (1, 2, 3, 4)],
+                zeta_d=_sf(row, "zeta_d"), beta_d=_sf(row, "beta_d"),
+                F0SD=_sf(row, "F0SD"), G2SD=_sf(row, "G2SD"), has_d=has_d)
+
+_augment_pm6_full_from_mopac_csv()
+
+
+def _augment_pm3_from_mopac_csv() -> None:
+    """Extend PM3 to the full main-group set (Z<=53) from the bundled MOPAC CSV. PM3_PARAMS shipped only 10
+    elements (values correct, coverage capped — same omission PM6 had). Standard PM3 is sp-only for main group
+    (unlike PM6), and mlxmolkit's d-orbital integrals are PM6-specific, so PM3 stays sp-only here (n_basis=4,
+    charge-only eheat=0). Existing 10 kept intact. d-orbital PM3 (Al/Si/Ti/Zn/P/S...) would need the PM6 d path."""
+    csv_path = Path(__file__).resolve().parent / "data" / "parameters_PM3_MOPAC.csv"
+    if not csv_path.exists():
+        return
+    with csv_path.open(newline="") as handle:
+        for raw in csv.DictReader(handle, skipinitialspace=True):
+            row = {k.strip(): (v.strip() if v else "") for k, v in raw.items() if k is not None}
+            z = int(row["N"].strip())
+            if z in PM3_PARAMS or z not in _PM6_TORE or abs(_sf(row, "U_ss")) < 1e-6:
+                continue   # skip elements PM3 never parameterized (blank/zero U_ss in the CSV)
+            PM3_PARAMS[z] = ElementParams(
+                Z=z, symbol=row["sym"].strip(), n_basis=(1 if z == 1 else 4),
+                n_valence=_PM6_TORE[z], eheat=0.0,
+                Uss=_sf(row, "U_ss"), Upp=_sf(row, "U_pp"),
+                zeta_s=_sf(row, "zeta_s"), zeta_p=_sf(row, "zeta_p"),
+                beta_s=_sf(row, "beta_s"), beta_p=_sf(row, "beta_p"),
+                gss=_sf(row, "g_ss"), gsp=_sf(row, "g_sp"), gpp=_sf(row, "g_pp"),
+                gp2=_sf(row, "g_p2"), hsp=_sf(row, "h_sp"), alpha=_sf(row, "alpha"),
+                gauss_K=[_sf(row, f"Gaussian{i}_K") for i in (1, 2, 3, 4)],
+                gauss_L=[_sf(row, f"Gaussian{i}_L") for i in (1, 2, 3, 4)],
+                gauss_M=[_sf(row, f"Gaussian{i}_M") for i in (1, 2, 3, 4)])
+
+_augment_pm3_from_mopac_csv()
+
+
+# Method registry.  d-PM6 is the ONLY PM6 exposed: sp-only mis-charges P/S/halogens (drops their d-orbitals).
 METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     'RM1': RM1_PARAMS,
     'AM1': AM1_PARAMS,
     'PM3': PM3_PARAMS,
-    'PM6': PM6_SP_PARAMS,        # PM6 (sp-only, matches PYSEQM/MOPAC)
-    'PM6_SP': PM6_SP_PARAMS,     # PM6 sp-only (alias)
-    'PM6_D': PM6_FULL_PARAMS,    # PM6 with d-orbitals (experimental)
+    'PM6': PM6_FULL_PARAMS,      # full main-group PM6 WITH d-orbitals (Stewart 2007)
+    'PM6_D': PM6_FULL_PARAMS,    # alias
     'AM1_STAR': AM1_STAR_PARAMS,
     'RM1_STAR': RM1_STAR_PARAMS,
 }

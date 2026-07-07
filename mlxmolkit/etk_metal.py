@@ -297,10 +297,31 @@ _ETK_BODY = """
     float energy = tg_reduce_sum(shared, tid, tpm);
 
 #if PARALLEL_GRAD
-    // Parallel gradient: each thread handles a stripe of vars, reads all constraints
+    // Parallel gradient: each thread handles a stripe of vars, reads all distance constraints
     for (int v=(int)tid; v<n_vars; v+=(int)tpm) {
         int my_a=v/dim, my_c=v%dim; float g=0.0f;
-        // 1-4 distance gradient (simplest — same pattern as DG)
+        for (int t=d12_s;t<d12_e;t++) {
+            int a=d12_pairs[t*2]+atom_off, b=d12_pairs[t*2+1]+atom_off;
+            if ((my_a+atom_off)!=a && (my_a+atom_off)!=b) continue;
+            float df[3]; float d2=0.0f;
+            for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
+            float dist=sqrt(d2+1e-12f), lb=d12_bounds[t*3], ub=d12_bounds[t*3+1], wt=d12_bounds[t*3+2];
+            float pf=0.0f;
+            if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
+            else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
+            if (pf!=0.0f) g+=(((my_a+atom_off)==a)?1.0f:-1.0f)*pf*df[my_c];
+        }
+        for (int t=d13_s;t<d13_e;t++) {
+            int a=d13_pairs[t*2]+atom_off, b=d13_pairs[t*2+1]+atom_off;
+            if ((my_a+atom_off)!=a && (my_a+atom_off)!=b) continue;
+            float df[3]; float d2=0.0f;
+            for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
+            float dist=sqrt(d2+1e-12f), lb=d13_bounds[t*3], ub=d13_bounds[t*3+1], wt=d13_bounds[t*3+2];
+            float pf=0.0f;
+            if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
+            else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
+            if (pf!=0.0f) g+=(((my_a+atom_off)==a)?1.0f:-1.0f)*pf*df[my_c];
+        }
         for (int t=d14_s;t<d14_e;t++) {
             int a=d14_pairs[t*2]+atom_off, b=d14_pairs[t*2+1]+atom_off;
             if ((my_a+atom_off)!=a && (my_a+atom_off)!=b) continue;
@@ -393,6 +414,12 @@ _ETK_BODY = """
             for (int t=imp_s+(int)tid;t<imp_e;t+=(int)tpm){
                 int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
                 lte+=improper_e(out_pos,ic,i0,i1,i2,improper_w[t],dim);}
+            for (int t=d12_s+(int)tid;t<d12_e;t+=(int)tpm){
+                int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off;
+                lte+=dist14_e(out_pos,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);}
+            for (int t=d13_s+(int)tid;t<d13_e;t+=(int)tpm){
+                int a=d13_pairs[t*2]+atom_off,b=d13_pairs[t*2+1]+atom_off;
+                lte+=dist14_e(out_pos,a,b,d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim);}
             for (int t=d14_s+(int)tid;t<d14_e;t+=(int)tpm){
                 int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
                 lte+=dist14_e(out_pos,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
@@ -429,14 +456,40 @@ _ETK_BODY = """
                 torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5]);}
         for (int t=imp_s+(int)tid;t<imp_e;t+=(int)tpm){int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
             lne+=improper_e(out_pos,ic,i0,i1,i2,improper_w[t],dim);}
+        for (int t=d12_s+(int)tid;t<d12_e;t+=(int)tpm){int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off;
+            lne+=dist14_e(out_pos,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);}
+        for (int t=d13_s+(int)tid;t<d13_e;t+=(int)tpm){int a=d13_pairs[t*2]+atom_off,b=d13_pairs[t*2+1]+atom_off;
+            lne+=dist14_e(out_pos,a,b,d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim);}
         for (int t=d14_s+(int)tid;t<d14_e;t+=(int)tpm){int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
             lne+=dist14_e(out_pos,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
         shared[tid]=lne; energy=tg_reduce_sum(shared,tid,tpm);
 
 #if PARALLEL_GRAD
-        // Parallel dist14 gradient + serial torsion/improper
+        // Parallel distance gradient + serial torsion/improper
         for (int v=(int)tid; v<n_vars; v+=(int)tpm) {
             int ma=v/dim, mc=v%dim; float g=0.0f;
+            for (int t=d12_s;t<d12_e;t++) {
+                int a=d12_pairs[t*2]+atom_off, b=d12_pairs[t*2+1]+atom_off;
+                if ((ma+atom_off)!=a && (ma+atom_off)!=b) continue;
+                float df[3]; float d2=0.0f;
+                for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
+                float dist=sqrt(d2+1e-12f), lb=d12_bounds[t*3], ub=d12_bounds[t*3+1], wt=d12_bounds[t*3+2];
+                float pf=0.0f;
+                if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
+                else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
+                if (pf!=0.0f) g+=(((ma+atom_off)==a)?1.0f:-1.0f)*pf*df[mc];
+            }
+            for (int t=d13_s;t<d13_e;t++) {
+                int a=d13_pairs[t*2]+atom_off, b=d13_pairs[t*2+1]+atom_off;
+                if ((ma+atom_off)!=a && (ma+atom_off)!=b) continue;
+                float df[3]; float d2=0.0f;
+                for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
+                float dist=sqrt(d2+1e-12f), lb=d13_bounds[t*3], ub=d13_bounds[t*3+1], wt=d13_bounds[t*3+2];
+                float pf=0.0f;
+                if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
+                else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
+                if (pf!=0.0f) g+=(((ma+atom_off)==a)?1.0f:-1.0f)*pf*df[mc];
+            }
             for (int t=d14_s;t<d14_e;t++) {
                 int a=d14_pairs[t*2]+atom_off, b=d14_pairs[t*2+1]+atom_off;
                 if ((ma+atom_off)!=a && (ma+atom_off)!=b) continue;
