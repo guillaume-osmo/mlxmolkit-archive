@@ -295,10 +295,11 @@ def pm6_esp_resp_charge_labels(
     """Generate PM6-backed ESP/RESP charge labels.
 
     If ``grid_coords`` and ``esp_values`` are provided, they are treated as the
-    quantum ESP to fit. Without an explicit grid, the current PM6/RM1 SCF
-    implementation supplies Mulliken-like atom charges; this function evaluates
-    their point-charge potential on a Connolly grid and applies ESP/RESP fitting
-    as a transparent PM6 proxy label.
+    quantum ESP to fit. Without an explicit grid, the NDDO SCF density is
+    condensed into Besler-Merz-Kollman atom-centred multipoles (monopole +
+    sp-hybrid dipole) whose true classical potential is evaluated on a Connolly
+    grid -- the physical NDDO ESP, not the old Mulliken-monopole proxy. See
+    ``mlxmolkit.nddo_multipole_esp``.
     """
 
     atom_array = np.asarray(atoms, dtype=np.int64)
@@ -314,15 +315,26 @@ def pm6_esp_resp_charge_labels(
         )
         if not scf.get("converged", False):
             raise RuntimeError(f"{method} SCF did not converge")
-        pm6_charges = np.asarray(scf["charges"], dtype=np.float64)
+        # True NDDO ESP from the density (monopole + sp-hybrid dipole), not the
+        # circular Mulliken-monopole proxy. See mlxmolkit.nddo_multipole_esp.
+        from mlxmolkit.nddo_multipole_esp import (
+            atomic_multipoles_from_density,
+            nddo_esp_on_grid,
+        )
+        from mlxmolkit.rm1.methods import get_params
+
+        params = [get_params(method)[int(z)] for z in atom_array.tolist()]
+        q_mono, dip, _quad = atomic_multipoles_from_density(
+            atom_array.tolist(), params, scf["density"]
+        )
         grid_coords = connolly_surface_grid(
             atom_array,
             coord_array,
             shell_factors=shell_factors,
             point_density=point_density,
         )
-        esp_values = coulomb_potential_from_charges_mlx(coord_array, pm6_charges, grid_coords)
-        source = f"{method.lower()}_mulliken_esp_proxy"
+        esp_values = nddo_esp_on_grid(coord_array, q_mono, dip, grid_coords)
+        source = f"{method.lower()}_multipole_esp"
     else:
         source = f"{method.lower()}_external_esp_grid"
 
