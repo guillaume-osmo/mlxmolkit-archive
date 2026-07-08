@@ -39,6 +39,60 @@ class DGParams:
     # Fourth dimension atoms (all atoms get 4th-dim penalty)
     fourth_idx: np.ndarray  # (n_atoms,) int32
 
+    # Full RDKit distance-bounds matrix (N,N): [i,j] i<j = upper, [j,i] = lower.
+    # Kept for the metric-matrix (distance-geometry) initial embedding.
+    bounds_mat: np.ndarray = None
+
+
+# --------------------------------------------------------------------------- #
+# Metric-matrix (classic distance-geometry) initial embedding.                #
+# RDKit's ETKDG starts each conformer by sampling a random distance matrix     #
+# WITHIN the smoothed bounds, forming the double-centred Gram matrix           #
+# G = -1/2 J D2 J, and taking the top-`dim` eigenvectors * sqrt(eigenvalue) as #
+# the initial coordinates. The Metal port previously started from Gaussian     #
+# noise, which lands in a different DG basin -> different conformers than       #
+# RDKit. This restores the embedding so the port reproduces RDKit's basin.     #
+# --------------------------------------------------------------------------- #
+def _embed_one_metric(bmat: np.ndarray, rng, dim: int = 4) -> np.ndarray:
+    """One conformer's initial coords via the metric-matrix embedding. Returns (N, dim)."""
+    N = int(bmat.shape[0])
+    if N <= 1:
+        return np.zeros((N, dim), np.float32)
+    iu = np.triu_indices(N, 1)
+    up = bmat[iu].astype(np.float64)                     # i<j -> upper bound
+    lo = bmat[(iu[1], iu[0])].astype(np.float64)         # j,i -> lower bound
+    lo = np.minimum(lo, up)
+    d = lo + rng.random(len(up)) * (up - lo)             # random distance within bounds
+    D2 = np.zeros((N, N))
+    D2[iu] = d * d
+    D2[(iu[1], iu[0])] = d * d
+    # double-centre: G = -1/2 (D2 - rowmean - colmean + grandmean)
+    G = -0.5 * (D2 - D2.mean(1, keepdims=True) - D2.mean(0, keepdims=True) + D2.mean())
+    w, V = np.linalg.eigh(G)                              # ascending eigenvalues
+    idx = np.argsort(w)[::-1][:dim]                       # top-`dim`
+    lam = np.clip(w[idx], 0.0, None)
+    X = V[:, idx] * np.sqrt(lam)[None, :]                 # (N, dim); zero cols if eigenvalue <=0
+    return X.astype(np.float32)
+
+
+def metric_matrix_positions(batch, bounds_mats, seed: int = 42, dim: int = 4) -> np.ndarray:
+    """RDKit-style DG initial coords for every conformer in `batch`, atom-major flat array.
+    `bounds_mats[m]` is molecule m's bounds matrix (m indexes batch.conf_to_mol)."""
+    import os as _os
+    _force_gauss = bool(_os.environ.get("MLXMOLKIT_GAUSSIAN_INIT"))   # A/B toggle for validation
+    rng = np.random.default_rng(seed)
+    n_total = int(batch.conf_atom_starts[-1])
+    out = np.zeros(n_total * dim, np.float32)
+    for c in range(int(batch.n_confs_total)):
+        m = int(batch.conf_to_mol[c])
+        a0 = int(batch.conf_atom_starts[c]); a1 = int(batch.conf_atom_starts[c + 1])
+        bmat = None if _force_gauss else bounds_mats[m]
+        if bmat is None:                                 # fallback: Gaussian (old behaviour)
+            out[a0 * dim:a1 * dim] = rng.standard_normal((a1 - a0) * dim).astype(np.float32)
+        else:
+            out[a0 * dim:a1 * dim] = _embed_one_metric(bmat, rng, dim).reshape(-1)
+    return out
+
 
 @dataclass
 class BatchedDGSystem:
@@ -200,6 +254,7 @@ def extract_dg_params(
         chiral_vol_lower=np.array(chiral_vol_lower, dtype=np.float32) if n_chiral else np.zeros(0, dtype=np.float32),
         chiral_vol_upper=np.array(chiral_vol_upper, dtype=np.float32) if n_chiral else np.zeros(0, dtype=np.float32),
         fourth_idx=fourth_idx,
+        bounds_mat=np.asarray(bounds_mat, dtype=np.float32),
     )
 
 
