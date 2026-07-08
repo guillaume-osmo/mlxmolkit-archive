@@ -250,18 +250,31 @@ def extract_etk_params(
     # and pucker under torsion refinement, so we emit all three permutations to match RDKit.
     if use_basic_knowledge:
         for atom in mol.GetAtoms():
-            hyb = atom.GetHybridization()
-            if hyb != Chem.HybridizationType.SP2:
+            # RDKit restricts inversion/improper centers to C/N/O with EXACTLY 3 neighbours
+            # (TorsionPreferences.cpp); the port previously flattened any sp2 deg>=3 atom (e.g. boron).
+            if atom.GetAtomicNum() not in (6, 7, 8):
+                continue
+            if atom.GetHybridization() != Chem.HybridizationType.SP2:
                 continue
             neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
-            if len(neighbors) < 3:
+            if len(neighbors) != 3:
                 continue
+
+            # RDKit boosts the force constant ~50/6x for sp2-C bonded to a terminal sp2 O
+            # (carbonyl/amide/ester/carboxylate) — isBoundToSP2O.
+            w = improper_weight
+            if atom.GetAtomicNum() == 6:
+                for nb in atom.GetNeighbors():
+                    if (nb.GetAtomicNum() == 8 and nb.GetHybridization() == Chem.HybridizationType.SP2
+                            and nb.GetDegree() == 1):
+                        w = improper_weight * (50.0 / 6.0)
+                        break
 
             center = atom.GetIdx()
             n0, n1, n2 = neighbors[0], neighbors[1], neighbors[2]
             for (a, b, c) in ((n0, n1, n2), (n1, n2, n0), (n2, n0, n1)):
                 improper_idx_list.append([center, a, b, c])
-                improper_w_list.append(improper_weight)
+                improper_w_list.append(w)
 
     n_improper = len(improper_idx_list)
     if n_improper > 0:

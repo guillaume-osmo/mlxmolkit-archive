@@ -203,33 +203,30 @@ def extract_dg_params(
 
         center = atom.GetIdx()
         neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
-        if len(neighbors) < 4:
+        # RDKit uses FIXED signed chiral-volume windows (Embedder.cpp:1105-1141), NOT an avg_d^3
+        # heuristic: |vol| in [5, 100] (lower relaxes to 2 for 3-coordinate centres). The old
+        # heuristic capped |vol| near ~1.5, forbidding the natural tetrahedral volume (~8) and thus
+        # flattening/occasionally inverting the centre. 3-coordinate stereocentres (sulfoxides,
+        # chiral N/P/S) were skipped entirely (len<4) and got NO constraint -> free enantiomer.
+        if len(neighbors) < 3:
             continue
-
-        # Compute volume bounds from distance bounds
-        # V = (p1-p4) . ((p2-p4) x (p3-p4))
-        i1, i2, i3, i4 = neighbors[0], neighbors[1], neighbors[2], neighbors[3]
-
-        # Estimate volume from bounds (nvMolKit approach)
-        d12 = bounds_mat[min(i1, i2), max(i1, i2)]
-        d13 = bounds_mat[min(i1, i3), max(i1, i3)]
-        d14 = bounds_mat[min(i1, i4), max(i1, i4)]
-        d23 = bounds_mat[min(i2, i3), max(i2, i3)]
-        d24 = bounds_mat[min(i2, i4), max(i2, i4)]
-        d34 = bounds_mat[min(i3, i4), max(i3, i4)]
-
-        avg_d = (d12 + d13 + d14 + d23 + d24 + d34) / 6.0
-        vol_est = avg_d ** 3 / (6.0 * np.sqrt(2.0))
+        if len(neighbors) == 3:
+            i1, i2, i3, i4 = neighbors[0], neighbors[1], neighbors[2], center  # center = 4th vertex
+            vol_lo_mag = 2.0
+        else:
+            i1, i2, i3, i4 = neighbors[0], neighbors[1], neighbors[2], neighbors[3]
+            vol_lo_mag = 5.0
+        vol_hi_mag = 100.0
 
         if tag == Chem.ChiralType.CHI_TETRAHEDRAL_CCW:
-            vol_lower = 0.0
-            vol_upper = vol_est
+            vol_lower = vol_lo_mag
+            vol_upper = vol_hi_mag
         elif tag == Chem.ChiralType.CHI_TETRAHEDRAL_CW:
-            vol_lower = -vol_est
-            vol_upper = 0.0
+            vol_lower = -vol_hi_mag
+            vol_upper = -vol_lo_mag
         else:
-            vol_lower = -vol_est
-            vol_upper = vol_est
+            vol_lower = -vol_hi_mag
+            vol_upper = vol_hi_mag
 
         chiral_idx1.append(i1)
         chiral_idx2.append(i2)
