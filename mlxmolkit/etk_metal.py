@@ -83,7 +83,7 @@ inline void torsion_g(const device float* pos, device float* grad,
     float c=cp,c2=c*c,c3=c*c2,c4=c*c3;
     float dE=-s0*V0*sp-2.0f*s1*V1*(2.0f*c*sp)-3.0f*s2*V2*(4.0f*c2*sp-sp)
         -4.0f*s3*V3*(8.0f*c3*sp-4.0f*c*sp)-5.0f*s4*V4*(16.0f*c4*sp-12.0f*c2*sp+sp)
-        -6.0f*s5*V5*(32.0f*c4*c*sp-32.0f*c3*sp+6.0f*sp);
+        -6.0f*s5*V5*(32.0f*c4*c*sp-32.0f*c3*sp+6.0f*c*sp);
     float st;
     if (abs(sp)>1e-8f) st=-dE/sp; else st=-dE/max(abs(cp),1e-16f)*sign(cp+1e-30f);
     float dcx0=inv0*(tnx1-cp*tnx0),dcy0=inv0*(tny1-cp*tny0),dcz0=inv0*(tnz1-cp*tnz0);
@@ -102,56 +102,25 @@ inline void torsion_g(const device float* pos, device float* grad,
     grad[i4*dim+0]+=g4x;grad[i4*dim+1]+=g4y;grad[i4*dim+2]+=g4z;
 }
 
-// ---- Improper torsion energy: E = w * (1 - cos(2ω)) ----
+// ---- Improper torsion (planarity) energy: E = w * (1 - cos(2ω)) ----
+// Identity: with c = cos(ω) = calc_cos_phi(ic,i0,i1,i2),  1-cos(2ω) = 2-2c^2,
+// which is exactly torsion_e(c, V=[0,w,0,0,0,0], s=[0,-1,0,0,0,0]).  Delegating to the
+// (finite-difference-verified) torsion energy/gradient keeps E and dE/dx consistent.
+// The previous standalone improper_g used a Blondel-Karplus dφ/dx that did NOT match this
+// ω definition (FD error ~150) — which silently zeroed the ETK refinement.
 inline float improper_e(const device float* pos,
     int ic,int i0,int i1,int i2, float wt, int dim
 ) {
-    float b1[3],b2[3],b3[3];
-    for (int d=0;d<3;d++){b1[d]=pos[i0*dim+d]-pos[ic*dim+d];b2[d]=pos[i1*dim+d]-pos[i0*dim+d];b3[d]=pos[i2*dim+d]-pos[i1*dim+d];}
-    float n1x=b1[1]*b2[2]-b1[2]*b2[1],n1y=b1[2]*b2[0]-b1[0]*b2[2],n1z=b1[0]*b2[1]-b1[1]*b2[0];
-    float n2x=b2[1]*b3[2]-b2[2]*b3[1],n2y=b2[2]*b3[0]-b2[0]*b3[2],n2z=b2[0]*b3[1]-b2[1]*b3[0];
-    float n1l=sqrt(n1x*n1x+n1y*n1y+n1z*n1z+1e-12f);
-    float n2l=sqrt(n2x*n2x+n2y*n2y+n2z*n2z+1e-12f);
-    float b2l=sqrt(b2[0]*b2[0]+b2[1]*b2[1]+b2[2]*b2[2]+1e-12f);
-    float cw=(n1x*n2x+n1y*n2y+n1z*n2z)/(n1l*n2l);
-    cw=clamp(cw,-1.0f,1.0f);
-    float bh0=b2[0]/b2l,bh1=b2[1]/b2l,bh2=b2[2]/b2l;
-    float m1x=n1y*bh2-n1z*bh1,m1y=n1z*bh0-n1x*bh2,m1z=n1x*bh1-n1y*bh0;
-    float sw=(m1x*n2x+m1y*n2y+m1z*n2z)/(n1l*n2l);
-    float omega=atan2(sw,cw);
-    return wt*(1.0f-cos(2.0f*omega));
+    float c = calc_cos_phi(pos, ic,i0,i1,i2, dim);
+    return torsion_e(c, 0.0f,wt,0.0f,0.0f,0.0f,0.0f, 0.0f,-1.0f,0.0f,0.0f,0.0f,0.0f);
 }
 
-// ---- Improper torsion gradient ----
+// ---- Improper torsion gradient (delegates to fixed torsion_g) ----
 inline void improper_g(const device float* pos, device float* grad,
     int ic,int i0,int i1,int i2, float wt, int dim
 ) {
-    float b1[3],b2[3],b3[3];
-    for (int d=0;d<3;d++){b1[d]=pos[i0*dim+d]-pos[ic*dim+d];b2[d]=pos[i1*dim+d]-pos[i0*dim+d];b3[d]=pos[i2*dim+d]-pos[i1*dim+d];}
-    float n1x=b1[1]*b2[2]-b1[2]*b2[1],n1y=b1[2]*b2[0]-b1[0]*b2[2],n1z=b1[0]*b2[1]-b1[1]*b2[0];
-    float n2x=b2[1]*b3[2]-b2[2]*b3[1],n2y=b2[2]*b3[0]-b2[0]*b3[2],n2z=b2[0]*b3[1]-b2[1]*b3[0];
-    float n1l=sqrt(n1x*n1x+n1y*n1y+n1z*n1z+1e-12f);
-    float n2l=sqrt(n2x*n2x+n2y*n2y+n2z*n2z+1e-12f);
-    float b2l=sqrt(b2[0]*b2[0]+b2[1]*b2[1]+b2[2]*b2[2]+1e-12f);
-    float cw=(n1x*n2x+n1y*n2y+n1z*n2z)/(n1l*n2l); cw=clamp(cw,-1.0f,1.0f);
-    float bh0=b2[0]/b2l,bh1=b2[1]/b2l,bh2=b2[2]/b2l;
-    float m1x=n1y*bh2-n1z*bh1,m1y=n1z*bh0-n1x*bh2,m1z=n1x*bh1-n1y*bh0;
-    float sw=(m1x*n2x+m1y*n2y+m1z*n2z)/(n1l*n2l);
-    float omega=atan2(sw,cw);
-    float dEdw=wt*2.0f*sin(2.0f*omega);
-    float n1sq=n1x*n1x+n1y*n1y+n1z*n1z+1e-12f,n2sq=n2x*n2x+n2y*n2y+n2z*n2z+1e-12f;
-    float b2sq=b2[0]*b2[0]+b2[1]*b2[1]+b2[2]*b2[2]+1e-12f;
-    float f0=-b2l/n1sq,f3=b2l/n2sq;
-    float b1b2=b1[0]*b2[0]+b1[1]*b2[1]+b1[2]*b2[2];
-    float b3b2=b3[0]*b2[0]+b3[1]*b2[1]+b3[2]*b2[2];
-    float f1a=b1b2/b2sq-1.0f,f1b=-b3b2/b2sq,f2a=b3b2/b2sq-1.0f,f2b=-b1b2/b2sq;
-    for (int d=0;d<3;d++){
-        float dp0=f0*(d==0?n1x:d==1?n1y:n1z);
-        float dp3=f3*(d==0?n2x:d==1?n2y:n2z);
-        float dp1=f1a*dp0+f1b*dp3,dp2=f2a*dp3+f2b*dp0;
-        grad[ic*dim+d]+=dEdw*dp0; grad[i0*dim+d]+=dEdw*dp1;
-        grad[i1*dim+d]+=dEdw*dp2; grad[i2*dim+d]+=dEdw*dp3;
-    }
+    torsion_g(pos, grad, ic,i0,i1,i2,
+        0.0f,wt,0.0f,0.0f,0.0f,0.0f, 0.0f,-1.0f,0.0f,0.0f,0.0f,0.0f, dim);
 }
 
 // ---- 1-4 distance constraint: flat-bottom harmonic ----
