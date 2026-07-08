@@ -39,6 +39,68 @@ class DGParams:
     # Fourth dimension atoms (all atoms get 4th-dim penalty)
     fourth_idx: np.ndarray  # (n_atoms,) int32
 
+    # Full RDKit distance-bounds matrix (N,N): [i,j] i<j = upper, [j,i] = lower.
+    # Kept for the metric-matrix (distance-geometry) initial embedding.
+    bounds_mat: np.ndarray = None
+
+
+# --------------------------------------------------------------------------- #
+# Metric-matrix (classic distance-geometry) initial embedding.                #
+# RDKit's ETKDG starts each conformer by sampling a random distance matrix     #
+# WITHIN the smoothed bounds, forming the double-centred Gram matrix           #
+# G = -1/2 J D2 J, and taking the top-`dim` eigenvectors * sqrt(eigenvalue) as #
+# the initial coordinates. The Metal port previously started from Gaussian     #
+# noise, which lands in a different DG basin -> different conformers than       #
+# RDKit. This restores the embedding so the port reproduces RDKit's basin.     #
+# --------------------------------------------------------------------------- #
+def _embed_one_metric(bmat: np.ndarray, rng, dim: int = 4) -> np.ndarray:
+    """One conformer's initial coords via the metric-matrix embedding. Returns (N, dim)."""
+    N = int(bmat.shape[0])
+    if N <= 1:
+        return np.zeros((N, dim), np.float32)
+    iu = np.triu_indices(N, 1)
+    up = bmat[iu].astype(np.float64)                     # i<j -> upper bound
+    lo = bmat[(iu[1], iu[0])].astype(np.float64)         # j,i -> lower bound
+    lo = np.minimum(lo, up)
+    d = lo + rng.random(len(up)) * (up - lo)             # random distance within bounds
+    D2 = np.zeros((N, N))
+    D2[iu] = d * d
+    D2[(iu[1], iu[0])] = d * d
+    # double-centre: G = -1/2 (D2 - rowmean - colmean + grandmean)
+    G = -0.5 * (D2 - D2.mean(1, keepdims=True) - D2.mean(0, keepdims=True) + D2.mean())
+    w, V = np.linalg.eigh(G)                              # ascending eigenvalues
+    idx = np.argsort(w)[::-1][:dim]                       # top-`dim`
+    lam = w[idx]
+    # RDKit (randNegEig=True) fills a random [-1,1] coordinate when a top-`dim` eigenvalue is
+    # non-positive, instead of collapsing that DoF to exactly 0 (which biases small/linear molecules).
+    cols = []
+    for k in range(dim):
+        if lam[k] > 0.0:
+            cols.append(V[:, idx[k]] * np.sqrt(lam[k]))
+        else:
+            cols.append(1.0 - 2.0 * rng.random(N))
+    X = np.stack(cols, axis=1)
+    return X.astype(np.float32)
+
+
+def metric_matrix_positions(batch, bounds_mats, seed: int = 42, dim: int = 4) -> np.ndarray:
+    """RDKit-style DG initial coords for every conformer in `batch`, atom-major flat array.
+    `bounds_mats[m]` is molecule m's bounds matrix (m indexes batch.conf_to_mol)."""
+    import os as _os
+    _force_gauss = bool(_os.environ.get("MLXMOLKIT_GAUSSIAN_INIT"))   # A/B toggle for validation
+    rng = np.random.default_rng(seed)
+    n_total = int(batch.conf_atom_starts[-1])
+    out = np.zeros(n_total * dim, np.float32)
+    for c in range(int(batch.n_confs_total)):
+        m = int(batch.conf_to_mol[c])
+        a0 = int(batch.conf_atom_starts[c]); a1 = int(batch.conf_atom_starts[c + 1])
+        bmat = None if _force_gauss else bounds_mats[m]
+        if bmat is None:                                 # fallback: Gaussian (old behaviour)
+            out[a0 * dim:a1 * dim] = rng.standard_normal((a1 - a0) * dim).astype(np.float32)
+        else:
+            out[a0 * dim:a1 * dim] = _embed_one_metric(bmat, rng, dim).reshape(-1)
+    return out
+
 
 @dataclass
 class BatchedDGSystem:
@@ -118,12 +180,16 @@ def extract_dg_params(
             lb = float(bounds_mat[j, i])
             if ub <= 0 or lb <= 0:
                 continue
-            # Weight based on basin size tolerance (nvMolKit pattern)
             ub2 = ub * ub
             lb2 = lb * lb
-            if ub2 - lb2 > basin_size_tol:
+            # RDKit trims a pair from the DG error function when the LINEAR spread exceeds
+            # basinThresh=5.0 A (DistGeomUtils); the port used a squared (ub2-lb2)>1e8 test that
+            # never fires in the metric-embedding regime, retaining loose long-range pairs.
+            if ub - lb > 5.0:
                 continue
-            w = 1.0 / max(ub2 - lb2, 1e-8)
+            # RDKit weights every retained pair uniformly at 1.0 (extraWeights null in both ETKDG
+            # fields); the port's 1/(ub2-lb2) reweighting over-weighted tight bonds and skewed the basin.
+            w = 1.0
             idx1_list.append(i)
             idx2_list.append(j)
             lb2_list.append(lb2)
@@ -149,33 +215,30 @@ def extract_dg_params(
 
         center = atom.GetIdx()
         neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
-        if len(neighbors) < 4:
+        # RDKit uses FIXED signed chiral-volume windows (Embedder.cpp:1105-1141), NOT an avg_d^3
+        # heuristic: |vol| in [5, 100] (lower relaxes to 2 for 3-coordinate centres). The old
+        # heuristic capped |vol| near ~1.5, forbidding the natural tetrahedral volume (~8) and thus
+        # flattening/occasionally inverting the centre. 3-coordinate stereocentres (sulfoxides,
+        # chiral N/P/S) were skipped entirely (len<4) and got NO constraint -> free enantiomer.
+        if len(neighbors) < 3:
             continue
-
-        # Compute volume bounds from distance bounds
-        # V = (p1-p4) . ((p2-p4) x (p3-p4))
-        i1, i2, i3, i4 = neighbors[0], neighbors[1], neighbors[2], neighbors[3]
-
-        # Estimate volume from bounds (nvMolKit approach)
-        d12 = bounds_mat[min(i1, i2), max(i1, i2)]
-        d13 = bounds_mat[min(i1, i3), max(i1, i3)]
-        d14 = bounds_mat[min(i1, i4), max(i1, i4)]
-        d23 = bounds_mat[min(i2, i3), max(i2, i3)]
-        d24 = bounds_mat[min(i2, i4), max(i2, i4)]
-        d34 = bounds_mat[min(i3, i4), max(i3, i4)]
-
-        avg_d = (d12 + d13 + d14 + d23 + d24 + d34) / 6.0
-        vol_est = avg_d ** 3 / (6.0 * np.sqrt(2.0))
+        if len(neighbors) == 3:
+            i1, i2, i3, i4 = neighbors[0], neighbors[1], neighbors[2], center  # center = 4th vertex
+            vol_lo_mag = 2.0
+        else:
+            i1, i2, i3, i4 = neighbors[0], neighbors[1], neighbors[2], neighbors[3]
+            vol_lo_mag = 5.0
+        vol_hi_mag = 100.0
 
         if tag == Chem.ChiralType.CHI_TETRAHEDRAL_CCW:
-            vol_lower = 0.0
-            vol_upper = vol_est
+            vol_lower = vol_lo_mag
+            vol_upper = vol_hi_mag
         elif tag == Chem.ChiralType.CHI_TETRAHEDRAL_CW:
-            vol_lower = -vol_est
-            vol_upper = 0.0
+            vol_lower = -vol_hi_mag
+            vol_upper = -vol_lo_mag
         else:
-            vol_lower = -vol_est
-            vol_upper = vol_est
+            vol_lower = -vol_hi_mag
+            vol_upper = vol_hi_mag
 
         chiral_idx1.append(i1)
         chiral_idx2.append(i2)
@@ -200,6 +263,7 @@ def extract_dg_params(
         chiral_vol_lower=np.array(chiral_vol_lower, dtype=np.float32) if n_chiral else np.zeros(0, dtype=np.float32),
         chiral_vol_upper=np.array(chiral_vol_upper, dtype=np.float32) if n_chiral else np.zeros(0, dtype=np.float32),
         fourth_idx=fourth_idx,
+        bounds_mat=np.asarray(bounds_mat, dtype=np.float32),
     )
 
 

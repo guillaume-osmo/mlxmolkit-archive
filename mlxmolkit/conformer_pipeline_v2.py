@@ -19,7 +19,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 import mlx.core as mx
 
-from .dg_extract import DGParams, extract_dg_params, get_bounds_matrix
+from .dg_extract import DGParams, extract_dg_params, get_bounds_matrix, metric_matrix_positions
 from .etk_extract import ETKParams, extract_etk_params
 from .shared_batch import (
     SharedConstraintBatch,
@@ -170,8 +170,15 @@ def _process_chunk(
         mmff_max_iters = _auto_iters(complexity, base=200, scale=15.0)
 
     # ---- Stage 1: DG minimize (4D) ----
+    # Initial coords via RDKit's metric-matrix distance-geometry embedding (random distance
+    # matrix within bounds -> double-centred Gram -> top-4 eigenvectors), NOT Gaussian noise:
+    # the Gaussian start lands in a different DG basin and does not reproduce RDKit's conformers.
     batch4 = pack_shared_dg_batch(chunk_dg, chunk_k, dim=4)
-    pos4 = init_random_positions(batch4, seed=42 + seed_offset)
+    _bounds_mats = [dg.bounds_mat for dg in chunk_dg]
+    if all(b is not None for b in _bounds_mats):
+        pos4 = metric_matrix_positions(batch4, _bounds_mats, seed=42 + seed_offset, dim=4)
+    else:
+        pos4 = init_random_positions(batch4, seed=42 + seed_offset)
     dg_out, dg_e, dg_s = dg_minimize_shared(
         batch4, pos4, max_iters=dg_max_iters,
         fourth_dim_weight=fourth_dim_weight, chiral_weight=chiral_weight,
@@ -287,7 +294,7 @@ def _process_chunk(
     mmff_converged = np.ones(C, dtype=bool)
     mmff_ran = False
     if run_mmff and mols_list is not None:
-        from rdkit.Chem import AllChem
+        from rdkit import Chem
         chunk_mmff = []
         mmff_converged[:] = False
         # Use first conformer of each molecule for MMFF param extraction
@@ -298,7 +305,7 @@ def _process_chunk(
             s3 = int(batch3.conf_atom_starts[conf_cursor]) * 3
             conf_pos = pos3[s3:s3 + n_a * 3].reshape(n_a, 3)
             if mol.GetNumConformers() == 0:
-                AllChem.EmbedMolecule(mol, randomSeed=42)
+                mol.AddConformer(Chem.Conformer(int(n_a)), assignId=True)
             conf = mol.GetConformer(0)
             for a_idx in range(n_a):
                 conf.SetAtomPosition(a_idx, conf_pos[a_idx].astype(float).tolist())

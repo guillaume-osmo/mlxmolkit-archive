@@ -295,8 +295,10 @@ def extract_mmff_params(
             if vdw:
                 v_idx1.append(i)
                 v_idx2.append(j)
-                v_R_star.append(vdw[0])
-                v_eps.append(vdw[1])
+                # slots [2],[3] are the donor-acceptor SCALED R*/eps that RDKit's MMFF actually
+                # applies (DARAD=0.8, DAEPS=0.5 for D-A H-bond pairs); [0],[1] are unscaled.
+                v_R_star.append(vdw[2])
+                v_eps.append(vdw[3])
 
             qi, qj = charges[i], charges[j]
             if abs(qi) > 1e-10 and abs(qj) > 1e-10:
