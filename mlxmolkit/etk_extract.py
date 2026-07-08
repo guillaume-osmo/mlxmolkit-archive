@@ -123,6 +123,9 @@ def extract_etk_params(
     *,
     use_exp_torsion: bool = True,
     use_basic_knowledge: bool = True,
+    use_long_range: bool = True,
+    long_range_weight: float = 10.0,
+    ring_planarity_fc: float = 100.0,
     use_small_ring_torsions: bool = False,
     use_macrocycle_torsions: bool = True,
     use_macrocycle14config: bool = False,
@@ -200,6 +203,32 @@ def extract_etk_params(
                     torsion_signs_list.append(signs)
         except Exception:
             pass
+
+    # Flat-ring planarity torsions. RDKit adds these inside construct3DForceField (NOT via
+    # GetExperimentalTorsions, so the port misses them): for 4 consecutive sp2/aromatic ring atoms
+    # a-b-c-d, a cos2φ term V*(1 - cos2φ) drives the endocyclic dihedral to planar (φ=0). Reuses the
+    # verified torsion energy/gradient (V at index 1, sign -1). Dedup by central bond (b,c).
+    if use_basic_knowledge:
+        ring_fc = ring_planarity_fc
+        ri = mol.GetRingInfo()
+        seen_ring_bonds = set()
+        for ring in ri.AtomRings():
+            nring = len(ring)
+            if nring < 4:
+                continue
+            for k in range(nring):
+                a, b, c, d = ring[k], ring[(k + 1) % nring], ring[(k + 2) % nring], ring[(k + 3) % nring]
+                if any(mol.GetAtomWithIdx(x).GetHybridization() != Chem.HybridizationType.SP2
+                       for x in (a, b, c, d)):
+                    continue
+                key = (min(b, c), max(b, c))
+                if key in seen_ring_bonds:
+                    continue
+                seen_ring_bonds.add(key)
+                torsion_idx_list.append([a, b, c, d])
+                torsion_V_list.append([0.0, ring_fc, 0.0, 0.0, 0.0, 0.0])
+                torsion_signs_list.append([0, -1, 0, 0, 0, 0])
+
     n_torsions = len(torsion_idx_list)
     if n_torsions > 0:
         torsion_idx = np.array(torsion_idx_list, dtype=np.int32)
@@ -215,6 +244,10 @@ def extract_etk_params(
     improper_idx_list = []
     improper_w_list = []
 
+    # RDKit's ETKDG expands each sp2 center into THREE UFF out-of-plane inversion terms (the 3
+    # cyclic neighbour permutations), giving ~3x the planarity restraint of a single improper.
+    # With one improper/center sp2 centres are under-restrained (~1/3 the out-of-plane stiffness)
+    # and pucker under torsion refinement, so we emit all three permutations to match RDKit.
     if use_basic_knowledge:
         for atom in mol.GetAtoms():
             hyb = atom.GetHybridization()
@@ -225,8 +258,10 @@ def extract_etk_params(
                 continue
 
             center = atom.GetIdx()
-            improper_idx_list.append([center, neighbors[0], neighbors[1], neighbors[2]])
-            improper_w_list.append(improper_weight)
+            n0, n1, n2 = neighbors[0], neighbors[1], neighbors[2]
+            for (a, b, c) in ((n0, n1, n2), (n1, n2, n0), (n2, n0, n1)):
+                improper_idx_list.append([center, a, b, c])
+                improper_w_list.append(improper_weight)
 
     n_improper = len(improper_idx_list)
     if n_improper > 0:
@@ -307,6 +342,24 @@ def extract_etk_params(
                         d14_lb.append(lb)
                         d14_ub.append(ub)
                         d14_w.append(dist14_weight)
+
+    # Long-range distance constraints (RDKit's addLongRangeDistanceConstraints): EVERY pair beyond
+    # 1-3 held at its FIXED smoothed-bounds range during the ET stage, so torsion rotation cannot
+    # distort the overall shape. The port stops at 1-4, leaving the long-range structure unconstrained
+    # -> torsions inflate strain. This adds all topological-distance>=4 pairs at fixed bounds.
+    if use_basic_knowledge and use_long_range:
+        lr_w = long_range_weight
+        from rdkit.Chem import GetDistanceMatrix
+        topo = GetDistanceMatrix(mol)
+        na = mol.GetNumAtoms()
+        for a in range(na):
+            for d in range(a + 1, na):
+                if topo[a, d] < 4:  # 1-2/1-3/1-4 already handled above
+                    continue
+                ub = bounds_mat[a, d]; lb = bounds_mat[d, a]
+                if ub > 0 and lb > 0:
+                    d14_i1.append(a); d14_i2.append(d)
+                    d14_lb.append(lb); d14_ub.append(ub); d14_w.append(lr_w)
 
     # Deduplicate
     seen = set()
