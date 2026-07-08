@@ -70,8 +70,16 @@ def _embed_one_metric(bmat: np.ndarray, rng, dim: int = 4) -> np.ndarray:
     G = -0.5 * (D2 - D2.mean(1, keepdims=True) - D2.mean(0, keepdims=True) + D2.mean())
     w, V = np.linalg.eigh(G)                              # ascending eigenvalues
     idx = np.argsort(w)[::-1][:dim]                       # top-`dim`
-    lam = np.clip(w[idx], 0.0, None)
-    X = V[:, idx] * np.sqrt(lam)[None, :]                 # (N, dim); zero cols if eigenvalue <=0
+    lam = w[idx]
+    # RDKit (randNegEig=True) fills a random [-1,1] coordinate when a top-`dim` eigenvalue is
+    # non-positive, instead of collapsing that DoF to exactly 0 (which biases small/linear molecules).
+    cols = []
+    for k in range(dim):
+        if lam[k] > 0.0:
+            cols.append(V[:, idx[k]] * np.sqrt(lam[k]))
+        else:
+            cols.append(1.0 - 2.0 * rng.random(N))
+    X = np.stack(cols, axis=1)
     return X.astype(np.float32)
 
 
@@ -172,12 +180,16 @@ def extract_dg_params(
             lb = float(bounds_mat[j, i])
             if ub <= 0 or lb <= 0:
                 continue
-            # Weight based on basin size tolerance (nvMolKit pattern)
             ub2 = ub * ub
             lb2 = lb * lb
-            if ub2 - lb2 > basin_size_tol:
+            # RDKit trims a pair from the DG error function when the LINEAR spread exceeds
+            # basinThresh=5.0 A (DistGeomUtils); the port used a squared (ub2-lb2)>1e8 test that
+            # never fires in the metric-embedding regime, retaining loose long-range pairs.
+            if ub - lb > 5.0:
                 continue
-            w = 1.0 / max(ub2 - lb2, 1e-8)
+            # RDKit weights every retained pair uniformly at 1.0 (extraWeights null in both ETKDG
+            # fields); the port's 1/(ub2-lb2) reweighting over-weighted tight bonds and skewed the basin.
+            w = 1.0
             idx1_list.append(i)
             idx2_list.append(j)
             lb2_list.append(lb2)
