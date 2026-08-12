@@ -80,7 +80,7 @@ def _one_centre_w(p) -> np.ndarray:
                                getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0))
 
 
-def _two_centre_packed(pA, pB, rA, rB) -> np.ndarray:
+def _two_centre_packed(pA, pB, rA, rB, dense=None) -> np.ndarray:
     """Packed two-electron block for one atom pair, (packed(nA), packed(nB)).
 
     Two sources, one output convention:
@@ -105,7 +105,8 @@ def _two_centre_packed(pA, pB, rA, rB) -> np.ndarray:
             # TETCI indexes [second centre pair, first centre pair].
             return (w.T[:pa, :pb] if first_is_A else w[:pa, :pb]).copy()
 
-    dense, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    if dense is None:
+        dense, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
     # The rotation pads every centre to its shell width — hydrogen comes back
     # 4-wide — so trim to the orbitals that actually exist before packing.
     return pack(dense[:nA, :nA, :nB, :nB], nA, nB)
@@ -195,6 +196,26 @@ def prepare_batch(
 
     atoms_list = []
     coords_list = []
+
+    # Every sp pair in the whole batch is rotated in one vectorised call
+    # before the per-molecule loop below. Doing it inside the loop meant one
+    # scalar rotation per pair per molecule, which was ~69% of prepare_batch.
+    from .rotation_batch import rotate_pairs
+    _pw_keys, _pw_params, _pw_coords = [], [], []
+    for mol_idx, (atoms, coords) in enumerate(molecules):
+        coords_arr = np.asarray(coords, dtype=np.float64)
+        mol_params = [param_dict[z] for z in atoms]
+        for i in range(len(atoms)):
+            for j in range(i + 1, len(atoms)):
+                if mol_params[i].n_basis <= 4 and mol_params[j].n_basis <= 4:
+                    _pw_keys.append((mol_idx, i, j))
+                    _pw_params.append((mol_params[i], mol_params[j]))
+                    _pw_coords.append((coords_arr[i], coords_arr[j]))
+    if _pw_keys:
+        _rotated = rotate_pairs(_pw_params, _pw_coords)
+        pair_w = {key: _rotated[k] for k, key in enumerate(_pw_keys)}
+    else:
+        pair_w = {}
 
     for mol_idx, (atoms, coords) in enumerate(molecules):
         coords = np.array(coords, dtype=np.float64)
@@ -290,10 +311,12 @@ def prepare_batch(
                     H[sj:sj + nB, sj:sj + nB] += _pair_core_attraction(
                         pB, pA, coords[j], coords[i])
                 else:
-                    _, e1b, e2a = rotate_integrals_to_molecular_frame(
-                        pA, pB, coords[i], coords[j])
-                    H[si:si + nA, si:si + nA] += e1b[:nA, :nA]
-                    H[sj:sj + nB, sj:sj + nB] += e2a[:nB, :nB]
+                    w_ij = pair_w[(mol_idx, i, j)]
+                    # e1b and e2a are slices of the rotated tensor.
+                    H[si:si + nA, si:si + nA] += (
+                        -float(pB.n_valence) * w_ij[:nA, :nA, 0, 0])
+                    H[sj:sj + nB, sj:sj + nB] += (
+                        -float(pA.n_valence) * w_ij[0, 0, :nB, :nB])
 
         # === Two-centre integrals, packed ===
         # Stored as lower-triangle packed pair blocks with a per-pair offset,
@@ -304,7 +327,8 @@ def prepare_batch(
         for i in range(n_at):
             for j in range(i + 1, n_at):
                 block = _two_centre_packed(params[i], params[j],
-                                           coords[i], coords[j])
+                                           coords[i], coords[j],
+                                           dense=pair_w.get((mol_idx, i, j)))
                 off_ij = pair_cursor[mol_idx]
                 w_packed_rows[mol_idx].append(block.ravel())
                 pair_offset_all[mol_idx, i, j] = off_ij
