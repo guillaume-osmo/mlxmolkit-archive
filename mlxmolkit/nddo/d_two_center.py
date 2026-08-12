@@ -149,181 +149,34 @@ def _packed_idx_4(i: int, j: int) -> int:
     return i * (i + 1) // 2 + j
 
 
-def _yy_pair_w_pyseqm(pA, pB, coordA, coordB):
-    """Compute via vendored numpy TETCI (bit-exact to PYSEQM)."""
+def _yy_pair_w(pA, pB, coordA, coordB):
+    """Compute via vendored numpy TETCI (bit-exact to PYSEQM).
+
+    TETCI returns the block already packed; expanding it used a 45x81 Python
+    loop, which cost ~3 ms per pair and dominated d-orbital gradients. The
+    expansion is pure indexing, so it is done with the shared packing helper.
+    """
     w, first_is_A = _tetci_pair_w(pA, pB, coordA, coordB)
     if w is None:
         return None
-    W = np.zeros((9, 9, 9, 9))
-    for mu in range(9):
-        for nu in range(mu + 1):
-            kl = _packed_idx_9(mu, nu)
-            for lam in range(9):
-                for sig in range(lam + 1):
-                    ij = _packed_idx_9(lam, sig)
-                    val = w[ij, kl]
-                    W[mu, nu, lam, sig] = val
-                    W[nu, mu, lam, sig] = val
-                    W[mu, nu, sig, lam] = val
-                    W[nu, mu, sig, lam] = val
+    from .packing import unpack, packed_size
+    n = packed_size(9)
+    # TETCI indexes [second centre pair, first centre pair].
+    W = unpack(w[:n, :n].T, 9, 9)
     return W if first_is_A else W.transpose(2, 3, 0, 1)
 
 
-def _yy_pair_w_pyseqm_OLD(pA, pB, coordA, coordB):
-    """Original PYSEQM delegation — kept for reference, not used."""
-    try:
-        import torch
-        from seqm.Molecule import Molecule
-        from seqm.seqm_functions.constants import Constants
-        from seqm.seqm_functions.hcore import hcore
-    except ImportError:
-        return None
+def _yx_pair_w(p_d, p_sp, coord_d, coord_sp):
+    """Compute via vendored numpy TETCI (bit-exact to PYSEQM).
 
-    # PYSEQM sorts atoms by Z descending. Track who is first/second to
-    # know how to index the returned w tensor.
-    if pA.Z >= pB.Z:
-        first_pA = True
-        Z_sorted = [int(pA.Z), int(pB.Z)]
-        coords_sorted = [np.asarray(coordA, dtype=np.float64),
-                         np.asarray(coordB, dtype=np.float64)]
-    else:
-        first_pA = False
-        Z_sorted = [int(pB.Z), int(pA.Z)]
-        coords_sorted = [np.asarray(coordB, dtype=np.float64),
-                         np.asarray(coordA, dtype=np.float64)]
-    # Phantom H if odd electrons
-    n_elec = int(pA.n_valence + pB.n_valence)
-    if n_elec % 2 == 1:
-        Z_sorted.append(1)
-        coords_sorted.append(coords_sorted[0] + np.array([1000.0, 0.0, 0.0]))
-    # PYSEQM internally indexes some tensors with the default dtype; if
-    # the caller hasn't set torch float64 (e.g. when invoked from a
-    # numpy-only SCF loop) we get a Double/Float index_put dtype mismatch.
-    # Constants() FREEZES dtype at instantiation, so the set_default must
-    # happen BEFORE creating it.
-    prev_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.float64)
-    try:
-        const = Constants()
-        sp_params = {"method": "PM6"}
-        species = torch.from_numpy(np.asarray([Z_sorted], dtype=np.int64))
-        xyz = torch.from_numpy(np.asarray([coords_sorted], dtype=np.float64))
-        mol = Molecule(const, sp_params, xyz, species)
-        _, w_t, *_ = hcore(mol)
-    except Exception:
-        torch.set_default_dtype(prev_dtype)
-        return None
-    torch.set_default_dtype(prev_dtype)
-    w = w_t.detach().cpu().numpy()[0]  # (45, 45)
-
-    # PYSEQM convention: w[ij_on_2nd_atom, kl_on_1st_atom] in the pair.
-    # After sorting, first atom = higher Z. Build W indexed as
-    # W[μ_first, ν_first, λ_second, σ_second] = (μ_first ν_first | λ_second σ_second).
-    W = np.zeros((9, 9, 9, 9))
-    for mu in range(9):
-        for nu in range(mu + 1):
-            kl = _packed_idx_9(mu, nu)
-            for lam in range(9):
-                for sig in range(lam + 1):
-                    ij = _packed_idx_9(lam, sig)
-                    val = w[ij, kl]
-                    # Fill all symmetric positions
-                    W[mu, nu, lam, sig] = val
-                    W[nu, mu, lam, sig] = val
-                    W[mu, nu, sig, lam] = val
-                    W[nu, mu, sig, lam] = val
-    if first_pA:
-        return W  # already W[μ_A, ν_A, λ_B, σ_B]
-    else:
-        # Caller's pA was second-sorted (lower Z); transpose: W[μ_A=2nd, ν, λ_B=1st, σ]
-        return W.transpose(2, 3, 0, 1)
-
-
-def _yx_pair_w_pyseqm(p_d, p_sp, coord_d, coord_sp):
-    """Compute via vendored numpy TETCI (bit-exact to PYSEQM)."""
+    See :func:`_yy_pair_w` — same packed source, same vectorised
+    expansion, here with a 4-orbital second centre.
+    """
     w, first_is_d = _tetci_pair_w(p_d, p_sp, coord_d, coord_sp)
     if w is None:
         return None
-    W = np.zeros((9, 9, 4, 4))
-    for mu in range(9):
-        for nu in range(mu + 1):
-            kl = _packed_idx_9(mu, nu)
-            for lam in range(4):
-                for sig in range(lam + 1):
-                    ij = _packed_idx_4(lam, sig)
-                    val = w[ij, kl]
-                    W[mu, nu, lam, sig] = val
-                    W[nu, mu, lam, sig] = val
-                    W[mu, nu, sig, lam] = val
-                    W[nu, mu, sig, lam] = val
-    return W
-
-
-def _yx_pair_w_pyseqm_OLD(p_d, p_sp, coord_d, coord_sp):
-    """Original PYSEQM delegation — kept for reference, not used."""
-    try:
-        import torch
-        from seqm.Molecule import Molecule
-        from seqm.seqm_functions.constants import Constants
-        from seqm.seqm_functions.hcore import hcore
-    except ImportError:
-        return None
-
-    if p_d.Z < p_sp.Z:
-        # Caller violated the contract; PYSEQM still sorts by Z descending,
-        # so just trust that and proceed (the result is still correct).
-        pass
-
-    Z_sorted = [int(p_d.Z), int(p_sp.Z)]
-    coords_sorted = [np.asarray(coord_d, dtype=np.float64),
-                     np.asarray(coord_sp, dtype=np.float64)]
-    # PYSEQM's RHF setup requires an even electron count. For odd-electron
-    # 2-atom subsystems (e.g. Cl(7) + C(4) = 11), add a phantom H far away.
-    # The pairwise integrals don't depend on other atoms, so this is safe.
-    n_elec = int(p_d.n_valence + p_sp.n_valence)
-    if n_elec % 2 == 1:
-        # Far enough that it doesn't perturb local-frame integrals.
-        Z_sorted.append(1)
-        coords_sorted.append(np.asarray(coord_d, dtype=np.float64)
-                             + np.array([1000.0, 0.0, 0.0]))
-    # See _yy_pair_w_pyseqm for the dtype-set-before-Constants() trick.
-    prev_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.float64)
-    try:
-        const = Constants()
-        sp_params = {"method": "PM6"}
-        species = torch.from_numpy(np.asarray([Z_sorted], dtype=np.int64))
-        xyz = torch.from_numpy(np.asarray([coords_sorted], dtype=np.float64))
-        mol = Molecule(const, sp_params, xyz, species)
-        _, w_t, *_ = hcore(mol)
-    except Exception:
-        torch.set_default_dtype(prev_dtype)
-        return None
-    torch.set_default_dtype(prev_dtype)
-    # The pair index for our A-B pair is always 0 (the first pair) when
-    # only 2 real atoms participate or pair (0, 1) when a phantom is appended.
-    w = w_t.detach().cpu().numpy()[0]  # (45, 45)
-
-    # PYSEQM PM6 convention for w[pair, ij, kl]:
-    #   pair = (i, j) with i < j
-    #   ij = packed pair index on atom j  (SECOND atom, lower Z = sp atom)
-    #   kl = packed pair index on atom i  (FIRST atom, higher Z = d atom)
-    # Verified by direct dump: w[H2S, ij=0(s_H,s_H), kl=14(d_z2,d_z2 on S)] = 9.34.
-    #
-    # Build W[μ_d, ν_d, λ_sp, σ_sp] = (μ_d ν_d | λ_sp σ_sp).
-    W = np.zeros((9, 9, 4, 4))
-    for mu in range(9):
-        for nu in range(mu + 1):
-            kl = _packed_idx_9(mu, nu)
-            for lam in range(4):
-                for sig in range(lam + 1):
-                    ij = _packed_idx_4(lam, sig)
-                    val = w[ij, kl]
-                    W[mu, nu, lam, sig] = val
-                    W[nu, mu, lam, sig] = val
-                    W[mu, nu, sig, lam] = val
-                    W[nu, mu, sig, lam] = val
-    return W
+    from .packing import unpack, packed_size
+    return unpack(w[:packed_size(4), :packed_size(9)].T, 9, 4)
 
 
 def compute_d_two_center(
@@ -449,7 +302,7 @@ def d_two_center_fock(
     # path (compute_yy_integrals) is approximate and was the source of
     # CCl4/CHCl3 residuals.
     if pA.n_basis == 9 and pB.n_basis == 9:
-        W = _yy_pair_w_pyseqm(pA, pB, coordA, coordB)
+        W = _yy_pair_w(pA, pB, coordA, coordB)
         if W is None:
             # Native fallback (the old code) — kept inline for self-containment
             from .yy_integrals import compute_yy_integrals
@@ -589,7 +442,7 @@ def d_two_center_fock(
     # call — verified to match the full-molecule w-tensor bit-exactly.
     # Native port of PYSEQM's TETCI for YX is the documented remaining work.
     if pA.n_basis == 9 and pB.n_basis == 4:
-        W = _yx_pair_w_pyseqm(pA, pB, coordA, coordB)
+        W = _yx_pair_w(pA, pB, coordA, coordB)
         if W is None:
             d_int = compute_d_two_center(pA, pB, R_bohr)
             PB_total = sum(P[sB+k, sB+k] for k in range(nB_sp))
@@ -642,7 +495,7 @@ def d_two_center_fock(
         return F
     if pB.n_basis == 9 and pA.n_basis == 4:
         # Symmetric counterpart: pA is sp, pB has d. Pass d-atom first.
-        W = _yx_pair_w_pyseqm(pB, pA, coordB, coordA)  # W[μ_B, ν_B, λ_A, σ_A]
+        W = _yx_pair_w(pB, pA, coordB, coordA)  # W[μ_B, ν_B, λ_A, σ_A]
         if W is None:
             d_int = compute_d_two_center(pA, pB, R_bohr)
             PA_total = sum(P[sA+k, sA+k] for k in range(nA_sp))

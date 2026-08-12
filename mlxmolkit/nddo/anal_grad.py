@@ -17,10 +17,11 @@ from __future__ import annotations
 import numpy as np
 from .scf import nddo_energy
 from .methods import get_params
-from .integrals import compute_nuclear_repulsion, nuclear_repulsion_for_method
+from .integrals import (compute_nuclear_repulsion, nuclear_repulsion_for_method,
+                        pair_repulsion_for_method)
 
 
-def _pair_terms(params, coords, i, j, starts, P, n_basis):
+def _pair_terms(params, coords, i, j, starts, P, n_basis, w=None):
     """Everything about the pair (i, j) that moves when either atom moves.
 
     Returns (dH, dT): the pair's additive contribution to the core Hamiltonian
@@ -29,23 +30,71 @@ def _pair_terms(params, coords, i, j, starts, P, n_basis):
     """
     from .scf import (_pair_resonance_block, _pair_core_attraction,
                       _pair_fock_twocentre)
+    from .rotation import rotate_integrals_to_molecular_frame
 
     pA, pB = params[i], params[j]
     sA, sB = starts[i], starts[j]
     nA, nB = pA.n_basis, pB.n_basis
+    rA, rB = coords[i], coords[j]
 
     dH = np.zeros((n_basis, n_basis))
-    block = _pair_resonance_block(pA, pB, coords[i], coords[j])
+    block = _pair_resonance_block(pA, pB, rA, rB)
     dH[sA:sA + nA, sB:sB + nB] += block
     dH[sB:sB + nB, sA:sA + nA] += block.T
-    # Attraction is not symmetric in the pair: (i,j) lands on i's diagonal
-    # block, (j,i) on j's, so both orderings are needed.
-    dH[sA:sA + nA, sA:sA + nA] += _pair_core_attraction(pA, pB, coords[i], coords[j])
-    dH[sB:sB + nB, sB:sB + nB] += _pair_core_attraction(pB, pA, coords[j], coords[i])
 
+    if nA == 9 or nB == 9:
+        # d pairs keep the 9x9 Wigner-D attraction and the d two-centre path.
+        dH[sA:sA + nA, sA:sA + nA] += _pair_core_attraction(pA, pB, rA, rB)
+        dH[sB:sB + nB, sB:sB + nB] += _pair_core_attraction(pB, pA, rB, rA)
+        dT = _pair_fock_twocentre(np.zeros((n_basis, n_basis)), P,
+                                  pA, pB, sA, sB, rA, rB)
+        return dH, dT
+
+    # One rotation supplies all three sp contributions. Attraction is not
+    # symmetric in the pair — (i,j) lands on i's diagonal block and (j,i) on
+    # j's — but e1b and e2a are exactly those two orderings, so asking for the
+    # rotation three times was paying three times for one answer.
+    if w is None:
+        w, e1b, e2a = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    else:
+        # e1b and e2a are slices of w, so a batched caller need only supply w.
+        e1b = -float(pB.n_valence) * w[:, :, 0, 0]
+        e2a = -float(pA.n_valence) * w[0, 0, :, :]
+    dH[sA:sA + nA, sA:sA + nA] += e1b[:nA, :nA]
+    dH[sB:sB + nB, sB:sB + nB] += e2a[:nB, :nB]
     dT = _pair_fock_twocentre(np.zeros((n_basis, n_basis)), P,
-                              pA, pB, sA, sB, coords[i], coords[j])
+                              pA, pB, sA, sB, rA, rB, w=w)
     return dH, dT
+
+
+
+def _pair_terms_many(params, coords, pairs, starts, P, n_basis):
+    """`_pair_terms` for a list of pairs, rotating them in one vectorised call.
+
+    The scalar rotation costs ~75 us per pair and was the single largest line
+    in a gradient profile. Grouping the pairs and rotating them together turns
+    that into a handful of array operations; the assembly below stays per pair,
+    but it is only numpy slicing.
+
+    d-bearing pairs fall back to the scalar path — their integrals come from a
+    different routine, and there are few of them.
+    """
+    from .rotation_batch import rotate_pairs
+
+    sp, dd = [], []
+    for i, j in pairs:
+        (sp if params[i].n_basis <= 4 and params[j].n_basis <= 4 else dd).append((i, j))
+
+    out = {}
+    if sp:
+        ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
+                          [(coords[i], coords[j]) for i, j in sp])
+        for k, (i, j) in enumerate(sp):
+            out[(i, j)] = _pair_terms(params, coords, i, j, starts, P, n_basis,
+                                      w=ws[k])
+    for i, j in dd:
+        out[(i, j)] = _pair_terms(params, coords, i, j, starts, P, n_basis)
+    return out
 
 
 def analytical_gradient(
@@ -54,6 +103,7 @@ def analytical_gradient(
     method: str = 'RM1',
     step: float = 1e-5,
     molecular_charge: float = 0.0,
+    scf_result: dict | None = None,
 ) -> tuple[dict, np.ndarray]:
     """Compute energy and gradient.
 
@@ -70,7 +120,10 @@ def analytical_gradient(
     coords = np.asarray(coords, dtype=np.float64)
     n_atoms = len(atoms)
 
-    result = nddo_energy(
+    # `scf_result` lets a batched caller solve every molecule's SCF in one
+    # dispatch and hand the converged density in, rather than each gradient
+    # re-solving its own.
+    result = scf_result if scf_result is not None else nddo_energy(
         atoms, coords, method=method, max_iter=200, conv_tol=1e-8,
         molecular_charge=molecular_charge,
     )
@@ -88,29 +141,42 @@ def analytical_gradient(
     # The one-centre Fock block is whatever F is not explained by H and the
     # two-centre pairs. It depends only on P and the atom parameters, so it is
     # the same at every displaced geometry and never needs rebuilding.
+    all_pairs = [(i, j) for i in range(n_atoms) for j in range(i + 1, n_atoms)]
+    pair_ref = _pair_terms_many(params, coords, all_pairs, starts, P, n_basis)
     T_ref = np.zeros((n_basis, n_basis))
-    pair_ref = {}
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            dH, dT = _pair_terms(params, coords, i, j, starts, P, n_basis)
-            pair_ref[(i, j)] = (dH, dT)
-            T_ref += dT
+    for _dH, dT in pair_ref.values():
+        T_ref += dT
     G_one = F_ref - H_ref - T_ref
+
+    # Core-core repulsion is a plain sum over pairs, so it gets the same
+    # treatment as H and F: keep the reference total and the per-pair terms,
+    # and patch only the pairs that move. Rebuilding it in full at each of the
+    # 6N displacements was 46% of a menthol gradient.
+    E_nuc_ref = nuclear_repulsion_for_method(atoms, coords, PARAMS, method)
+    nuc_ref = {(i, j): pair_repulsion_for_method(atoms, coords, i, j, PARAMS, method)
+               for i in range(n_atoms) for j in range(i + 1, n_atoms)}
 
     def energy_with_atom_moved(a: int, shifted: np.ndarray) -> float:
         H = H_ref.copy()
         T = T_ref.copy()
-        for j in range(n_atoms):
-            if j == a:
-                continue
-            key = (a, j) if a < j else (j, a)
+        dirty = [((a, j) if a < j else (j, a)) for j in range(n_atoms) if j != a]
+        fresh = _pair_terms_many(params, shifted, dirty, starts, P, n_basis)
+        for key in dirty:
             old_H, old_T = pair_ref[key]
-            new_H, new_T = _pair_terms(params, shifted, *key, starts, P, n_basis)
+            new_H, new_T = fresh[key]
             H += new_H - old_H
             T += new_T - old_T
         F = H + G_one + T
         E_elec = 0.5 * np.sum(P * (H + F))
-        return E_elec + nuclear_repulsion_for_method(atoms, shifted, PARAMS, method)
+
+        E_nuc = E_nuc_ref
+        for j in range(n_atoms):
+            if j == a:
+                continue
+            key = (a, j) if a < j else (j, a)
+            E_nuc += (pair_repulsion_for_method(atoms, shifted, *key, PARAMS, method)
+                      - nuc_ref[key])
+        return E_elec + E_nuc
 
     gradient = np.zeros((n_atoms, 3))
     for a in range(n_atoms):

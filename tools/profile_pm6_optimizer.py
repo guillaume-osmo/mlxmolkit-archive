@@ -87,7 +87,7 @@ for name, smi in MOLS[:4]:
 
 print("\n=== 3. full PM6 geometry optimisation, mlxmolkit vs MOPAC ===")
 print(f"{'molecule':<14}{'atoms':>6}{'mlx s':>9}{'mopac s':>9}{'ratio':>8}"
-      f"{'mlx eV':>12}{'mopac eV':>12}{'d kcal':>9}")
+      f"{'mlx kcal':>12}{'mopac kcal':>12}{'d kcal':>9}")
 for name, smi in MOLS:
     atoms, coords = geometry(smi)
     t0 = time.perf_counter()
@@ -95,14 +95,18 @@ for name, smi in MOLS:
     t_mlx = time.perf_counter() - t0
     hof, t_mop, cycles = run_mopac(atoms, coords, name, "PM6 PRECISE GNORM=0.1")
 
-    e_mlx = res.get("energy_eV", float("nan"))
-    # MOPAC reports a heat of formation, mlxmolkit a total electronic energy;
-    # only the *difference between geometries* is comparable, so compare the
-    # optimised MOPAC HoF against mlxmolkit's own geometry scored by MOPAC.
+    # Both sides reported as heat of formation in kcal/mol. mlxmolkit's
+    # `energy_eV` is a total electronic energy and is NOT comparable to
+    # MOPAC's heat of formation — printing them side by side invites exactly
+    # the wrong conclusion, so it is not done here.
+    hof_mlx = res.get("heat_of_formation_kcal", float("nan"))
     hof_of_mlx, _, _ = run_mopac(atoms, res["coords"], name + "_mlxgeom",
                                  "PM6 PRECISE 1SCF")
     print(f"{name:<14}{len(atoms):>6}{t_mlx:>9.2f}{t_mop:>9.2f}"
-          f"{t_mop/max(t_mlx,1e-9):>8.2f}{e_mlx:>12.3f}{hof:>12.3f}"
+          f"{t_mop/max(t_mlx,1e-9):>8.2f}{hof_mlx:>12.3f}{hof:>12.3f}"
           f"{hof_of_mlx - hof:>9.3f}")
-print("\nd kcal = mlxmolkit's optimised geometry scored by MOPAC, minus MOPAC's own")
-print("optimum. Positive means mlxmolkit stopped short of MOPAC's minimum.")
+print("\nBoth energy columns are heats of formation in kcal/mol, so they are")
+print("directly comparable. d kcal = mlxmolkit's optimised geometry scored by")
+print("MOPAC, minus MOPAC's own optimum: it isolates geometry quality from any")
+print("difference in the energy expression. Positive means mlxmolkit stopped")
+print("short of MOPAC's minimum.")

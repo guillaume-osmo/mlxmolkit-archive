@@ -69,11 +69,13 @@ def pack(dense: np.ndarray, n_a: int, n_b: int) -> np.ndarray:
     exactly.
     """
     out = np.zeros((packed_size(n_a), packed_size(n_b)), dtype=np.float64)
-    ia = index_matrix(n_a)
-    ib = index_matrix(n_b)
-    for mu in range(n_a):
-        for nu in range(n_a):
-            out[ia[mu, nu], ib[:n_b, :n_b].ravel()] = dense[mu, nu].ravel()
+    rows = index_matrix(n_a).ravel()
+    cols = index_matrix(n_b).ravel()
+    # One scatter rather than a loop over the first index pair. Several
+    # (mu, nu) map to the same packed row — that is the point of packing — and
+    # they carry equal values by the symmetry this function assumes, so the
+    # repeated writes agree and last-wins is harmless.
+    out[rows[:, None], cols[None, :]] = dense.reshape(rows.size, cols.size)
     return out
 
 

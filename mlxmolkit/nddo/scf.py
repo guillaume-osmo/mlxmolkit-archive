@@ -387,19 +387,30 @@ def _build_core_hamiltonian(atoms, coords, info):
             H[si:si + nA, sj:sj + nB] = block
             H[sj:sj + nB, si:si + nA] = block.T
 
-    # Electron-nuclear attraction using properly rotated integrals
+    # Electron-nuclear attraction. One rotation of the pair (i, j) yields the
+    # attraction on i from j *and* on j from i, so the unordered loop below
+    # does half the work the ordered one did. d pairs keep the 9x9 Wigner-D
+    # path, which is not expressible through the sp rotation.
     for i in range(n_atoms):
         si, nA = starts[i], params[i].n_basis
-        for j in range(n_atoms):
-            if i == j:
-                continue
-            H[si:si + nA, si:si + nA] += _pair_core_attraction(
-                params[i], params[j], coords[i], coords[j])
+        for j in range(i + 1, n_atoms):
+            sj, nB = starts[j], params[j].n_basis
+            pA, pB = params[i], params[j]
+            if pA.n_basis == 9 or pB.n_basis == 9:
+                H[si:si + nA, si:si + nA] += _pair_core_attraction(
+                    pA, pB, coords[i], coords[j])
+                H[sj:sj + nB, sj:sj + nB] += _pair_core_attraction(
+                    pB, pA, coords[j], coords[i])
+            else:
+                _, e1b, e2a = rotate_integrals_to_molecular_frame(
+                    pA, pB, coords[i], coords[j])
+                H[si:si + nA, si:si + nA] += e1b[:nA, :nA]
+                H[sj:sj + nB, sj:sj + nB] += e2a[:nB, :nB]
 
     return H
 
 
-def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB):
+def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB, w=None):
     """Two-centre Coulomb/exchange contribution of ONE atom pair, applied to F.
 
     Split out of :func:`_build_fock` for the same reason as the core-Hamiltonian
@@ -410,8 +421,14 @@ def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB):
 
     F is modified in place for the sp part and returned, because the d path
     (d_two_center_fock) returns a new array.
+
+    `w` lets a caller pass the rotated tensor it already has. One rotation
+    yields the two-electron block *and* both attraction orderings, so a caller
+    that needs all three should rotate once and hand the result in rather than
+    paying for it three times.
     """
-    w, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    if w is None:
+        w, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
     nA_sp = min(pA.n_basis, 4)
     nB_sp = min(pB.n_basis, 4)
     #   F[mu nu_A] += sum P[la si_B] w        (J on A)
@@ -433,7 +450,32 @@ def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB):
     return F
 
 
-def _build_fock(H, P, info, atoms, coords):
+
+def precompute_pair_w(atoms, coords, info):
+    """Rotated two-centre tensors for every sp pair of a fixed geometry.
+
+    The rotation depends on the atom parameters and the geometry, never on the
+    density, so it is constant for the whole SCF — yet _build_fock re-derived
+    it at every iteration. On menthol that was ~7000 scalar rotations per
+    single point, half the cost of a gradient.
+
+    d-bearing pairs are omitted: they take a different integral routine, and a
+    missing key simply falls back to computing that pair as before.
+    """
+    from .rotation_batch import rotate_pairs
+
+    params = info['params']
+    n_atoms = len(atoms)
+    sp = [(i, j) for i in range(n_atoms) for j in range(i + 1, n_atoms)
+          if params[i].n_basis <= 4 and params[j].n_basis <= 4]
+    if not sp:
+        return {}
+    ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
+                      [(coords[i], coords[j]) for i, j in sp])
+    return {pair: ws[k] for k, pair in enumerate(sp)}
+
+
+def _build_fock(H, P, info, atoms, coords, pair_w=None):
     """Build Fock matrix F = H + G(P).
 
     Two contributions:
@@ -544,8 +586,10 @@ def _build_fock(H, P, info, atoms, coords):
     # === Two-center contribution (full 10x10 w tensor) ===
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
-            F = _pair_fock_twocentre(F, P, params[i], params[j],
-                                     starts[i], starts[j], coords[i], coords[j])
+            F = _pair_fock_twocentre(
+                F, P, params[i], params[j], starts[i], starts[j],
+                coords[i], coords[j],
+                w=None if pair_w is None else pair_w.get((i, j)))
 
     return F
 
@@ -873,7 +917,11 @@ def nddo_energy(
                 atom_starts_metal, ssss.astype(np.float32),
                 n_basis, n_atoms,
             )
-        return _build_fock(H, P, info, atoms, coords)
+        return _build_fock(H, P, info, atoms, coords, pair_w=_pair_w)
+
+    # The two-centre rotations are fixed for this geometry, so they are
+    # built once here instead of at every iteration of the loop below.
+    _pair_w = precompute_pair_w(atoms, coords, info)
 
     # DIIS (Direct Inversion in the Iterative Subspace) storage
     diis_max = 6
@@ -1344,7 +1392,17 @@ def rm1_energy_batch_mlx(
     """
     from .batch import prepare_batch
     from .fock_metal import MetalFockContext
-    from mlx_addons.linalg import solve_lu
+    # mlx_addons is a private package and is not on PyPI, so an unguarded
+    # import of it here disabled this entire path for anyone without it: the
+    # ImportError was caught upstream and silently dropped the batch SCF back
+    # to the legacy route, per-molecule numpy eigh with a host round-trip on
+    # every Fock build. The DIIS solve is a batch of systems no larger than
+    # 7x7 (the history is capped at 6), which mx.linalg.solve handles.
+    try:
+        from mlx_addons.linalg import solve_lu
+    except ImportError:
+        def solve_lu(A, rhs):
+            return mx.linalg.solve(A, rhs, stream=mx.cpu)
 
     # This path runs the SCF in float32, whose density-RMS noise floor is
     # ~1e-5. A tighter conv_tol (e.g. the 1e-6 default) can never be tripped —
