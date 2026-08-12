@@ -172,7 +172,7 @@ def test_tetci_ri_sc_bit_exact():
 def test_yx_w_element_bit_exact(mu, nu, lam, sig, expected):
     """Per-element W[mu,nu,lam,sig] for S-C YX pair must match PYSEQM."""
     PARAMS = METHOD_PARAMS['PM6_D']
-    W = d2c._yx_pair_w_pyseqm(PARAMS[16], PARAMS[6],
+    W = d2c._yx_pair_w(PARAMS[16], PARAMS[6],
                               np.array([0., 0., 0.]),
                               np.array([1.81, 0., 0.]))
     assert W is not None and W.shape == (9, 9, 4, 4)
@@ -185,7 +185,7 @@ def test_yx_w_element_bit_exact(mu, nu, lam, sig, expected):
 def test_yx_w_symmetric_in_mu_nu():
     """W[mu,nu,lam,sig] should equal W[nu,mu,lam,sig]."""
     PARAMS = METHOD_PARAMS['PM6_D']
-    W = d2c._yx_pair_w_pyseqm(PARAMS[16], PARAMS[6],
+    W = d2c._yx_pair_w(PARAMS[16], PARAMS[6],
                               np.array([0., 0., 0.]),
                               np.array([1.81, 0., 0.]))
     diff = np.abs(W - W.transpose(1, 0, 2, 3)).max()
@@ -194,7 +194,7 @@ def test_yx_w_symmetric_in_mu_nu():
 
 def test_yx_w_symmetric_in_lam_sig():
     PARAMS = METHOD_PARAMS['PM6_D']
-    W = d2c._yx_pair_w_pyseqm(PARAMS[16], PARAMS[6],
+    W = d2c._yx_pair_w(PARAMS[16], PARAMS[6],
                               np.array([0., 0., 0.]),
                               np.array([1.81, 0., 0.]))
     diff = np.abs(W - W.transpose(0, 1, 3, 2)).max()
@@ -211,7 +211,7 @@ def test_yy_w_runs_and_symmetric(ZA, ZB, R_ang):
     """YY pair returns a (9, 9, 9, 9) W tensor that is symmetric in the
     expected index pairs (no NaN/inf), regardless of the actual values."""
     PARAMS = METHOD_PARAMS['PM6_D']
-    W = d2c._yy_pair_w_pyseqm(PARAMS[ZA], PARAMS[ZB],
+    W = d2c._yy_pair_w(PARAMS[ZA], PARAMS[ZB],
                               np.array([0., 0., 0.]),
                               np.array([R_ang, 0., 0.]))
     assert W is not None and W.shape == (9, 9, 9, 9)
