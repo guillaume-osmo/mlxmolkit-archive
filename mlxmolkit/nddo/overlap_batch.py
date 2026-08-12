@@ -250,6 +250,14 @@ def overlap_pairs(pair_specs):
     groups: dict[tuple, list[int]] = {}
 
     for k, (pA, pB, rA, rB) in enumerate(pair_specs):
+        if float(np.linalg.norm(np.asarray(rB) - np.asarray(rA))) < 1e-10:
+            # Coincident centres: the scalar short-circuits to an identity
+            # block. Without this the rotation divides by zero and returns a
+            # silent NaN, which is worse than either answer.
+            block = np.zeros((pA.n_basis, pB.n_basis))
+            np.fill_diagonal(block, 1.0)
+            out[k] = block
+            continue
         swap = principal_qn(pA.Z) < principal_qn(pB.Z)
         a, b = (pB, pA) if swap else (pA, pB)
         jcall = _JCALL.get((principal_qn(a.Z), principal_qn(b.Z)))

@@ -92,3 +92,27 @@ def test_the_table_covers_every_jcall():
 
 def test_empty_input():
     assert overlap_pairs([]) == []
+
+
+@pytest.mark.parametrize("za,zb", [(6, 8), (1, 1), (6, 1), (1, 6), (16, 6)])
+def test_coincident_centres_give_the_identity_block(za, zb):
+    """The scalar short-circuits at R < 1e-10; the batch must too.
+
+    This was a real defect: without the guard the rotation divides by zero and
+    returns a silent NaN. My own tests missed it because they only ever drew
+    separated geometries — the case is unreachable in a real molecule, which is
+    exactly why nothing exercised it.
+    """
+    spec = (PARAMS[za], PARAMS[zb], np.zeros(3), np.zeros(3))
+    got = overlap_pairs([spec])[0]
+    assert not np.isnan(got).any(), "coincident centres produced NaN"
+    assert np.array_equal(got, overlap_molecular_frame(*spec))
+
+
+def test_near_coincident_does_not_blow_up():
+    """Just outside the cutoff the ordinary path must still be finite."""
+    tiny = np.array([2e-10, 0.0, 0.0])
+    spec = (PARAMS[6], PARAMS[8], np.zeros(3), tiny)
+    got = overlap_pairs([spec])[0]
+    assert np.isfinite(got).all()
+    assert np.abs(got - overlap_molecular_frame(*spec)).max() < EPS
