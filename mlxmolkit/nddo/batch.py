@@ -245,6 +245,23 @@ def prepare_batch(
     pair_overlap = (dict(zip(_d_keys, overlap_d_batch(_d_specs)))
                     if _d_keys else {})
 
+    # Resonance overlaps for the sp pairs, which are the bulk of any organic
+    # batch. overlap_pairs routes anything its table does not cover — d
+    # orbitals, or qn > 3 like Br and I — back to the scalar routine itself.
+    from .overlap_batch import overlap_pairs
+    _sp_keys, _sp_specs = [], []
+    for mol_idx, (atoms, coords) in enumerate(molecules):
+        coords_arr = np.asarray(coords, dtype=np.float64)
+        mol_params = [param_dict[z] for z in atoms]
+        for i in range(len(atoms)):
+            for j in range(i + 1, len(atoms)):
+                if mol_params[i].n_basis <= 4 and mol_params[j].n_basis <= 4:
+                    _sp_keys.append((mol_idx, i, j))
+                    _sp_specs.append((mol_params[i], mol_params[j],
+                                      coords_arr[i], coords_arr[j]))
+    if _sp_keys:
+        pair_overlap.update(zip(_sp_keys, overlap_pairs(_sp_specs)))
+
     for mol_idx, (atoms, coords) in enumerate(molecules):
         coords = np.array(coords, dtype=np.float64)
         n_at = len(atoms)
