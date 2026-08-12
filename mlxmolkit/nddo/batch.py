@@ -80,7 +80,7 @@ def _one_centre_w(p) -> np.ndarray:
                                getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0))
 
 
-def _two_centre_packed(pA, pB, rA, rB, dense=None) -> np.ndarray:
+def _two_centre_packed(pA, pB, rA, rB, dense=None, tetci=None) -> np.ndarray:
     """Packed two-electron block for one atom pair, (packed(nA), packed(nB)).
 
     Two sources, one output convention:
@@ -98,8 +98,11 @@ def _two_centre_packed(pA, pB, rA, rB, dense=None) -> np.ndarray:
     nA, nB = pA.n_basis, pB.n_basis
 
     if nA == 9 or nB == 9:
-        from .d_two_center import _tetci_pair_w
-        w, first_is_A = _tetci_pair_w(pA, pB, rA, rB)
+        if tetci is not None:
+            w, first_is_A = tetci
+        else:
+            from .d_two_center import _tetci_pair_w
+            w, first_is_A = _tetci_pair_w(pA, pB, rA, rB)
         if w is not None:
             pa, pb = packed_size(nA), packed_size(nB)
             # TETCI indexes [second centre pair, first centre pair].
@@ -217,6 +220,31 @@ def prepare_batch(
     else:
         pair_w = {}
 
+    # d-bearing pairs the same way. two_elec_two_center_int is vectorised over
+    # a pair axis, so asking it for one pair at a time cost 2.58 ms each and
+    # made a batch with 10% d-containing molecules twice as expensive per
+    # molecule as an sp-only one.
+    from .d_two_center import _tetci_pairs_w
+    _d_keys, _d_specs = [], []
+    for mol_idx, (atoms, coords) in enumerate(molecules):
+        coords_arr = np.asarray(coords, dtype=np.float64)
+        mol_params = [param_dict[z] for z in atoms]
+        for i in range(len(atoms)):
+            for j in range(i + 1, len(atoms)):
+                if mol_params[i].n_basis == 9 or mol_params[j].n_basis == 9:
+                    _d_keys.append((mol_idx, i, j))
+                    _d_specs.append((mol_params[i], mol_params[j],
+                                     coords_arr[i], coords_arr[j]))
+    pair_tetci = (dict(zip(_d_keys, _tetci_pairs_w(_d_specs)))
+                  if _d_keys else {})
+
+    # The resonance overlap for those same pairs, likewise in one call:
+    # diatom_overlap_matrixD is written for a batch and was being handed one
+    # pair at a time at ~1.4 ms each.
+    from .overlap_d import overlap_d_batch
+    pair_overlap = (dict(zip(_d_keys, overlap_d_batch(_d_specs)))
+                    if _d_keys else {})
+
     for mol_idx, (atoms, coords) in enumerate(molecules):
         coords = np.array(coords, dtype=np.float64)
         n_at = len(atoms)
@@ -289,8 +317,9 @@ def prepare_batch(
         # and overran their own arrays on sulfur or a halogen.
         for i in range(n_at):
             for j in range(i + 1, n_at):
-                block = _pair_resonance_block(params[i], params[j],
-                                              coords[i], coords[j])
+                block = _pair_resonance_block(
+                    params[i], params[j], coords[i], coords[j],
+                    overlap=pair_overlap.get((mol_idx, i, j)))
                 si, sj = starts[i], starts[j]
                 nA, nB = params[i].n_basis, params[j].n_basis
                 H[si:si + nA, sj:sj + nB] = block
@@ -328,7 +357,8 @@ def prepare_batch(
             for j in range(i + 1, n_at):
                 block = _two_centre_packed(params[i], params[j],
                                            coords[i], coords[j],
-                                           dense=pair_w.get((mol_idx, i, j)))
+                                           dense=pair_w.get((mol_idx, i, j)),
+                                           tetci=pair_tetci.get((mol_idx, i, j)))
                 off_ij = pair_cursor[mol_idx]
                 w_packed_rows[mol_idx].append(block.ravel())
                 pair_offset_all[mol_idx, i, j] = off_ij
