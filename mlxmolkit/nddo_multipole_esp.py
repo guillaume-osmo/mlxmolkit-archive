@@ -66,7 +66,7 @@ def atomic_multipoles_from_density(atoms, params, density):
         Q_A,ij = qa_A^2 * (3 P(p_i,p_j) - delta_ij * Tr_pp).  (Overall sign/scale
         for the ESP is applied at evaluation via ``quad_scale``, calibrated to QM.)
     """
-    from .rm1.integrals import _charge_separations
+    from .nddo.integrals import _charge_separations
 
     P = np.asarray(density, dtype=np.float64)
     N = len(params)
@@ -216,8 +216,8 @@ def nddo_density_esp(atoms, coords_ang, *, method="PM6", total_charge=0,
     ``quad_scale`` (from ``calibrate_quad_scale``) to include the quadrupole
     term; default 0.0 keeps the well-validated monopole+dipole ESP.
     """
-    from .rm1 import nddo_energy
-    from .rm1.methods import get_params
+    from .nddo import nddo_energy
+    from .nddo.methods import get_params
     from .esp_resp import connolly_surface_grid
 
     atom_list = [int(z) for z in atoms]

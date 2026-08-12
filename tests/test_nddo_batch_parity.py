@@ -23,8 +23,8 @@ import pytest
 
 pytest.importorskip("rdkit")
 
-from mlxmolkit.rm1.methods import get_params
-from mlxmolkit.rm1.scf import nddo_energy, nddo_energy_batch
+from mlxmolkit.nddo.methods import get_params
+from mlxmolkit.nddo.scf import nddo_energy, nddo_energy_batch
 
 SP_ONLY = ["O", "CCO", "c1ccccc1", "CC(=O)OCC"]
 
@@ -35,7 +35,7 @@ D_ORBITAL = ["CSC", "CCS", "ClCCl"]
 
 
 def _embed(smiles, seed=42):
-    from mlxmolkit.rm1.pipeline import _smiles_to_3d
+    from mlxmolkit.nddo.pipeline import _smiles_to_3d
 
     result = _smiles_to_3d(smiles, seed=seed)
     if result is None:
@@ -88,7 +88,7 @@ def test_pm6_core_core_is_not_the_am1_form():
     The two differ by several eV, so if prepare_batch ever loses the method
     again this fails loudly instead of returning a plausible-looking number.
     """
-    from mlxmolkit.rm1.integrals import (compute_nuclear_repulsion,
+    from mlxmolkit.nddo.integrals import (compute_nuclear_repulsion,
                                          nuclear_repulsion_for_method)
 
     atoms, coords = _embed("CCO")

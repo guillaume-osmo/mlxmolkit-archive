@@ -4,9 +4,9 @@ import sys; sys.path.insert(0, '.')
 import numpy as np
 import time
 
-from mlxmolkit.rm1.pipeline import _smiles_to_3d
-from mlxmolkit.rm1.gradient import nddo_optimize_batch
-from mlxmolkit.rm1.scf import rm1_energy_batch
+from mlxmolkit.nddo.pipeline import _smiles_to_3d
+from mlxmolkit.nddo.gradient import nddo_optimize_batch
+from mlxmolkit.nddo.scf import rm1_energy_batch
 
 # Small set first
 test_mols = [

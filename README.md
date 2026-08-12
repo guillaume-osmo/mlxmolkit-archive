@@ -34,7 +34,7 @@ entry point is covered by `tests/test_{methods_api,pm6_d_native,pm6_d3h4,pyseqm_
 ### Public API
 
 ```python
-from mlxmolkit.rm1 import (
+from mlxmolkit.nddo import (
     # SCF
     nddo_energy, nddo_energy_batch,
     # PM6-D3H4 corrections
@@ -44,7 +44,7 @@ from mlxmolkit.rm1 import (
 )
 
 # Bit-exact primitives (vendored from PYSEQM)
-from mlxmolkit.rm1._pyseqm_port import (
+from mlxmolkit.nddo._pyseqm_port import (
     diatom_overlap_matrixD, two_elec_two_center_int,
     qn_int, qnD_int,
 )
@@ -433,7 +433,7 @@ Full nvMolKit pipeline: DG (4D) → 4D→3D collapse → setReferenceValues → 
 
 - [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) — NVIDIA's CUDA implementation (Apache 2.0)
 - [shivampatel10/mlxmolkit](https://github.com/shivampatel10/mlxmolkit) — TPM threadgroup kernels and MMFF Metal implementation
-- [PYSEQM](https://github.com/lanl/PYSEQM) — LANL semi-empirical reference (BSD-3 Clause); the NumPy port in `mlxmolkit/rm1/_pyseqm_port/` is a mechanical torch→numpy translation of selected modules
+- [PYSEQM](https://github.com/lanl/PYSEQM) — LANL semi-empirical reference (BSD-3 Clause); the NumPy port in `mlxmolkit/nddo/_pyseqm_port/` is a mechanical torch→numpy translation of selected modules
 - [RDKit blog: Butina clustering with nvMolKit](https://greglandrum.github.io/rdkit-blog/posts/2026-02-28-nvmolkit-clustering.html)
 - [MLX](https://github.com/ml-explore/mlx) — Apple's ML framework with Metal kernel support
 - [MMFF94](https://doi.org/10.1002/(SICI)1096-987X(199604)17:5/6<490::AID-JCC1>3.0.CO;2-P) — Halgren, J. Comput. Chem. 1996

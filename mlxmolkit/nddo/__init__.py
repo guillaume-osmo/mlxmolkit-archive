@@ -1,4 +1,4 @@
-"""mlxmolkit.rm1 — PM6_D / RM1 semi-empirical SCF on Apple Silicon.
+"""mlxmolkit.nddo — PM6_D / RM1 semi-empirical SCF on Apple Silicon.
 
 Public API — only the entry points covered by the test suite.
 Lower-level internals are reachable via submodule imports but are not
@@ -39,7 +39,7 @@ Bit-exact reference primitives (vendored from PYSEQM, BSD-3, LANL)
     These match PYSEQM to machine precision; the regression suite in
     tests/test_pyseqm_port.py asserts this on every commit.
 
-    from mlxmolkit.rm1._pyseqm_port import (
+    from mlxmolkit.nddo._pyseqm_port import (
         diatom_overlap_matrixD,     # qn=1..6 diatomic overlap (incl. d)
         two_elec_two_center_int,    # full TETCI per pair
         qn_int, qnD_int,            # periodic-table tables

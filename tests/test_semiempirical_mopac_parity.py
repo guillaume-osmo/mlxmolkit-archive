@@ -28,7 +28,7 @@ try:
     from rdkit import Chem, RDLogger
     from rdkit.Chem import AllChem
     RDLogger.DisableLog("rdApp.*")
-    from mlxmolkit.rm1.methods import METHOD_PARAMS, get_params
+    from mlxmolkit.nddo.methods import METHOD_PARAMS, get_params
     from mlxmolkit.am1bcc import am1_bcc_charges_from_rdkit_mol
     _IMPORTS_OK = True
 except Exception as _e:  # pragma: no cover

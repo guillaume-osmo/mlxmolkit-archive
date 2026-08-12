@@ -14,7 +14,7 @@ import pathlib
 import numpy as np
 import pytest
 
-from mlxmolkit.rm1 import nddo_energy
+from mlxmolkit.nddo import nddo_energy
 
 seqm = pytest.importorskip("seqm", reason="PYSEQM not installed")
 

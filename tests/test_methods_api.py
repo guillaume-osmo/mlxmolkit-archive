@@ -10,7 +10,7 @@ for PM6_D is in tests/test_pm6_d_native.py (charges vs PYSEQM/MOPAC).
 import numpy as np
 import pytest
 
-from mlxmolkit.rm1 import nddo_energy, pm6_d3h4_correction
+from mlxmolkit.nddo import nddo_energy, pm6_d3h4_correction
 
 
 H2O_ATOMS = [8, 1, 1]

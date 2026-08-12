@@ -37,7 +37,7 @@ def _load_pwcct(filepath: str = None):
     if _PWCCT_LOADED:
         return
     if filepath is None:
-        # Bundled CSV in mlxmolkit/rm1/data/ (extracted from PYSEQM
+        # Bundled CSV in mlxmolkit/nddo/data/ (extracted from PYSEQM
         # seqm/params/, BSD-3-Clause)
         filepath = os.path.join(
             os.path.dirname(__file__), 'data', 'PWCCT_PM6_MOPAC.csv'

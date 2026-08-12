@@ -1,6 +1,6 @@
 # PM6 cross-toolkit validation
 
-`mlxmolkit.rm1` PM6_D validated against three independent reference codes on frozen
+`mlxmolkit.nddo` PM6_D validated against three independent reference codes on frozen
 geometries (RDKit ETKDGv3 seed=1 + MMFF94, baked into `tests/_mopac_ref_generated.py`).
 
 | reference | version | how |

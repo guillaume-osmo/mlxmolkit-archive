@@ -812,7 +812,7 @@ def nddo_energy(
         ``native=True`` to run the mlxmolkit path instead.
     """
     # PM6_D is bit-exact via the vendored numpy PYSEQM port
-    # (mlxmolkit/rm1/_pyseqm_port/), so the native path is always used.
+    # (mlxmolkit/nddo/_pyseqm_port/), so the native path is always used.
     # `native` kw is kept for back-compat but is now a no-op.
     _ = native
 

@@ -19,7 +19,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from mlxmolkit.rm1 import nddo_energy
+from mlxmolkit.nddo import nddo_energy
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SPARROW_PY = "/Users/guillaume-osmo/miniconda3/envs/sparrow/bin/python"

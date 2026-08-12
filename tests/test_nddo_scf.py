@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 import mlx.core as mx
 
-from mlxmolkit.rm1 import scf as scf_mod
-from mlxmolkit.rm1.scf import nddo_energy, nddo_energy_batch
+from mlxmolkit.nddo import scf as scf_mod
+from mlxmolkit.nddo.scf import nddo_energy, nddo_energy_batch
 
 
 # Test geometries (Angstrom)
