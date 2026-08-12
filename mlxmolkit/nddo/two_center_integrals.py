@@ -16,6 +16,9 @@ Reference: repp.f in MOPAC, two_elec_two_center_int_local_frame.py in PYSEQM.
 """
 from __future__ import annotations
 
+from functools import lru_cache
+from typing import NamedTuple
+
 import numpy as np
 from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, principal_qn
 
@@ -23,12 +26,47 @@ EV = 27.21  # Hartree to eV (MOPAC convention)
 
 
 def _compute_multipole_params(p: ElementParams) -> tuple[float, float, float, float, float]:
-    """Compute charge separations and additive terms for one atom.
+    """Charge separations and additive terms for one atom.
 
     Exact port of PYSEQM's cal_par.py (dd_qq, additive_term_rho1, rho2).
 
+    A pure function of the element's own parameters — no geometry enters — yet
+    it runs two five-step secant solvers, and every two-centre integral asked
+    for it afresh. A single benzaldehyde gradient called it 14528 times for
+    three distinct elements. It is memoised on the parameters it actually
+    reads, so the answer is identical and computed once per element per method.
+
     Returns: da, qa, rho0, rho1, rho2
     """
+    return _multipole_params_cached(
+        p.Z, p.n_basis, p.gss, p.zeta_s, p.zeta_p, p.hsp, p.gpp, p.gp2)
+
+
+@lru_cache(maxsize=None)
+def _multipole_params_cached(Z, n_basis, gss, zeta_s, zeta_p, hsp, gpp, gp2):
+    p = _MultipoleInputs(Z, n_basis, gss, zeta_s, zeta_p, hsp, gpp, gp2)
+    return _compute_multipole_params_uncached(p)
+
+
+class _MultipoleInputs(NamedTuple):
+    """Exactly the fields :func:`_compute_multipole_params_uncached` reads.
+
+    Naming them here is what makes the cache key provably complete: if the
+    computation ever starts reading another parameter, it fails loudly on this
+    object instead of silently returning a stale value.
+    """
+    Z: int
+    n_basis: int
+    gss: float
+    zeta_s: float
+    zeta_p: float
+    hsp: float
+    gpp: float
+    gp2: float
+
+
+def _compute_multipole_params_uncached(p) -> tuple[float, float, float, float, float]:
+    """The actual computation. See :func:`_compute_multipole_params`."""
     # rho0: monopole additive term = 0.5*ev/gss (PYSEQM line 240)
     rho0 = 0.5 * EV / p.gss if p.gss > 1e-10 else 0.0
 

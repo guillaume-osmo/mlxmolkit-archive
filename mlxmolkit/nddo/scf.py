@@ -387,19 +387,30 @@ def _build_core_hamiltonian(atoms, coords, info):
             H[si:si + nA, sj:sj + nB] = block
             H[sj:sj + nB, si:si + nA] = block.T
 
-    # Electron-nuclear attraction using properly rotated integrals
+    # Electron-nuclear attraction. One rotation of the pair (i, j) yields the
+    # attraction on i from j *and* on j from i, so the unordered loop below
+    # does half the work the ordered one did. d pairs keep the 9x9 Wigner-D
+    # path, which is not expressible through the sp rotation.
     for i in range(n_atoms):
         si, nA = starts[i], params[i].n_basis
-        for j in range(n_atoms):
-            if i == j:
-                continue
-            H[si:si + nA, si:si + nA] += _pair_core_attraction(
-                params[i], params[j], coords[i], coords[j])
+        for j in range(i + 1, n_atoms):
+            sj, nB = starts[j], params[j].n_basis
+            pA, pB = params[i], params[j]
+            if pA.n_basis == 9 or pB.n_basis == 9:
+                H[si:si + nA, si:si + nA] += _pair_core_attraction(
+                    pA, pB, coords[i], coords[j])
+                H[sj:sj + nB, sj:sj + nB] += _pair_core_attraction(
+                    pB, pA, coords[j], coords[i])
+            else:
+                _, e1b, e2a = rotate_integrals_to_molecular_frame(
+                    pA, pB, coords[i], coords[j])
+                H[si:si + nA, si:si + nA] += e1b[:nA, :nA]
+                H[sj:sj + nB, sj:sj + nB] += e2a[:nB, :nB]
 
     return H
 
 
-def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB):
+def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB, w=None):
     """Two-centre Coulomb/exchange contribution of ONE atom pair, applied to F.
 
     Split out of :func:`_build_fock` for the same reason as the core-Hamiltonian
@@ -410,8 +421,14 @@ def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB):
 
     F is modified in place for the sp part and returned, because the d path
     (d_two_center_fock) returns a new array.
+
+    `w` lets a caller pass the rotated tensor it already has. One rotation
+    yields the two-electron block *and* both attraction orderings, so a caller
+    that needs all three should rotate once and hand the result in rather than
+    paying for it three times.
     """
-    w, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    if w is None:
+        w, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
     nA_sp = min(pA.n_basis, 4)
     nB_sp = min(pB.n_basis, 4)
     #   F[mu nu_A] += sum P[la si_B] w        (J on A)

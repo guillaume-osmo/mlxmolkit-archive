@@ -29,22 +29,35 @@ def _pair_terms(params, coords, i, j, starts, P, n_basis):
     """
     from .scf import (_pair_resonance_block, _pair_core_attraction,
                       _pair_fock_twocentre)
+    from .rotation import rotate_integrals_to_molecular_frame
 
     pA, pB = params[i], params[j]
     sA, sB = starts[i], starts[j]
     nA, nB = pA.n_basis, pB.n_basis
+    rA, rB = coords[i], coords[j]
 
     dH = np.zeros((n_basis, n_basis))
-    block = _pair_resonance_block(pA, pB, coords[i], coords[j])
+    block = _pair_resonance_block(pA, pB, rA, rB)
     dH[sA:sA + nA, sB:sB + nB] += block
     dH[sB:sB + nB, sA:sA + nA] += block.T
-    # Attraction is not symmetric in the pair: (i,j) lands on i's diagonal
-    # block, (j,i) on j's, so both orderings are needed.
-    dH[sA:sA + nA, sA:sA + nA] += _pair_core_attraction(pA, pB, coords[i], coords[j])
-    dH[sB:sB + nB, sB:sB + nB] += _pair_core_attraction(pB, pA, coords[j], coords[i])
 
+    if nA == 9 or nB == 9:
+        # d pairs keep the 9x9 Wigner-D attraction and the d two-centre path.
+        dH[sA:sA + nA, sA:sA + nA] += _pair_core_attraction(pA, pB, rA, rB)
+        dH[sB:sB + nB, sB:sB + nB] += _pair_core_attraction(pB, pA, rB, rA)
+        dT = _pair_fock_twocentre(np.zeros((n_basis, n_basis)), P,
+                                  pA, pB, sA, sB, rA, rB)
+        return dH, dT
+
+    # One rotation supplies all three sp contributions. Attraction is not
+    # symmetric in the pair — (i,j) lands on i's diagonal block and (j,i) on
+    # j's — but e1b and e2a are exactly those two orderings, so asking for the
+    # rotation three times was paying three times for one answer.
+    w, e1b, e2a = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    dH[sA:sA + nA, sA:sA + nA] += e1b[:nA, :nA]
+    dH[sB:sB + nB, sB:sB + nB] += e2a[:nB, :nB]
     dT = _pair_fock_twocentre(np.zeros((n_basis, n_basis)), P,
-                              pA, pB, sA, sB, coords[i], coords[j])
+                              pA, pB, sA, sB, rA, rB, w=w)
     return dH, dT
 
 

@@ -275,13 +275,25 @@ def prepare_batch(
                 H[si:si + nA, sj:sj + nB] = block
                 H[sj:sj + nB, si:si + nA] = block.T
 
+        # Electron-nuclear attraction. One rotation of the pair (i, j) yields the
+        # attraction on i from j *and* on j from i, so the unordered loop below
+        # does half the work the ordered one did. d pairs keep the 9x9 Wigner-D
+        # path, which is not expressible through the sp rotation.
         for i in range(n_at):
             si, nA = starts[i], params[i].n_basis
-            for j in range(n_at):
-                if i == j:
-                    continue
-                H[si:si + nA, si:si + nA] += _pair_core_attraction(
-                    params[i], params[j], coords[i], coords[j])
+            for j in range(i + 1, n_at):
+                sj, nB = starts[j], params[j].n_basis
+                pA, pB = params[i], params[j]
+                if pA.n_basis == 9 or pB.n_basis == 9:
+                    H[si:si + nA, si:si + nA] += _pair_core_attraction(
+                        pA, pB, coords[i], coords[j])
+                    H[sj:sj + nB, sj:sj + nB] += _pair_core_attraction(
+                        pB, pA, coords[j], coords[i])
+                else:
+                    _, e1b, e2a = rotate_integrals_to_molecular_frame(
+                        pA, pB, coords[i], coords[j])
+                    H[si:si + nA, si:si + nA] += e1b[:nA, :nA]
+                    H[sj:sj + nB, sj:sj + nB] += e2a[:nB, :nB]
 
         # === Two-centre integrals, packed ===
         # Stored as lower-triangle packed pair blocks with a per-pair offset,
