@@ -377,78 +377,107 @@ def prepare_batch(
         for n, pos in enumerate(positions):
             pair_packed[pos] = packed[n]
 
+    # ---- one flat atom axis, and one flat orbital axis, for the whole batch --
+    # What is left in the per-molecule loop below is per-atom and per-orbital
+    # Python: building basis_to_atom/basis_type an orbital at a time, copying
+    # five parameters per atom, and filling the H diagonal with a branch on the
+    # orbital type. None of that depends on the molecule it sits in, so it is
+    # done here across the batch and the loop just slices.
+    if N:
+        flat_z = np.concatenate([np.asarray(a, dtype=np.int64) for a, _c in molecules])
+    else:
+        flat_z = np.zeros(0, dtype=np.int64)
+    n_at_per_mol = np.diff(atom_flat_start)
+    flat_mol = np.repeat(np.arange(N), n_at_per_mol)
+    flat_pos = np.arange(flat_z.size) - atom_flat_start[flat_mol]
+
+    # Element parameters as Z-indexed tables. A batch has thousands of atoms
+    # and a handful of elements, so every per-atom quantity below is a gather.
+    zmax = int(flat_z.max()) + 1 if flat_z.size else 1
+    tab_norb = np.zeros(zmax, dtype=np.int32)
+    tab_nval = np.zeros(zmax)
+    tab_U = np.zeros((zmax, 3))
+    tab_g = np.zeros((zmax, 5))
+    for z in np.unique(flat_z):
+        p = param_dict[int(z)]
+        tab_norb[z] = p.n_basis
+        tab_nval[z] = float(p.n_valence)
+        tab_U[z] = (p.Uss, p.Upp, getattr(p, "Udd", 0.0))
+        tab_g[z] = (p.gss, p.gsp, p.gpp, p.gp2, p.hsp)
+
+    flat_norb = tab_norb[flat_z].astype(np.int64)
+    n_bas_per_mol = np.bincount(flat_mol, weights=flat_norb,
+                                minlength=N).astype(np.int64)
+    mol_orb_start = np.concatenate([[0], np.cumsum(n_bas_per_mol)])
+
+    # Expand atoms to orbitals: each atom contributes n_basis consecutive
+    # orbitals, whose type is 0..n_basis-1. Both come from one cumsum.
+    orb_atom = np.repeat(np.arange(flat_z.size), flat_norb)
+    atom_orb_start = np.concatenate([[0], np.cumsum(flat_norb)])
+    orb_type = np.arange(atom_orb_start[-1]) - atom_orb_start[orb_atom]
+    orb_mol = flat_mol[orb_atom]
+    orb_col = np.arange(atom_orb_start[-1]) - mol_orb_start[orb_mol]
+
+    atom_map_all[orb_mol, orb_col] = flat_pos[orb_atom]
+    type_map_all[orb_mol, orb_col] = orb_type
+    atom_starts_all[flat_mol, flat_pos] = (
+        atom_orb_start[:-1] - mol_orb_start[flat_mol])
+    atom_starts_all[np.arange(N), n_at_per_mol] = n_bas_per_mol
+    atom_params_all[flat_mol, flat_pos] = tab_g[flat_z]
+    atom_norb_all[flat_mol, flat_pos] = flat_norb
+
+    # One-centre d integrals depend only on the element, so one call per
+    # distinct d element covers every atom of it in the batch.
+    for z in np.unique(flat_z[flat_norb == 9]):
+        sel = flat_z == z
+        atom_w_all[flat_mol[sel], flat_pos[sel]] = _one_centre_w(param_dict[int(z)])
+
+    # H_core diagonal: Uss for the s orbital, Upp for p, Udd for d.
+    orb_z = flat_z[orb_atom]
+    orb_diag = np.where(orb_type == 0, tab_U[orb_z, 0],
+                        np.where(orb_type <= 3, tab_U[orb_z, 1], tab_U[orb_z, 2]))
+
+    # Electron counts, and the three validity checks, for every molecule at once.
+    n_elec_all = (np.bincount(flat_mol, weights=tab_nval[flat_z], minlength=N)
+                  - molecular_charges_arr)
+    n_elec_int = np.rint(n_elec_all).astype(np.int64)
+    bad = np.flatnonzero(~np.isclose(n_elec_all, n_elec_int, atol=1.0e-6))
+    if bad.size:
+        raise ValueError(f"molecule {bad[0]} has non-integer electron count: "
+                         f"{n_elec_all[bad[0]]}")
+    bad = np.flatnonzero(n_elec_int < 0)
+    if bad.size:
+        raise ValueError(f"molecule {bad[0]} has negative electron count")
+    bad = np.flatnonzero(n_elec_int % 2 != 0)
+    if bad.size:
+        raise ValueError(
+            f"molecule {bad[0]} is open shell ({n_elec_int[bad[0]]} electrons); "
+            "only closed-shell NDDO batches are currently supported"
+        )
+
+    n_atoms_arr[:] = n_at_per_mol
+    n_basis_arr[:] = n_bas_per_mol
+    n_occ_arr[:] = n_elec_int // 2
+
     for mol_idx, (atoms, coords) in enumerate(molecules):
         coords = np.array(coords, dtype=np.float64)
-        n_at = len(atoms)
-        params = [param_dict[z] for z in atoms]
-        n_bas = sum(p.n_basis for p in params)
-        n_elec_float = float(sum(p.n_valence for p in params)) - float(molecular_charges_arr[mol_idx])
-        n_elec = int(round(n_elec_float))
-        if not np.isclose(n_elec_float, n_elec, atol=1.0e-6):
-            raise ValueError(f"molecule {mol_idx} has non-integer electron count: {n_elec_float}")
-        if n_elec < 0:
-            raise ValueError(f"molecule {mol_idx} has negative electron count")
-        if n_elec % 2 != 0:
-            raise ValueError(
-                f"molecule {mol_idx} is open shell ({n_elec} electrons); "
-                "only closed-shell NDDO batches are currently supported"
-            )
-        n_occ = n_elec // 2
-
-        n_atoms_arr[mol_idx] = n_at
-        n_basis_arr[mol_idx] = n_bas
-        n_occ_arr[mol_idx] = n_occ
+        n_at = int(n_at_per_mol[mol_idx])
+        params = params_by_mol[mol_idx]
+        n_bas = int(n_bas_per_mol[mol_idx])
         atoms_list.append(atoms)
         coords_list.append(coords)
 
-        # Build basis info
-        basis_to_atom = []
-        basis_type = []
-        atom_basis_start = []
-        for i, p in enumerate(params):
-            atom_basis_start.append(len(basis_to_atom))
-            for k in range(p.n_basis):
-                basis_to_atom.append(i)
-                basis_type.append(k)
-        atom_basis_start.append(n_bas)
+        starts = atom_starts_all[mol_idx]
+        o0, o1 = int(mol_orb_start[mol_idx]), int(mol_orb_start[mol_idx + 1])
 
-        b2a = np.array(basis_to_atom, dtype=np.int32)
-        btype = np.array(basis_type, dtype=np.int32)
-
-        atom_map_all[mol_idx, :n_bas] = b2a
-        type_map_all[mol_idx, :n_bas] = btype
-        for i in range(n_at + 1):
-            atom_starts_all[mol_idx, i] = atom_basis_start[i]
-
-        # Atom params
-        for i, p in enumerate(params):
-            atom_params_all[mol_idx, i] = [p.gss, p.gsp, p.gpp, p.gp2, p.hsp]
-            atom_norb_all[mol_idx, i] = p.n_basis
-            if p.n_basis == 9:
-                atom_w_all[mol_idx, i] = _one_centre_w(p)
-
-        # === Build H_core ===
         H = np.zeros((n_bas, n_bas), dtype=np.float64)
-
-        # Diagonal: Uss/Upp/Udd
-        for mu in range(n_bas):
-            i = b2a[mu]
-            p = params[i]
-            if btype[mu] == 0:
-                H[mu, mu] = p.Uss
-            elif btype[mu] <= 3:
-                H[mu, mu] = p.Upp
-            else:
-                H[mu, mu] = p.Udd
-
-        starts = atom_basis_start
+        np.fill_diagonal(H, orb_diag[o0:o1])
 
         # One walk over this molecule's slice of the pair table, doing what
         # four separate (i, j) walks used to: resonance, electron-nuclear
         # attraction, packing, and the core-core term list. Each precomputed
         # result is reached by the pair's dense id rather than by hashing an
         # (mol_idx, i, j) tuple.
-        starts = atom_basis_start
         pm6_core = method in PM6_CORE_CORE_METHODS
 
         for pid in range(mol_pair_start[mol_idx], mol_pair_start[mol_idx + 1]):
