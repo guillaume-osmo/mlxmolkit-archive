@@ -17,7 +17,8 @@ from __future__ import annotations
 import numpy as np
 from .scf import nddo_energy
 from .methods import get_params
-from .integrals import compute_nuclear_repulsion, nuclear_repulsion_for_method
+from .integrals import (compute_nuclear_repulsion, nuclear_repulsion_for_method,
+                        pair_repulsion_for_method)
 
 
 def _pair_terms(params, coords, i, j, starts, P, n_basis):
@@ -110,6 +111,14 @@ def analytical_gradient(
             T_ref += dT
     G_one = F_ref - H_ref - T_ref
 
+    # Core-core repulsion is a plain sum over pairs, so it gets the same
+    # treatment as H and F: keep the reference total and the per-pair terms,
+    # and patch only the pairs that move. Rebuilding it in full at each of the
+    # 6N displacements was 46% of a menthol gradient.
+    E_nuc_ref = nuclear_repulsion_for_method(atoms, coords, PARAMS, method)
+    nuc_ref = {(i, j): pair_repulsion_for_method(atoms, coords, i, j, PARAMS, method)
+               for i in range(n_atoms) for j in range(i + 1, n_atoms)}
+
     def energy_with_atom_moved(a: int, shifted: np.ndarray) -> float:
         H = H_ref.copy()
         T = T_ref.copy()
@@ -123,7 +132,15 @@ def analytical_gradient(
             T += new_T - old_T
         F = H + G_one + T
         E_elec = 0.5 * np.sum(P * (H + F))
-        return E_elec + nuclear_repulsion_for_method(atoms, shifted, PARAMS, method)
+
+        E_nuc = E_nuc_ref
+        for j in range(n_atoms):
+            if j == a:
+                continue
+            key = (a, j) if a < j else (j, a)
+            E_nuc += (pair_repulsion_for_method(atoms, shifted, *key, PARAMS, method)
+                      - nuc_ref[key])
+        return E_elec + E_nuc
 
     gradient = np.zeros((n_atoms, 3))
     for a in range(n_atoms):

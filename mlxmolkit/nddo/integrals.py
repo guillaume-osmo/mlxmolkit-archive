@@ -280,6 +280,39 @@ def nuclear_repulsion_for_method(
     return compute_nuclear_repulsion(atoms, coords, param_dict=params)
 
 
+def am1_pair_repulsion(pA, pB, coordI: np.ndarray, coordJ: np.ndarray) -> float:
+    """AM1/RM1/PM3-style core-core repulsion for ONE atom pair, in eV.
+
+    Counterpart to :func:`~mlxmolkit.nddo.pwcct.pm6_pair_repulsion`; see there
+    for why the total is expressed per pair.
+    """
+    R = float(np.linalg.norm(coordI - coordJ))
+    R_bohr = R * ANG_TO_BOHR
+
+    rho0A = 0.5 * EV / pA.gss if pA.gss > 0 else 0.0
+    rho0B = 0.5 * EV / pB.gss if pB.gss > 0 else 0.0
+    ssss = EV / np.sqrt(R_bohr ** 2 + (rho0A + rho0B) ** 2)
+
+    ZA, ZB = pA.n_valence, pB.n_valence
+    t1 = ZA * ZB * ssss
+
+    # MOPAC special case: for N-H and O-H the heavy atom's exponential picks
+    # up a factor R.
+    t2 = np.exp(-pA.alpha * R)
+    if pA.Z in (7, 8) and pB.Z == 1:
+        t2 *= R
+    t3 = np.exp(-pB.alpha * R)
+    if pB.Z in (7, 8) and pA.Z == 1:
+        t3 *= R
+
+    t4 = ZA * ZB / R
+    t5 = sum(pA.gauss_K[k] * np.exp(-pA.gauss_L[k] * (R - pA.gauss_M[k]) ** 2)
+             for k in range(4) if pA.gauss_K[k] != 0)
+    t6 = sum(pB.gauss_K[k] * np.exp(-pB.gauss_L[k] * (R - pB.gauss_M[k]) ** 2)
+             for k in range(4) if pB.gauss_K[k] != 0)
+    return float(t1 * (1.0 + t2 + t3) + t4 * (t5 + t6))
+
+
 def compute_nuclear_repulsion(
     atoms: list[int],
     coords: np.ndarray,
@@ -287,64 +320,30 @@ def compute_nuclear_repulsion(
 ) -> float:
     """Compute core-core (nuclear) repulsion energy.
 
-    E_nuc = Σ_{A<B} Z_A * Z_B * (ss|ss)_AB * f(R_AB)
-
-    where f includes the AM1/RM1 Gaussian correction terms.
-
-    Returns energy in eV.
+    E_nuc = sum_{A<B} Z_A Z_B (ss|ss)_AB f(R_AB), where f carries the AM1/RM1
+    Gaussian corrections. Returns eV.
     """
     if param_dict is None:
         param_dict = RM1_PARAMS
-    n_atoms = len(atoms)
     params = [param_dict[z] for z in atoms]
-    E_nuc = 0.0
+    n_atoms = len(atoms)
+    return float(sum(
+        am1_pair_repulsion(params[i], params[j], coords[i], coords[j])
+        for i in range(n_atoms) for j in range(i + 1, n_atoms)))
 
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            pA = params[i]
-            pB = params[j]
-            R = np.linalg.norm(coords[i] - coords[j])  # Angstrom
-            R_bohr = R * ANG_TO_BOHR
 
-            # (ss|ss) integral
-            rho0A = 0.5 * EV / pA.gss if pA.gss > 0 else 0.0
-            rho0B = 0.5 * EV / pB.gss if pB.gss > 0 else 0.0
-            aee = (rho0A + rho0B) ** 2
-            ssss = EV / np.sqrt(R_bohr ** 2 + aee)
+def pair_repulsion_for_method(atoms, coords, i, j, params, method) -> float:
+    """Core-core repulsion of the pair (i, j) under `method`.
 
-            ZA = pA.n_valence
-            ZB = pB.n_valence
-
-            # MOPAC/PYSEQM AM1 convention:
-            # t1 = Z_A * Z_B * (ss|ss)
-            # t2 = exp(-alpha_A * R_angstrom)
-            # t3 = exp(-alpha_B * R_angstrom)
-            # Gaussian: t4 = Z_A * Z_B / R_angstrom (Coulomb-like, NOT ssss)
-            # t5 = Σ K_A * exp(-L_A * (R_ang - M_A)²)
-            # t6 = Σ K_B * exp(-L_B * (R_ang - M_B)²)
-            # E_nuc_pair = t1 * (1 + t2 + t3) + t4 * (t5 + t6)
-
-            t1 = ZA * ZB * ssss
-
-            # MOPAC special case: N-H and O-H pairs
-            # exp(-alpha*R) becomes exp(-alpha*R)*R for the heavy atom
-            # PYSEQM: XH = ((ni==7)|(ni==8)) & (nj==1)
-            is_NH_OH_A = (pA.Z in (7, 8)) and (pB.Z == 1)
-            is_NH_OH_B = (pB.Z in (7, 8)) and (pA.Z == 1)
-
-            t2 = np.exp(-pA.alpha * R)
-            if is_NH_OH_A:
-                t2 *= R  # special N-H/O-H convention
-            t3 = np.exp(-pB.alpha * R)
-            if is_NH_OH_B:
-                t3 *= R  # special N-H/O-H convention
-
-            t4 = ZA * ZB / R  # Coulomb Z*Z/R in Angstrom (eV·A units from Gaussian terms)
-            t5 = sum(pA.gauss_K[k] * np.exp(-pA.gauss_L[k] * (R - pA.gauss_M[k]) ** 2)
-                    for k in range(4) if pA.gauss_K[k] != 0)
-            t6 = sum(pB.gauss_K[k] * np.exp(-pB.gauss_L[k] * (R - pB.gauss_M[k]) ** 2)
-                    for k in range(4) if pB.gauss_K[k] != 0)
-
-            E_nuc += t1 * (1.0 + t2 + t3) + t4 * (t5 + t6)
-
-    return E_nuc
+    Mirrors :func:`nuclear_repulsion_for_method`, which picks the PWCCT form
+    for PM6 variants and the AM1-style one otherwise. Keeping the dispatch in
+    one place is what stops a gradient differentiating a different energy from
+    the one the SCF minimised.
+    """
+    if method in PM6_CORE_CORE_METHODS:
+        from .pwcct import pm6_pair_repulsion
+        return pm6_pair_repulsion(atoms[i], atoms[j],
+                                  params[atoms[i]], params[atoms[j]],
+                                  coords[i], coords[j])
+    return am1_pair_repulsion(params[atoms[i]], params[atoms[j]],
+                              coords[i], coords[j])

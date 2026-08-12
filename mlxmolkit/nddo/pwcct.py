@@ -64,66 +64,57 @@ def get_pwcct(z1: int, z2: int) -> Tuple[float, float]:
     return _PWCCT_CACHE.get((z1, z2), (0.0, 0.0))
 
 
+def pm6_pair_repulsion(zi: int, zj: int, pA, pB,
+                       coordI: np.ndarray, coordJ: np.ndarray) -> float:
+    """PM6 core-core repulsion for ONE atom pair, in eV.
+
+    Split out of :func:`pm6_nuclear_repulsion` because the total is a plain sum
+    over pairs: displacing one atom changes only the pairs that touch it, so a
+    gradient can update N-1 terms rather than rebuilding all N(N-1)/2. On
+    menthol the full rebuild was 46% of a gradient evaluation.
+    """
+    R_ang = float(np.linalg.norm(coordJ - coordI))
+    R_bohr = R_ang * ANG_TO_BOHR
+
+    ZA = float(pA.n_valence)
+    ZB = float(pB.n_valence)
+
+    rho0A = 0.5 * EV / pA.gss if pA.gss > 0 else 0.0
+    rho0B = 0.5 * EV / pB.gss if pB.gss > 0 else 0.0
+    gam = EV / np.sqrt(R_bohr ** 2 + (rho0A + rho0B) ** 2)
+
+    unpolcore = 1e-8 * ((float(zi) ** (1.0/3) + float(zj) ** (1.0/3)) / R_ang) ** 12
+    chi, alp = get_pwcct(zi, zj)
+
+    is_XH = ((zi in (6, 7, 8)) and zj == 1) or ((zj in (6, 7, 8)) and zi == 1)
+    if is_XH:
+        expo2 = unpolcore + ZA * ZB * gam * (
+            1.0 + 2.0 * chi * math.exp(-alp * R_ang ** 2))
+    else:
+        expo2 = unpolcore + ZA * ZB * gam * (
+            1.0 + 2.0 * chi * math.exp(-alp * (R_ang + 0.0003 * R_ang ** 6)))
+
+    if zi == 6 and zj == 6:
+        expo2 += ZA * ZB * gam * 9.28 * math.exp(-5.98 * R_ang)
+
+    t4 = ZA * ZB / R_ang
+    t5 = sum(pA.gauss_K[k] * math.exp(-pA.gauss_L[k] * (R_ang - pA.gauss_M[k]) ** 2)
+             for k in range(4) if pA.gauss_K[k] != 0)
+    t6 = sum(pB.gauss_K[k] * math.exp(-pB.gauss_L[k] * (R_ang - pB.gauss_M[k]) ** 2)
+             for k in range(4) if pB.gauss_K[k] != 0)
+    return expo2 + t4 * (t5 + t6)
+
+
 def pm6_nuclear_repulsion(
     atoms: list[int],
     coords: np.ndarray,
     param_dict: dict,
 ) -> float:
     """PM6 nuclear repulsion energy. Exact PYSEQM formula."""
-    n_atoms = len(atoms)
     coords = np.asarray(coords, dtype=np.float64)
-    E_nuc = 0.0
-
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            pA = param_dict[atoms[i]]
-            pB = param_dict[atoms[j]]
-            R_vec = coords[j] - coords[i]
-            R_ang = np.linalg.norm(R_vec)  # Angstrom
-            R_bohr = R_ang * ANG_TO_BOHR
-
-            ZA = float(pA.n_valence)
-            ZB = float(pB.n_valence)
-
-            # (ss|ss) = gam
-            rho0A = 0.5 * EV / pA.gss if pA.gss > 0 else 0.0
-            rho0B = 0.5 * EV / pB.gss if pB.gss > 0 else 0.0
-            gam = EV / np.sqrt(R_bohr ** 2 + (rho0A + rho0B) ** 2)
-
-            # Unpolarized core-core
-            atomic_A = float(atoms[i])
-            atomic_B = float(atoms[j])
-            unpolcore = 1e-8 * ((atomic_A ** (1.0/3) + atomic_B ** (1.0/3)) / R_ang) ** 12
-
-            # PWCCT chi, alpha
-            chi, alp = get_pwcct(atoms[i], atoms[j])
-
-            # C-H, N-H, O-H special case
-            is_XH = ((atoms[i] in (6, 7, 8)) and atoms[j] == 1) or \
-                     ((atoms[j] in (6, 7, 8)) and atoms[i] == 1)
-            # C-C special case
-            is_CC = (atoms[i] == 6) and (atoms[j] == 6)
-
-            if is_XH:
-                expo2 = (unpolcore
-                         + ZA * ZB * gam
-                         * (1.0 + 2.0 * chi * math.exp(-alp * R_ang ** 2)))
-            else:
-                expo2 = (unpolcore
-                         + ZA * ZB * gam
-                         * (1.0 + 2.0 * chi * math.exp(-alp * (R_ang + 0.0003 * R_ang ** 6))))
-
-            # C-C extra term
-            if is_CC:
-                expo2 += ZA * ZB * gam * 9.28 * math.exp(-5.98 * R_ang)
-
-            # Gaussian corrections (same as AM1-style)
-            t4 = ZA * ZB / R_ang
-            t5 = sum(pA.gauss_K[k] * math.exp(-pA.gauss_L[k] * (R_ang - pA.gauss_M[k]) ** 2)
-                     for k in range(4) if pA.gauss_K[k] != 0)
-            t6 = sum(pB.gauss_K[k] * math.exp(-pB.gauss_L[k] * (R_ang - pB.gauss_M[k]) ** 2)
-                     for k in range(4) if pB.gauss_K[k] != 0)
-
-            E_nuc += expo2 + t4 * (t5 + t6)
-
-    return E_nuc
+    n_atoms = len(atoms)
+    return float(sum(
+        pm6_pair_repulsion(atoms[i], atoms[j],
+                           param_dict[atoms[i]], param_dict[atoms[j]],
+                           coords[i], coords[j])
+        for i in range(n_atoms) for j in range(i + 1, n_atoms)))
