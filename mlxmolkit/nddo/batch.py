@@ -6,13 +6,16 @@ so a single Metal kernel dispatch handles all Fock matrices.
 """
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 from dataclasses import dataclass, field
 from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, EV_TO_KCAL
 from .overlap import overlap_molecular_frame
 from .rotation import rotate_integrals_to_molecular_frame
 from .packing import pack, packed_size, unpack
-from .scf import _pair_resonance_block, _pair_core_attraction
+from .scf import (_pair_resonance_block, _pair_core_attraction,
+                  _beta_for_orbital)
 from .integrals import (compute_nuclear_repulsion, nuclear_repulsion_for_method,
                         PM6_CORE_CORE_METHODS)
 
@@ -61,13 +64,41 @@ class RM1Batch:
 
 
 
+@lru_cache(maxsize=None)
+def _one_centre_w_cached(Z, zeta_s, zeta_p, zeta_d, F0SD, G2SD) -> np.ndarray:
+    from .tetci_multipole_pyseqm import PM6_TAIL_EXPONENTS
+    from .w_integrals import compute_w_integrals
+    from .params import principal_qn
+
+    qn = principal_qn(Z)
+    if Z in PM6_TAIL_EXPONENTS:
+        zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[Z]
+    else:
+        zs_t, zp_t, zd_t = zeta_s, zeta_p, zeta_d
+    out = compute_w_integrals(zs_t, zp_t, zd_t, qn, qn, F0SD, G2SD)
+    out.flags.writeable = False
+    return out
+
+
 def _one_centre_w(p) -> np.ndarray:
     """The 243 one-centre two-electron integrals for a d-bearing atom.
 
-    A function of the atom's Slater exponents alone, so it is constant across
-    the SCF and across geometries — computed once per atom when the batch is
-    prepared. Mirrors what the sequential solver does per iteration.
+    A function of the atom's Slater exponents alone — no geometry, no density —
+    so it is computed once per element rather than once per atom per molecule.
+    An 800-molecule batch has 760 d atoms and two distinct d elements; without
+    the cache that is 760 runs of the Slater-Condon machinery (126560 calls to
+    _binom alone) for two distinct answers.
+
+    The cached array is returned read-only so a caller cannot mutate the shared
+    copy.
     """
+    return _one_centre_w_cached(
+        p.Z, p.zeta_s, p.zeta_p, p.zeta_d,
+        getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0))
+
+
+def _one_centre_w_uncached(p) -> np.ndarray:
+    """Kept as the reference the cache is checked against."""
     from .tetci_multipole_pyseqm import PM6_TAIL_EXPONENTS
     from .w_integrals import compute_w_integrals
     from .params import principal_qn
@@ -247,6 +278,36 @@ def prepare_batch(
     pair_overlap = (dict(zip(_d_keys, overlap_d_batch(_d_specs)))
                     if _d_keys else {})
 
+    # Electron-nuclear attraction on the d atoms. yh_e1b_contribution rebuilds
+    # the 15x45 Wigner-D coefficient machinery one row at a time; over an
+    # 800-molecule batch that was 589 ms, the largest single cost left here.
+    # Only the direction whose *first* atom carries d orbitals takes that path.
+    from .tetci_yh import yh_e1b_batch
+    _att_keys, _att_pp, _att_pc = [], [], []
+    # The other direction of a mixed pair — the sp atom seen by the d atom's
+    # nucleus — took the scalar sp rotation instead, 5000 calls and the largest
+    # cost left once the d side was batched. It is the same rotate_pairs the
+    # sp-only path already uses, and e1b is a slice of what it returns.
+    _sp_att_keys, _sp_att_params, _sp_att_coords = [], [], []
+    for (mol_idx, i, j), (pA, pB, rA, rB) in zip(_d_keys, _d_specs):
+        for slot, (pX, pY, rX, rY) in enumerate(((pA, pB, rA, rB), (pB, pA, rB, rA))):
+            if pX.n_basis == 9:
+                _att_keys.append((mol_idx, i, j, slot))
+                _att_pp.append((pX, pY))
+                _att_pc.append((rX, rY))
+            else:
+                _sp_att_keys.append((mol_idx, i, j, slot))
+                _sp_att_params.append((pX, pY))
+                _sp_att_coords.append((rX, rY))
+    pair_attraction = (dict(zip(_att_keys, yh_e1b_batch(_att_pp, _att_pc)))
+                       if _att_keys else {})
+    if _sp_att_keys:
+        _w = rotate_pairs(_sp_att_params, _sp_att_coords)
+        for k, key in enumerate(_sp_att_keys):
+            nX = _sp_att_params[k][0].n_basis
+            pair_attraction[key] = (
+                -float(_sp_att_params[k][1].n_valence) * _w[k][:nX, :nX, 0, 0])
+
     # Resonance overlaps for the sp pairs, which are the bulk of any organic
     # batch. overlap_pairs routes anything its table does not cover — d
     # orbitals, or qn > 3 like Br and I — back to the scalar routine itself.
@@ -263,6 +324,25 @@ def prepare_batch(
                                       coords_arr[i], coords_arr[j]))
     if _sp_keys:
         pair_overlap.update(zip(_sp_keys, overlap_pairs(_sp_specs)))
+
+    # Resonance blocks in bulk. With the overlap already computed this is only
+    # the Wolfsberg-Helmholz weighting 0.5*(beta_mu + beta_nu)*S, which is an
+    # outer sum over orbital indices — 65400 per-pair calls became one
+    # expression per orbital-width shape.
+    pair_resonance: dict = {}
+    _res_shapes: dict[tuple, list] = {}
+    for key, (pA, pB, _a, _b) in zip(_sp_keys, _sp_specs):
+        S = pair_overlap.get(key)
+        if S is not None:
+            _res_shapes.setdefault((pA.Z, pB.Z), []).append((key, S))
+    for (zA, zB), items in _res_shapes.items():
+        pA, pB = param_dict[zA], param_dict[zB]
+        betaA = np.array([_beta_for_orbital(pA, k) for k in range(pA.n_basis)])
+        betaB = np.array([_beta_for_orbital(pB, k) for k in range(pB.n_basis)])
+        weight = 0.5 * (betaA[:, None] + betaB[None, :])
+        stack = np.stack([S for _k, S in items]) * weight
+        for pos, (key, _S) in enumerate(items):
+            pair_resonance[key] = stack[pos]
 
     # Pack every sp pair's two-electron block in bulk, grouped by orbital
     # widths. pack() called per pair was 132 ms across 64640 calls on an
@@ -354,9 +434,11 @@ def prepare_batch(
         # and overran their own arrays on sulfur or a halogen.
         for i in range(n_at):
             for j in range(i + 1, n_at):
-                block = _pair_resonance_block(
-                    params[i], params[j], coords[i], coords[j],
-                    overlap=pair_overlap.get((mol_idx, i, j)))
+                block = pair_resonance.get((mol_idx, i, j))
+                if block is None:
+                    block = _pair_resonance_block(
+                        params[i], params[j], coords[i], coords[j],
+                        overlap=pair_overlap.get((mol_idx, i, j)))
                 si, sj = starts[i], starts[j]
                 nA, nB = params[i].n_basis, params[j].n_basis
                 H[si:si + nA, sj:sj + nB] = block
@@ -372,10 +454,14 @@ def prepare_batch(
                 sj, nB = starts[j], params[j].n_basis
                 pA, pB = params[i], params[j]
                 if pA.n_basis == 9 or pB.n_basis == 9:
-                    H[si:si + nA, si:si + nA] += _pair_core_attraction(
-                        pA, pB, coords[i], coords[j])
-                    H[sj:sj + nB, sj:sj + nB] += _pair_core_attraction(
-                        pB, pA, coords[j], coords[i])
+                    blk = pair_attraction.get((mol_idx, i, j, 0))
+                    H[si:si + nA, si:si + nA] += (
+                        blk if blk is not None
+                        else _pair_core_attraction(pA, pB, coords[i], coords[j]))
+                    blk = pair_attraction.get((mol_idx, i, j, 1))
+                    H[sj:sj + nB, sj:sj + nB] += (
+                        blk if blk is not None
+                        else _pair_core_attraction(pB, pA, coords[j], coords[i]))
                 else:
                     w_ij = pair_w[(mol_idx, i, j)]
                     # e1b and e2a are slices of the rotated tensor.

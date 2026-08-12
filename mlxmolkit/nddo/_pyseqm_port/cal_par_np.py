@@ -1,4 +1,6 @@
 import math
+from functools import lru_cache
+
 import numpy as np
 
 from . import torch_np_shim as torch
@@ -286,12 +288,15 @@ class additive_term_rho2(torch.autograd.Function):
         return (dhpp_ev, dD2)
 
 
-def POIJ(L, D, FG):
-    if L == 0:
-        POIJ = 0.5 * ev / FG
-        return POIJ
-    ### HIGHER TERMS.
-    DSQ = D * D
+@lru_cache(maxsize=None)
+def _poij_one(L, dsq, fg):
+    """Golden-section search for a single (dsq, fg). Body verbatim from PYSEQM.
+
+    Split out of :func:`POIJ` because the search depends only on element
+    parameters, never on geometry: a batch of 60k pairs carries a handful of
+    distinct (dsq, fg) values and was re-running the 100-iteration Python
+    search for every pair. It was 565 ms of an 800-molecule prepare_batch.
+    """
     EV4 = ev * 0.25
     EV8 = ev / 8.0000
     A1 = 0.1000
@@ -301,68 +306,62 @@ def POIJ(L, D, FG):
     I = 0
     F1 = 0
     F2 = 0
-    k = 0
-    #      DELTA = torch.zeros_like(FG)
-    POIJ = torch.zeros_like(FG)
-    for i in FG:
-        I = 0
-        A1 = 0.1000
-        A2 = 5.000
-        G1 = 0.3820
-        G2 = 0.6180
-        F1 = 0
-        F2 = 0
-        dsq = float(DSQ[k])
-        fg = float(FG[k])
-
-        while I < 100:
-            DELTA = A2 - A1
-            if DELTA < 10**-8:
-                if F1 >= F2:
-                    POIJtmp = A2
-                else:
-                    POIJtmp = A1
-                break
-
-            Y1 = A1 + DELTA * G1
-            Y2 = A1 + DELTA * G2
-            if L == 1:
-                F1 = (EV4 * (1.0000 / Y1 - 1.0000 / math.sqrt(Y1**2 + dsq)) - fg) ** 2
-                F2 = (EV4 * (1.0000 / Y2 - 1.0000 / math.sqrt(Y2**2 + dsq)) - fg) ** 2
-            else:
-                F1 = (
-                    EV8
-                    * (
-                        1.0000 / Y1
-                        - 2.00000 / math.sqrt(Y1**2 + dsq * 0.50000)
-                        + 1.00000 / math.sqrt(Y1**2 + dsq)
-                    )
-                    - fg
-                ) ** 2
-                F2 = (
-                    EV8
-                    * (
-                        1.0000 / Y2
-                        - 2.0000 / math.sqrt(Y2**2 + dsq * 0.50000)
-                        + 1.0000 / math.sqrt(Y2**2 + dsq)
-                    )
-                    - fg
-                ) ** 2
-            if F1 < F2:
-                A2 = Y2
-            else:
-                A1 = Y1
-            I = I + 1
-        if F1 >= F2:
-            POIJtmp = A2
+    while I < 100:
+        DELTA = A2 - A1
+        if DELTA < 10**-8:
+            break
+        Y1 = A1 + DELTA * G1
+        Y2 = A1 + DELTA * G2
+        if L == 1:
+            F1 = (EV4 * (1.0000 / Y1 - 1.0000 / math.sqrt(Y1**2 + dsq)) - fg) ** 2
+            F2 = (EV4 * (1.0000 / Y2 - 1.0000 / math.sqrt(Y2**2 + dsq)) - fg) ** 2
         else:
-            POIJtmp = A1
-        if i == 0.000:
-            POIJtmp = 0
-        POIJ[k] = POIJtmp
-        k = k + 1
+            F1 = (
+                EV8
+                * (
+                    1.0000 / Y1
+                    - 2.00000 / math.sqrt(Y1**2 + dsq * 0.50000)
+                    + 1.00000 / math.sqrt(Y1**2 + dsq)
+                )
+                - fg
+            ) ** 2
+            F2 = (
+                EV8
+                * (
+                    1.0000 / Y2
+                    - 2.0000 / math.sqrt(Y2**2 + dsq * 0.50000)
+                    + 1.0000 / math.sqrt(Y2**2 + dsq)
+                )
+                - fg
+            ) ** 2
+        if F1 < F2:
+            A2 = Y2
+        else:
+            A1 = Y1
+        I = I + 1
+    # Both exits — converged DELTA and exhausted I — fall through here, as in
+    # the original, so the fg == 0 zeroing applies to each.
+    POIJtmp = A2 if F1 >= F2 else A1
+    if fg == 0.000:
+        POIJtmp = 0
+    return POIJtmp
 
-    return POIJ
+
+def POIJ(L, D, FG):
+    if L == 0:
+        POIJ = 0.5 * ev / FG
+        return POIJ
+    ### HIGHER TERMS.
+    DSQ = D * D
+    fg = np.asarray(FG, dtype=np.float64)
+    dsq = np.broadcast_to(np.asarray(DSQ, dtype=np.float64), fg.shape)
+    # Solve each distinct pair once. The searches are identical for every pair
+    # sharing an element, and np.unique is far cheaper than repeating them.
+    keys, inverse = np.unique(
+        np.stack([dsq.ravel(), fg.ravel()], axis=1), axis=0, return_inverse=True
+    )
+    solved = np.array([_poij_one(L, float(a), float(b)) for a, b in keys])
+    return solved[inverse].reshape(fg.shape)
 
 
 # def AIJL(Z1,Z2,N1,N2,L):

@@ -19,7 +19,12 @@ from numpy.typing import NDArray
 
 from .params import ANG_TO_BOHR
 from .rotation_matrix_d import generate_rotation_matrix, rotate_core
-from .two_center_integrals import _compute_multipole_params, two_center_integrals
+from .packing import index_matrix
+from .two_center_integrals import (
+    _compute_multipole_params,
+    two_center_integrals,
+    two_center_integrals_batch,
+)
 from .tetci_multipole_pyseqm import pyseqm_d_params
 
 EV = 27.21
@@ -312,3 +317,116 @@ def yh_e1b_contribution(
                 e1b[i, j] = val  # mirror upper to lower → symmetric
     # H_core convention: V_munu = -Z_B * integral, so negate
     return -e1b
+
+
+def yh_e1b_batch(pair_params, pair_coords) -> NDArray[np.float64]:
+    """Vectorised :func:`yh_e1b_contribution` over a pair axis.
+
+    Parameters
+    ----------
+    pair_params : sequence of (pA, pB)
+        Every ``pA`` must carry d orbitals (``n_basis == 9``); ``pB`` may be
+        H, sp or spd. Mixed ``pB`` shells in one call are fine.
+    pair_coords : sequence of (rA, rB)
+        Positions in Angstrom, same order.
+
+    Returns
+    -------
+    (P, 9, 9) float
+        The blocks :func:`yh_e1b_contribution` returns, stacked.
+
+    The scalar routine spends its time in ``generate_rotation_matrix``, which
+    already accepts ``(n_pairs, 3)`` — calling it with ``xij[None, :]`` once per
+    pair rebuilds the 15x45 coefficient machinery for a single row. Everything
+    between the multipole parameters and the final unpack is elementwise, so the
+    whole path lifts to arrays with no change to the arithmetic.
+    """
+    P = len(pair_params)
+    if P == 0:
+        return np.zeros((0, 9, 9))
+
+    rA = np.array([c[0] for c in pair_coords], dtype=np.float64)
+    rB = np.array([c[1] for c in pair_coords], dtype=np.float64)
+    delta = rB - rA
+    R_ang = np.linalg.norm(delta, axis=1)
+    R = R_ang * ANG_TO_BOHR
+    xij = delta / R_ang[:, None]
+
+    # Element-indexed parameter gather: a batch of 60k pairs draws on a handful
+    # of distinct elements, so resolve each one once and index.
+    def gather(getter, side):
+        cache, out = {}, []
+        for pA, pB in pair_params:
+            p = pA if side == 0 else pB
+            key = p.Z
+            if key not in cache:
+                cache[key] = getter(p)
+            out.append(cache[key])
+        return np.array(out, dtype=np.float64)
+
+    mp_A = gather(_compute_multipole_params, 0)
+    da_A, qa_A, rho0A, rho1A, rho2A = mp_A.T
+    rho0B = gather(_compute_multipole_params, 1)[:, 2]
+
+    d_keys = ("dp", "ds", "dorbdorb", "rho3", "rho4", "rho5", "rho6")
+    dvals = gather(lambda p: [pyseqm_d_params(p)[k] for k in d_keys], 0)
+    dpA, dsA, ddA, rho3A, rho4A, rho5A, rho6A = dvals.T
+
+    rhoSS = (rho0A + rho0B) ** 2
+    rhoSDD0 = (rho3A + rho0B) ** 2
+    rhoSSP = (rho1A + rho0B) ** 2
+    rhoSPD = (rho4A + rho0B) ** 2
+    rhoSPP = (rho2A + rho0B) ** 2
+    rhoSSD = (rho5A + rho0B) ** 2
+    rhoSDD = (rho6A + rho0B) ** 2
+
+    qq = EV / np.sqrt(R ** 2 + rhoSS)
+    DDq_Sq = EV / np.sqrt(R ** 2 + rhoSDD0)
+    DPUz_Sq = (EV1 / np.sqrt((R + dpA) ** 2 + rhoSPD)
+               - EV1 / np.sqrt((R - dpA) ** 2 + rhoSPD))
+    SPUz_Sq = (EV1 / np.sqrt((R + da_A) ** 2 + rhoSSP)
+               - EV1 / np.sqrt((R - da_A) ** 2 + rhoSSP))
+    DDQ_Sq = (EV2 / np.sqrt((R - ddA) ** 2 + rhoSDD)
+              + EV2 / np.sqrt((R + ddA) ** 2 + rhoSDD)
+              - EV1 / np.sqrt(R ** 2 + ddA ** 2 + rhoSDD))
+    DSQ_Sq = (EV2 / np.sqrt((R - dsA) ** 2 + rhoSSD)
+              + EV2 / np.sqrt((R + dsA) ** 2 + rhoSSD)
+              - EV1 / np.sqrt(R ** 2 + dsA ** 2 + rhoSSD))
+    PPQ_Sq = (EV2 / np.sqrt((R - qa_A * 2.0) ** 2 + rhoSPP)
+              + EV2 / np.sqrt((R + qa_A * 2.0) ** 2 + rhoSPP)
+              - EV1 / np.sqrt(R ** 2 + da_A ** 2 + rhoSPP))
+
+    riYH = np.zeros((P, 45))
+    riYH[:, 10] = DSQ_Sq * 1.154701
+    riYH[:, 11] = DPUz_Sq * 1.154701
+    riYH[:, 14] = DDq_Sq + DDQ_Sq * 1.333333
+    riYH[:, 17] = DPUz_Sq
+    riYH[:, 20] = DDq_Sq + DDQ_Sq * 0.666667
+    riYH[:, 24] = DPUz_Sq
+    riYH[:, 27] = DDq_Sq + DDQ_Sq * 0.666667
+    riYH[:, 35] = DDq_Sq + DDQ_Sq * -1.333333
+    riYH[:, 44] = DDq_Sq + DDQ_Sq * -1.333333
+
+    ri_xh, _kinds = two_center_integrals_batch(pair_params, R_ang)
+
+    Z_A = np.array([float(pA.n_valence) for pA, _ in pair_params])
+    Z_B = np.array([float(pB.n_valence) for _, pB in pair_params])
+
+    core_local = np.zeros((P, 46))
+    core_local[:, 0] = Z_A * ri_xh[:, 0]
+    core_local[:, 1] = Z_B * ri_xh[:, 0]
+    core_local[:, 3] = Z_B * ri_xh[:, 3]
+    core_local[:, 7] = Z_B * ri_xh[:, 1]
+    core_local[:, 10] = Z_B * ri_xh[:, 2]
+    core_local[:, 15] = Z_B * riYH[:, 44]
+    core_local[:, 17] = Z_B * riYH[:, 17]
+    core_local[:, 21] = Z_B * riYH[:, 20]
+    core_local[:, 22] = Z_B * riYH[:, 10]
+    core_local[:, 25] = Z_B * riYH[:, 11]
+    core_local[:, 28] = Z_B * riYH[:, 14]
+
+    rotated = rotate_core(core_local[:, 1:], generate_rotation_matrix(xij), 3)
+
+    # e1b[i, j] = rotated[pack_index(i, j)] — the scalar's INDX[i] + j is the
+    # lower-triangle index, so the double loop is one gather.
+    return -rotated[:, index_matrix(9)]
