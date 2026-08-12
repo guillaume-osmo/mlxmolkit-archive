@@ -191,7 +191,7 @@ def rotate_pairs(pair_params, pair_coords):
     local-frame integrals, and each group is rotated in one vectorised call.
     """
     from .rotation import _rotation_matrix
-    from .two_center_integrals import two_center_integrals
+    from .two_center_integrals import two_center_integrals_batch
 
     n = len(pair_params)
     out = np.zeros((n, 4, 4, 4, 4))
@@ -202,12 +202,17 @@ def rotate_pairs(pair_params, pair_coords):
     r1 = np.zeros((n, 3))
     r2 = np.zeros((n, 3))
 
+    # All local-frame integrals in one call; the loop below only sorts the
+    # results into type groups and builds the rotation vectors.
+    dists = np.array([float(np.linalg.norm(rB - rA)) for rA, rB in pair_coords])
+    ri_all_pairs, kinds = two_center_integrals_batch(pair_params, dists)
+
     for idx, ((pA, pB), (rA, rB)) in enumerate(zip(pair_params, pair_coords)):
         delta = rB - rA
-        R = float(np.linalg.norm(delta))
+        R = float(dists[idx])
         if R < 1e-10:
             continue
-        ri, _core, pair_type = two_center_integrals(pA, pB, R)
+        ri, pair_type = ri_all_pairs[idx], kinds[idx]
         if pair_type == "HX":
             # A is the hydrogen. The scalar routine solves the pair the other
             # way round and transposes, so do the same: recompute in the
@@ -215,11 +220,11 @@ def rotate_pairs(pair_params, pair_coords):
             pA, pB = pB, pA
             rA, rB = rB, rA
             delta = rB - rA
-            ri, _core, pair_type = two_center_integrals(pA, pB, R)
+            pair_type = "XH"          # batch already solved it in this order
             swapped.append(idx)
         rot = _rotation_matrix(-delta / R)
         r0[idx], r1[idx], r2[idx] = rot[0], rot[1], rot[2]
-        ri_all[idx, :len(ri)] = ri
+        ri_all[idx, :ri.size] = ri
         groups[pair_type].append(idx)
 
     for pair_type, idxs in groups.items():
