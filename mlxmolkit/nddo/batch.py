@@ -264,6 +264,24 @@ def prepare_batch(
     if _sp_keys:
         pair_overlap.update(zip(_sp_keys, overlap_pairs(_sp_specs)))
 
+    # Pack every sp pair's two-electron block in bulk, grouped by orbital
+    # widths. pack() called per pair was 132 ms across 64640 calls on an
+    # 800-molecule batch; the index map is the same for every pair of a given
+    # shape, so each shape is one scatter.
+    from .packing import pack_batch
+    pair_packed: dict = {}
+    by_shape: dict[tuple, list] = {}
+    for key, (pA, pB, _rA, _rB) in zip(_sp_keys, _sp_specs):
+        dense = pair_w.get(key)
+        if dense is None:
+            continue
+        by_shape.setdefault((pA.n_basis, pB.n_basis), []).append((key, dense))
+    for (nA, nB), items in by_shape.items():
+        stack = np.stack([d[:nA, :nA, :nB, :nB] for _k, d in items])
+        packed = pack_batch(stack, nA, nB)
+        for pos, (key, _d) in enumerate(items):
+            pair_packed[key] = packed[pos]
+
     for mol_idx, (atoms, coords) in enumerate(molecules):
         coords = np.array(coords, dtype=np.float64)
         n_at = len(atoms)
@@ -374,10 +392,12 @@ def prepare_batch(
         # ~24 MB, and sp-only methods travel the same path as the small case.
         for i in range(n_at):
             for j in range(i + 1, n_at):
-                block = _two_centre_packed(params[i], params[j],
-                                           coords[i], coords[j],
-                                           dense=pair_w.get((mol_idx, i, j)),
-                                           tetci=pair_tetci.get((mol_idx, i, j)))
+                block = pair_packed.get((mol_idx, i, j))
+                if block is None:
+                    block = _two_centre_packed(
+                        params[i], params[j], coords[i], coords[j],
+                        dense=pair_w.get((mol_idx, i, j)),
+                        tetci=pair_tetci.get((mol_idx, i, j)))
                 off_ij = pair_cursor[mol_idx]
                 w_packed_rows[mol_idx].append(block.ravel())
                 pair_offset_all[mol_idx, i, j] = off_ij
