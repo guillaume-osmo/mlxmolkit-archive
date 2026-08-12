@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, EV_TO_KCAL
 from .overlap import overlap_molecular_frame
 from .rotation import rotate_integrals_to_molecular_frame
-from .integrals import compute_nuclear_repulsion
+from .integrals import compute_nuclear_repulsion, nuclear_repulsion_for_method
 
 
 @dataclass
@@ -50,6 +50,7 @@ def prepare_batch(
     molecules: list[tuple[list[int], np.ndarray]],
     param_dict: dict = None,
     molecular_charges: list[float] | None = None,
+    method: str = 'RM1',
 ) -> RM1Batch:
     """Pre-compute all integrals for a batch of molecules.
 
@@ -58,6 +59,9 @@ def prepare_batch(
             atoms: list of atomic numbers
             coords: (n_atoms, 3) array in Angstrom
         param_dict: parameter dictionary (default: RM1_PARAMS)
+        method: NDDO method name — selects the core-core repulsion form. Must
+            match the method `param_dict` came from, or PM6/PM6_D energies
+            come out several eV wrong.
 
     Returns:
         RM1Batch with all pre-computed data
@@ -211,7 +215,8 @@ def prepare_batch(
         H_core_all[mol_idx, :n_bas, :n_bas] = H
 
         # Nuclear repulsion
-        E_nuc_arr[mol_idx] = compute_nuclear_repulsion(atoms, coords, param_dict=param_dict)
+        E_nuc_arr[mol_idx] = nuclear_repulsion_for_method(
+            atoms, coords, param_dict, method)
 
     return RM1Batch(
         n_mols=N,

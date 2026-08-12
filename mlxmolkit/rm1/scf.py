@@ -27,6 +27,7 @@ from .methods import get_params, METHOD_PARAMS
 from .integrals import (
     compute_one_center_integrals,
     compute_nuclear_repulsion,
+    nuclear_repulsion_for_method,
     _additive_terms,
     _charge_separations,
     EV,
@@ -976,11 +977,7 @@ def nddo_energy(
     # (PM6_D previously fell through to the AM1-style term, corrupting the heat-of-formation
     #  by ~11 eV even for CHNO molecules with no d-orbitals — the electronic energy/density
     #  were already correct, only this core-core term was wrong.)
-    if method in ('PM6', 'PM6_SP', 'PM6_D'):
-        from .pwcct import pm6_nuclear_repulsion
-        E_nuc = pm6_nuclear_repulsion(atoms, coords, PARAMS)
-    else:
-        E_nuc = compute_nuclear_repulsion(atoms, coords, param_dict=PARAMS)
+    E_nuc = nuclear_repulsion_for_method(atoms, coords, PARAMS, method)
 
     # Total energy
     E_total = E_elec + E_nuc
@@ -1105,7 +1102,49 @@ def nddo_energy_batch(
                 print(f"  all-MLX batch SCF unavailable; falling back to legacy batch path: {exc}")
 
     # Pre-compute all integrals (CPU, done once)
-    batch = prepare_batch(molecules, param_dict=PARAMS, molecular_charges=molecular_charges)
+    # The batched integral path is sp-only: prepare_batch stores the
+    # two-center w tensor as 4**4 = 256 doubles per atom pair and
+    # rotate_integrals_to_molecular_frame returns 4x4 blocks, so a method that
+    # gives an element d orbitals (PM6_D on P, S, Cl, Br, I -> 9 basis
+    # functions) does not fit and walks off the end of H with
+    # "IndexError: index 4 is out of bounds for axis 1 with size 4".
+    #
+    # Route those molecules through the sequential solver, which does handle d
+    # orbitals, and batch the rest. Correct results for everything; the
+    # d-orbital subset simply does not get the GPU speedup.
+    charges_in = (list(molecular_charges) if molecular_charges is not None
+                  else [0.0] * N)
+    d_positions = [i for i, (mol_atoms, _) in enumerate(molecules)
+                   if any(PARAMS[z].n_basis > 4 for z in mol_atoms)]
+    if d_positions:
+        d_set = set(d_positions)
+        sp_positions = [i for i in range(N) if i not in d_set]
+        merged: list[dict] = [None] * N
+        if sp_positions:
+            # Nothing here has d orbitals, so this cannot recurse again.
+            sp_results = nddo_energy_batch(
+                [molecules[i] for i in sp_positions],
+                max_iter=max_iter, conv_tol=conv_tol, use_metal=use_metal,
+                verbose=verbose, method=method,
+                molecular_charges=[charges_in[i] for i in sp_positions],
+                density_solver=density_solver,
+            )
+            for pos, res in zip(sp_positions, sp_results):
+                merged[pos] = res
+        if verbose:
+            print(f"  {len(d_positions)}/{N} molecules contain d-orbital "
+                  f"elements under {method}; solving those sequentially")
+        for i in d_positions:
+            mol_atoms, mol_coords = molecules[i]
+            merged[i] = nddo_energy(
+                mol_atoms, mol_coords, max_iter=max_iter, conv_tol=conv_tol,
+                verbose=False, method=method, molecular_charge=charges_in[i],
+            )
+        return merged
+
+    batch = prepare_batch(molecules, param_dict=PARAMS,
+                          molecular_charges=molecular_charges,
+                          method=method)
     MB = batch.max_basis
 
     # Initial density: MOPAC-style neutral-atom diagonal guess (matches the
@@ -1342,7 +1381,9 @@ def rm1_energy_batch_mlx(
     if N == 0:
         return []
 
-    batch = prepare_batch(molecules, param_dict=PARAMS, molecular_charges=molecular_charges)
+    batch = prepare_batch(molecules, param_dict=PARAMS,
+                          molecular_charges=molecular_charges,
+                          method=method)
     MB = batch.max_basis
 
     # Initial density: MOPAC-style neutral-atom diagonal guess — same as the
