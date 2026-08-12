@@ -450,7 +450,32 @@ def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB, w=None):
     return F
 
 
-def _build_fock(H, P, info, atoms, coords):
+
+def precompute_pair_w(atoms, coords, info):
+    """Rotated two-centre tensors for every sp pair of a fixed geometry.
+
+    The rotation depends on the atom parameters and the geometry, never on the
+    density, so it is constant for the whole SCF — yet _build_fock re-derived
+    it at every iteration. On menthol that was ~7000 scalar rotations per
+    single point, half the cost of a gradient.
+
+    d-bearing pairs are omitted: they take a different integral routine, and a
+    missing key simply falls back to computing that pair as before.
+    """
+    from .rotation_batch import rotate_pairs
+
+    params = info['params']
+    n_atoms = len(atoms)
+    sp = [(i, j) for i in range(n_atoms) for j in range(i + 1, n_atoms)
+          if params[i].n_basis <= 4 and params[j].n_basis <= 4]
+    if not sp:
+        return {}
+    ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
+                      [(coords[i], coords[j]) for i, j in sp])
+    return {pair: ws[k] for k, pair in enumerate(sp)}
+
+
+def _build_fock(H, P, info, atoms, coords, pair_w=None):
     """Build Fock matrix F = H + G(P).
 
     Two contributions:
@@ -561,8 +586,10 @@ def _build_fock(H, P, info, atoms, coords):
     # === Two-center contribution (full 10x10 w tensor) ===
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
-            F = _pair_fock_twocentre(F, P, params[i], params[j],
-                                     starts[i], starts[j], coords[i], coords[j])
+            F = _pair_fock_twocentre(
+                F, P, params[i], params[j], starts[i], starts[j],
+                coords[i], coords[j],
+                w=None if pair_w is None else pair_w.get((i, j)))
 
     return F
 
@@ -890,7 +917,11 @@ def nddo_energy(
                 atom_starts_metal, ssss.astype(np.float32),
                 n_basis, n_atoms,
             )
-        return _build_fock(H, P, info, atoms, coords)
+        return _build_fock(H, P, info, atoms, coords, pair_w=_pair_w)
+
+    # The two-centre rotations are fixed for this geometry, so they are
+    # built once here instead of at every iteration of the loop below.
+    _pair_w = precompute_pair_w(atoms, coords, info)
 
     # DIIS (Direct Inversion in the Iterative Subspace) storage
     diis_max = 6

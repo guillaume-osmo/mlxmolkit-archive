@@ -89,63 +89,29 @@ def nddo_gradient_batch(
     molecules = normalized_molecules
     N = len(molecules)
 
-    # Build all displaced geometries
-    # For each molecule: 1 center + 6*n_atoms displaced = 6*n_atoms+1 evals
-    all_mols = []
-    all_charges = []
-    mol_info = []  # (mol_idx, n_atoms, center_idx, grad_start_idx)
+    # The reference geometries are solved in a single batched SCF; each
+    # molecule's gradient then comes from its own converged density by the
+    # frozen-density route.
+    #
+    # This used to batch the *numerical* gradient instead: a full SCF at each
+    # of the 6N+1 displaced geometries, all in one dispatch. Batching does not
+    # rescue that — 10 small molecules cost 13.4 s each batched against 1.5 s
+    # each solved one at a time by the frozen-density route, because the
+    # batched version was doing 55 full SCFs per molecule where the other does
+    # one. Batch the cheap algorithm, not the expensive one.
+    from .anal_grad import analytical_gradient
 
-    idx = 0
-    for mol_idx, (atoms, coords) in enumerate(molecules):
-        charge = charge_values[mol_idx]
-        coords = np.asarray(coords, dtype=np.float64)
-        n_at = len(atoms)
-        center_idx = idx
+    scf = nddo_energy_batch(molecules, method=method, use_metal=True,
+                            molecular_charges=charge_values)
 
-        # Center geometry
-        all_mols.append((atoms, coords))
-        all_charges.append(charge)
-        idx += 1
-
-        grad_start = idx
-        # +/- displacements
-        for i in range(n_at):
-            for j in range(3):
-                cp = coords.copy(); cp[i, j] += step
-                all_mols.append((atoms, cp))
-                all_charges.append(charge)
-                idx += 1
-                cm = coords.copy(); cm[i, j] -= step
-                all_mols.append((atoms, cm))
-                all_charges.append(charge)
-                idx += 1
-
-        mol_info.append((mol_idx, n_at, center_idx, grad_start))
-
-    # One batch call for ALL displaced geometries
-    results = nddo_energy_batch(
-        all_mols,
-        method=method,
-        use_metal=True,
-        molecular_charges=all_charges,
-    )
-
-    # Extract energies and gradients
     energies = np.zeros(N)
     gradients = []
-
-    for mol_idx, n_at, center_idx, grad_start in mol_info:
-        energies[mol_idx] = results[center_idx]['energy_eV']
-
-        grad = np.zeros((n_at, 3))
-        k = grad_start
-        for i in range(n_at):
-            for j in range(3):
-                Ep = results[k]['energy_eV']
-                Em = results[k + 1]['energy_eV']
-                grad[i, j] = (Ep - Em) / (2.0 * step)
-                k += 2
-
+    for idx, ((atoms, coords), result) in enumerate(zip(molecules, scf)):
+        res, grad = analytical_gradient(
+            atoms, np.asarray(coords, dtype=np.float64), method=method,
+            molecular_charge=charge_values[idx], scf_result=result,
+        )
+        energies[idx] = res['energy_eV']
         gradients.append(grad)
 
     return energies, gradients

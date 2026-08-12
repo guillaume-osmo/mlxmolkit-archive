@@ -103,6 +103,7 @@ def analytical_gradient(
     method: str = 'RM1',
     step: float = 1e-5,
     molecular_charge: float = 0.0,
+    scf_result: dict | None = None,
 ) -> tuple[dict, np.ndarray]:
     """Compute energy and gradient.
 
@@ -119,7 +120,10 @@ def analytical_gradient(
     coords = np.asarray(coords, dtype=np.float64)
     n_atoms = len(atoms)
 
-    result = nddo_energy(
+    # `scf_result` lets a batched caller solve every molecule's SCF in one
+    # dispatch and hand the converged density in, rather than each gradient
+    # re-solving its own.
+    result = scf_result if scf_result is not None else nddo_energy(
         atoms, coords, method=method, max_iter=200, conv_tol=1e-8,
         molecular_charge=molecular_charge,
     )
