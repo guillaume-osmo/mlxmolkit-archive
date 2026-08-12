@@ -251,6 +251,35 @@ def compute_core_hamiltonian(
     return H
 
 
+# Methods whose core-core term is the PM6 pairwise-corrected (PWCCT) form
+# rather than the AM1-style Gaussian-augmented one.
+PM6_CORE_CORE_METHODS = frozenset({'PM6', 'PM6_D'})
+
+
+def nuclear_repulsion_for_method(
+    atoms: list[int],
+    coords: np.ndarray,
+    params: dict,
+    method: str,
+) -> float:
+    """Core-core repulsion for ``method`` — the single dispatch point.
+
+    Which core-core term a method uses is a property of the method, not of the
+    call site. The rule was spelled out separately in ``scf.nddo_energy`` and
+    ``anal_grad``, and missing entirely from ``batch.prepare_batch``: the
+    batched path always took the AM1-style branch, so batched PM6/PM6_SP/PM6_D
+    total energies were wrong by several eV (~100-260 kcal/mol of heat of
+    formation) while the electronic energy and density were correct.
+
+    Route every core-core evaluation through here so the three paths cannot
+    drift apart again.
+    """
+    if method in PM6_CORE_CORE_METHODS:
+        from .pwcct import pm6_nuclear_repulsion
+        return pm6_nuclear_repulsion(atoms, coords, params)
+    return compute_nuclear_repulsion(atoms, coords, param_dict=params)
+
+
 def compute_nuclear_repulsion(
     atoms: list[int],
     coords: np.ndarray,

@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 from .scf import nddo_energy
 from .methods import get_params
-from .integrals import compute_nuclear_repulsion
+from .integrals import compute_nuclear_repulsion, nuclear_repulsion_for_method
 
 
 def analytical_gradient(
@@ -98,10 +98,6 @@ def _energy_frozen_density(atoms, coords, P, PARAMS, method='RM1', molecular_cha
 
     # Nuclear repulsion — PM6 variants use the PWCCT core-core (must match scf.py so the
     # frozen-density gradient is consistent with the energy it differentiates).
-    if method in ('PM6', 'PM6_SP', 'PM6_D'):
-        from .pwcct import pm6_nuclear_repulsion
-        E_nuc = pm6_nuclear_repulsion(atoms, coords, PARAMS)
-    else:
-        E_nuc = compute_nuclear_repulsion(atoms, coords, param_dict=PARAMS)
+    E_nuc = nuclear_repulsion_for_method(atoms, coords, PARAMS, method)
 
     return E_elec + E_nuc
