@@ -130,6 +130,79 @@ def _tetci_pair_w(p1, p2, coord1, coord2):
     return w[0], (p1.Z >= p2.Z)
 
 
+
+def _tetci_pairs_w(pair_specs):
+    """Packed 45x45 two-electron blocks for MANY pairs, in one TETCI call.
+
+    ``two_elec_two_center_int`` is vectorised over a pair axis — its own
+    docstring says "ni, nj, xij, rij for each pair" — but :func:`_tetci_pair_w`
+    hands it a two-atom system carrying exactly one pair, so the vectorisation
+    is wasted. At 2.58 ms per pair that made d-bearing molecules cost more than
+    twice their sp equivalents in a batch.
+
+    Every pair becomes its own disjoint two-atom fragment in one system:
+    atoms are laid out [A0, B0, A1, B1, ...] and the pair list is
+    idxi = [0, 2, 4, ...], idxj = [1, 3, 5, ...]. Only ``xij`` and ``rij``
+    reach the integrals, so fragments do not interact and their absolute
+    placement is irrelevant.
+
+    Args:
+        pair_specs: sequence of (pA, pB, coordA, coordB).
+
+    Returns:
+        list of (w, first_is_A) matching :func:`_tetci_pair_w` pair by pair.
+    """
+    from ._pyseqm_port.two_elec_two_center_int_np import two_elec_two_center_int
+    from ._pyseqm_port import constants_np
+
+    if not pair_specs:
+        return []
+
+    Zs, coords, order = [], [], []
+    for p1, p2, c1, c2 in pair_specs:
+        first_is_A = p1.Z >= p2.Z
+        pa, pb = (p1, p2) if first_is_A else (p2, p1)
+        ca, cb = (c1, c2) if first_is_A else (c2, c1)
+        Zs.extend([int(pa.Z), int(pb.Z)])
+        coords.extend([np.asarray(ca, dtype=np.float64),
+                       np.asarray(cb, dtype=np.float64)])
+        order.append(first_is_A)
+
+    n_pairs = len(pair_specs)
+    idxi = np.arange(0, 2 * n_pairs, 2, dtype=np.int64)
+    idxj = idxi + 1
+    Z = np.asarray(Zs, dtype=np.int64)
+    coords_arr = np.asarray(coords, dtype=np.float64)
+    diff = coords_arr[idxj] - coords_arr[idxi]
+    R_ang = np.linalg.norm(diff, axis=1)
+    rij = R_ang * ANG_TO_BOHR
+    xij = diff / R_ang[:, None]
+
+    csv = _load_pm6_csv_params()
+    def col(name):
+        return np.asarray([csv[z].get(name, 0.0) for z in Zs], dtype=np.float64)
+
+    zetas, zetap, zetad = col('zeta_s'), col('zeta_p'), col('zeta_d')
+    zs, zp, zd = col('s_orb_exp_tail'), col('p_orb_exp_tail'), col('d_orb_exp_tail')
+    zs = np.where(zs > 0, zs, zetas)
+    zp = np.where(zp > 0, zp, np.where(zetap > 0, zetap, zetas))
+    zd = np.where(zd > 0, zd, np.where(zetad > 0, zetad, zetas))
+
+    class FakeConst:
+        qn = constants_np.qn_int
+        qnD_int = constants_np.qnD_int
+        tore = np.array([0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+                         0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0] + [0.0] * 60)
+
+    w, _e1b, _e2a, _a, _b, _c, _d = two_elec_two_center_int(
+        FakeConst(), idxi, idxj, Z[idxi], Z[idxj], xij, rij, Z,
+        zetas, zetap, zetad, zs, zp, zd,
+        col('g_ss'), col('g_pp'), col('g_p2'), col('h_sp'),
+        col('F0SD'), col('G2SD'), col('rho_core'), col('alpha'),
+        np.zeros_like(zetas), 'PM6')
+    return [(w[k], order[k]) for k in range(n_pairs)]
+
+
 # Lower-triangle packing for 9x9 — PYSEQM convention (i, j) with i >= j
 _TRIL9_I = np.array([i for i in range(9) for j in range(i + 1)])
 _TRIL9_J = np.array([j for i in range(9) for j in range(i + 1)])
