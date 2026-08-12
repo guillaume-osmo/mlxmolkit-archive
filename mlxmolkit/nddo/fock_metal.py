@@ -14,6 +14,8 @@ from __future__ import annotations
 import numpy as np
 import mlx.core as mx
 
+from .packing import packed_size, unpack
+
 
 _FOCK_BATCH_SOURCE = """
 uint tid = thread_position_in_grid.x;
@@ -21,10 +23,8 @@ int n_mols = (int)config[0];
 int MB = (int)config[1];      // max_basis (padded)
 int MA = (int)config[2];      // max_atoms (padded)
 int MO = (int)config[3];      // widest per-atom basis: 4 for sp, 9 with d
+int WSTRIDE = (int)config[4]; // per-molecule packed two-centre buffer length
 int MB2 = MB * MB;
-int MO2 = MO * MO;
-int MO3 = MO2 * MO;
-int MO4 = MO3 * MO;
 
 if (tid >= (uint)(n_mols * MB2)) return;
 
@@ -47,7 +47,8 @@ int mol_MB2 = mol * MB2;
 int mol_MA  = mol * (MA + 1);
 int mol_MA5 = mol * MA * 5;
 int mol_MB  = mol * MB;
-int mol_W   = mol * MA * MA * MO4;
+int mol_W   = mol * WSTRIDE;
+int mol_MA2 = mol * MA * MA;
 
 // Atom info for mu and nu
 int atom_mu = atom_map[mol_MB + mu];
@@ -84,8 +85,11 @@ if (atom_mu == atom_nu) {
                 for (int k = 1; k < 4; k++)
                     Ppp += P[mol_MB2 + (s+k)*MB + (s+k)];
                 f += P_self * gss * 0.5f + Ppp * (gsp - 0.5f * hsp);
-            } else {
-                // p orbital: PYSEQM factors
+            } else if (type_mu < 4) {
+                // p orbital: PYSEQM factors. Guarded to type < 4 — on a
+                // 9-orbital atom types 4-8 are d, and the sp formulas do not
+                // apply to them; their one-centre terms come from the W
+                // integrals below instead.
                 float Pss = P[mol_MB2 + s*MB + s];
                 float Ppp_total = 0.0f;
                 for (int k = 1; k < 4; k++)
@@ -99,7 +103,9 @@ if (atom_mu == atom_nu) {
         }
     } else {
         // Off-diagonal, same atom
-        if (n_orb > 1) {
+        // Same guard as the diagonal: any pair touching a d orbital is
+        // handled by the W integrals, not by the sp factors.
+        if (n_orb > 1 && type_mu < 4 && type_nu < 4) {
             float Pmn = P[mol_MB2 + mu*MB + nu];
             if ((type_mu == 0) != (type_nu == 0)) {
                 // s-p: sp_fac_2 = 1.5*hsp - 0.5*gsp
@@ -115,10 +121,39 @@ if (atom_mu == atom_nu) {
 }
 
 // =========================================================
-// TWO-CENTER: Coulomb + Exchange using full w tensor
+// ONE-CENTER d: the s-d, p-d and d-d cross terms
 // =========================================================
-// w tensor layout: w[mol, atom_i, atom_j, k*MO3 + l*MO2 + m*MO + n]
-//   where k,l index on atom_i (0..3), m,n on atom_j (0..3)
+// Additive on top of the sp formulas above, which already cover orbitals
+// 0-3 of a 9-orbital atom. Each thread evaluates exactly the packed element
+// it owns, so the sparse PM6 F-local map becomes a short CSR walk.
+if (atom_mu == atom_nu) {
+    int a = atom_mu;
+    int a_start = atom_starts[mol_MA + a];
+    int n_orb = atom_starts[mol_MA + a + 1] - a_start;
+    if (n_orb == 9) {
+        int mo = mu - a_start;
+        int no = nu - a_start;
+        int col = (mo >= no) ? (mo * (mo + 1) / 2 + no) : (no * (no + 1) / 2 + mo);
+        int wbase = (mol * MA + a) * 243;
+        float acc = 0.0f;
+        for (int e = flocal_start[col]; e < flocal_start[col + 1]; e++) {
+            int pi = flocal_p[e];
+            int ii = tril_i[pi];
+            int jj = tril_j[pi];
+            float weight = (ii == jj) ? 1.0f : 2.0f;
+            acc += atom_w[wbase + flocal_w[e]]
+                 * P[mol_MB2 + (a_start + ii) * MB + (a_start + jj)] * weight;
+        }
+        f += acc;
+    }
+}
+
+// =========================================================
+// TWO-CENTER: Coulomb + Exchange using the packed w blocks
+// =========================================================
+// Packed layout: pair_offset[mol, i, j] gives the start of the (i, j) block
+// inside this molecule's buffer. A block is (packed(nA), packed(nB)) row
+// major, packed(n) = n(n+1)/2, and the pair index is the lower-triangle one.
 
 int mu_off = mu - atom_starts[mol_MA + atom_mu];
 int nu_off = nu - atom_starts[mol_MA + atom_nu];
@@ -131,15 +166,17 @@ if (atom_mu == atom_nu) {
         int b_start = atom_starts[mol_MA + b];
         int b_end = atom_starts[mol_MA + b + 1];
         int nB = b_end - b_start;
-        // w index for pair (atom_mu, b)
-        int w_base = mol_W + atom_mu * MA * MO4 + b * MO4;
+        int w_base = mol_W + pair_offset[mol_MA2 + atom_mu * MA + b];
+        int pB = nB * (nB + 1) / 2;
+        int row = ((mu_off >= nu_off) ? (mu_off * (mu_off + 1) / 2 + nu_off)
+                                      : (nu_off * (nu_off + 1) / 2 + mu_off)) * pB;
         for (int ls = 0; ls < nB; ls++) {
             for (int ss = 0; ss < nB; ss++) {
                 int lam = b_start + ls;
                 int sig = b_start + ss;
-                // w[mu_off, nu_off, ls, ss]
-                int w_idx = mu_off * MO3 + nu_off * MO2 + ls * MO + ss;
-                f += P[mol_MB2 + lam * MB + sig] * w[w_base + w_idx];
+                int col = (ls >= ss) ? (ls * (ls + 1) / 2 + ss)
+                                     : (ss * (ss + 1) / 2 + ls);
+                f += P[mol_MB2 + lam * MB + sig] * w[w_base + row + col];
             }
         }
     }
@@ -162,14 +199,17 @@ if (atom_mu == atom_nu) {
     // F[mu_A, lam_B] -= 0.5 * sum_{nu_A on A, sig_B on B} P[nu_A, sig_B] * w[A,B,mu_off,nu_off_A,lam_off_B,sig_off_B]
     // But w is stored as w[A,B, kk,ll, mm,nn] where kk,ll are on A and mm,nn on B
     float exch = 0.0f;
-    int w_base = mol_W + a * MA * MO4 + b * MO4;
+    int w_base = mol_W + pair_offset[mol_MA2 + a * MA + b];
+    int pB = nB * (nB + 1) / 2;
     for (int nA_off = 0; nA_off < nA; nA_off++) {
         for (int sB_off = 0; sB_off < nB; sB_off++) {
             int nu_global = a_start + nA_off;
             int sig_global = b_start + sB_off;
-            // w[A,B, mu_off, nA_off, lam_off, sB_off]
-            int w_idx = mu_off * MO3 + nA_off * MO2 + lam_off * MO + sB_off;
-            exch += P[mol_MB2 + nu_global * MB + sig_global] * w[w_base + w_idx];
+            int row = ((mu_off >= nA_off) ? (mu_off * (mu_off + 1) / 2 + nA_off)
+                                          : (nA_off * (nA_off + 1) / 2 + mu_off)) * pB;
+            int col = (lam_off >= sB_off) ? (lam_off * (lam_off + 1) / 2 + sB_off)
+                                          : (sB_off * (sB_off + 1) / 2 + lam_off);
+            exch += P[mol_MB2 + nu_global * MB + sig_global] * w[w_base + row + col];
         }
     }
     f -= 0.5f * exch;
@@ -179,6 +219,27 @@ F_out[tid] = f;
 """
 
 _fock_batch_kernel = None
+
+
+
+def _flocal_csr():
+    """Flatten PM6_FLOCAL_MAP into CSR arrays the kernel can walk.
+
+    The map is a fixed sparse contraction: each of the 45 packed Fock elements
+    on a d atom is a short sum over one-centre W integrals times packed density
+    elements. Flattened once here so a thread can evaluate only its own element.
+    """
+    from .fock_d import PM6_FLOCAL_MAP, TRIL_I, TRIL_J
+
+    start = np.zeros(46, dtype=np.int32)
+    w_idx, p_idx = [], []
+    for col, ws, ps in PM6_FLOCAL_MAP:
+        start[col + 1] = len(ws)
+        w_idx.extend(ws)
+        p_idx.extend(ps)
+    start = np.cumsum(start).astype(np.int32)
+    return (start, np.array(w_idx, dtype=np.int32), np.array(p_idx, dtype=np.int32),
+            TRIL_I.astype(np.int32), TRIL_J.astype(np.int32))
 
 
 def _get_fock_batch_kernel():
@@ -193,7 +254,10 @@ def _get_fock_batch_kernel():
             name="rm1_fock_batch",
             input_names=["H_core", "P", "w", "atom_params",
                          "atom_map", "type_map", "atom_starts",
-                         "n_atoms_arr", "n_basis_arr", "config"],
+                         "n_atoms_arr", "n_basis_arr", "config",
+                         "pair_offset", "atom_w",
+                         "flocal_start", "flocal_w", "flocal_p",
+                         "tril_i", "tril_j"],
             output_names=["F_out"],
             source=_FOCK_BATCH_SOURCE,
         )
@@ -223,8 +287,16 @@ class MetalFockContext:
         self._atom_starts = mx.array(batch.atom_starts.flatten().astype(np.int32))
         self._n_atoms_arr = mx.array(batch.n_atoms_arr.astype(np.int32))
         self._n_basis_arr = mx.array(batch.n_basis_arr.astype(np.int32))
-        self._config = mx.array(np.array([N, MB, MA, batch.max_orb],
-                                        dtype=np.float32))
+        self._pair_offset = mx.array(batch.pair_offset.flatten().astype(np.int32))
+        self._atom_w = mx.array(batch.atom_w.flatten().astype(np.float32))
+        fs, fw, fp, ti, tj = _flocal_csr()
+        self._flocal_start = mx.array(fs)
+        self._flocal_w = mx.array(fw)
+        self._flocal_p = mx.array(fp)
+        self._tril_i = mx.array(ti)
+        self._tril_j = mx.array(tj)
+        self._config = mx.array(np.array(
+            [N, MB, MA, batch.max_orb, batch.w.shape[1]], dtype=np.float32))
         self._kernel = _get_fock_batch_kernel()
 
     def build_fock(self, P: np.ndarray) -> np.ndarray:
@@ -260,6 +332,9 @@ class MetalFockContext:
                 self._atom_params, self._atom_map, self._type_map,
                 self._atom_starts, self._n_atoms_arr, self._n_basis_arr,
                 self._config,
+                self._pair_offset, self._atom_w,
+                self._flocal_start, self._flocal_w, self._flocal_p,
+                self._tril_i, self._tril_j,
             ],
             output_shapes=[(self.n_elements,)],
             output_dtypes=[mx.float32],
@@ -339,6 +414,14 @@ def build_fock_batch_cpu(batch) -> np.ndarray:
                         F[pk, pl] += P[pk, pl] * pp_fac_off
                         F[pl, pk] += P[pl, pk] * pp_fac_off
 
+        # One-centre d contribution. The sp formulas above already cover
+        # orbitals 0-3 of a 9-orbital atom correctly; the W integrals add the
+        # s-d, p-d and d-d cross terms on top rather than replacing anything.
+        for a in range(n_at):
+            if starts[a + 1] - starts[a] == 9:
+                from .fock_d import fock_d_one_center
+                F = fock_d_one_center(F, P, batch.atom_w[mol, a], starts[a])
+
         # Two-center: full w tensor
         for a in range(n_at):
             for b in range(a + 1, n_at):
@@ -346,8 +429,13 @@ def build_fock_batch_cpu(batch) -> np.ndarray:
                 sB = starts[b]
                 nA = starts[a + 1] - sA
                 nB = starts[b + 1] - sB
-                MO = batch.max_orb
-                w = batch.w[mol, a, b].reshape(MO, MO, MO, MO)
+                # Packed pair block -> dense (nA, nA, nB, nB) for the loop
+                # below. The reference path keeps the dense contraction; only
+                # the storage changed.
+                off = int(batch.pair_offset[mol, a, b])
+                pa, pb = packed_size(nA), packed_size(nB)
+                w = unpack(batch.w[mol, off:off + pa * pb].reshape(pa, pb),
+                           nA, nB)
 
                 for mu_a in range(nA):
                     for nu_a in range(nA):

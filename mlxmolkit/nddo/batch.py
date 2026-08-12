@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, EV_TO_KCAL
 from .overlap import overlap_molecular_frame
 from .rotation import rotate_integrals_to_molecular_frame
+from .packing import pack, packed_size, unpack
+from .scf import _pair_resonance_block, _pair_core_attraction
 from .integrals import compute_nuclear_repulsion, nuclear_repulsion_for_method
 
 
@@ -30,12 +32,18 @@ class RM1Batch:
 
     # Padded matrices (N, MB, MB) — MB = max_basis
     H_core: np.ndarray         # (N, MB, MB) core Hamiltonian
-    # Two-center w tensor (N, MA, MA, MO, MO, MO, MO) flattened last 4 dims,
-    # where MO is the largest per-atom orbital count in the batch: 4 for an
-    # sp basis, 9 once any atom carries d orbitals. Blocks for atoms with
-    # fewer orbitals are zero-padded up to MO, so the stride is uniform.
-    w: np.ndarray              # (N, MA, MA, MO**4)
-    max_orb: int               # MO
+    # Two-centre integrals, lower-triangle packed per atom pair. `w` is a flat
+    # buffer; `pair_offset[m, i, j]` is where the (i, j) block starts in it, or
+    # -1 if there is none. A block is (packed(nA), packed(nB)) row-major, where
+    # packed(n) = n(n+1)/2 — 1 for hydrogen, 10 for an sp atom, 45 with d.
+    # Sizing each pair by its own two atoms rather than padding to the widest
+    # atom in the batch is what keeps a PM6 batch containing sulfur in tens of
+    # megabytes instead of gigabytes.
+    w: np.ndarray              # (N, max_pair_storage) float64
+    atom_w: np.ndarray         # (N, MA, 243) one-centre d integrals
+    pair_offset: np.ndarray    # (N, MA, MA) int32
+    atom_norb: np.ndarray      # (N, MA) int32 — orbitals per atom
+    max_orb: int               # widest per-atom basis in the batch
 
     # Per-atom parameters for Fock kernel
     atom_params: np.ndarray    # (N, MA, 5) [gss,gsp,gpp,gp2,hsp]
@@ -48,6 +56,59 @@ class RM1Batch:
 
     # Coords for reference
     coords_list: list          # list of coords arrays
+
+
+
+
+def _one_centre_w(p) -> np.ndarray:
+    """The 243 one-centre two-electron integrals for a d-bearing atom.
+
+    A function of the atom's Slater exponents alone, so it is constant across
+    the SCF and across geometries — computed once per atom when the batch is
+    prepared. Mirrors what the sequential solver does per iteration.
+    """
+    from .tetci_multipole_pyseqm import PM6_TAIL_EXPONENTS
+    from .w_integrals import compute_w_integrals
+    from .params import principal_qn
+
+    qn = principal_qn(p.Z)
+    if p.Z in PM6_TAIL_EXPONENTS:
+        zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
+    else:
+        zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d
+    return compute_w_integrals(zs_t, zp_t, zd_t, qn, qn,
+                               getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0))
+
+
+def _two_centre_packed(pA, pB, rA, rB) -> np.ndarray:
+    """Packed two-electron block for one atom pair, (packed(nA), packed(nB)).
+
+    Two sources, one output convention:
+
+    * pairs where either atom carries d orbitals come from the vendored TETCI
+      port, which already computes in the packed convention — the dense (9,9,9,9)
+      expansion that ``d_two_center`` builds is undone immediately afterwards, so
+      the packed tensor is taken directly and the round-trip is skipped;
+    * everything else comes from the sp rotation, which returns dense, and is
+      packed here.
+
+    The two packings nest — for orbitals below 4 the 9-basis index equals the
+    4-basis one — so both land in the same convention with no branch downstream.
+    """
+    nA, nB = pA.n_basis, pB.n_basis
+
+    if nA == 9 or nB == 9:
+        from .d_two_center import _tetci_pair_w
+        w, first_is_A = _tetci_pair_w(pA, pB, rA, rB)
+        if w is not None:
+            pa, pb = packed_size(nA), packed_size(nB)
+            # TETCI indexes [second centre pair, first centre pair].
+            return (w.T[:pa, :pb] if first_is_A else w[:pa, :pb]).copy()
+
+    dense, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    # The rotation pads every centre to its shell width — hydrogen comes back
+    # 4-wide — so trim to the orbitals that actually exist before packing.
+    return pack(dense[:nA, :nA, :nB, :nB], nA, nB)
 
 
 def prepare_batch(
@@ -116,7 +177,16 @@ def prepare_batch(
     n_occ_arr = np.zeros(N, dtype=np.int32)
 
     H_core_all = np.zeros((N, MB, MB), dtype=np.float64)
-    w_all = np.zeros((N, MA, MA, MO ** 4), dtype=np.float64)
+    # Packed two-centre storage: a flat buffer per molecule plus an offset
+    # table. -1 marks a pair with no block (an atom with itself, or padding).
+    w_packed_rows = [[] for _ in range(N)]
+    pair_cursor = [0] * N
+    pair_offset_all = np.full((N, MA, MA), -1, dtype=np.int32)
+    atom_norb_all = np.zeros((N, MA), dtype=np.int32)
+    # One-centre d integrals. These depend only on the atom's own
+    # parameters, never on geometry, so they are computed once here
+    # rather than per SCF iteration. Zero for atoms without d.
+    atom_w_all = np.zeros((N, MA, 243), dtype=np.float64)
     atom_params_all = np.zeros((N, MA, 5), dtype=np.float64)
     atom_map_all = np.zeros((N, MB), dtype=np.int32)
     type_map_all = np.zeros((N, MB), dtype=np.int32)
@@ -172,71 +242,83 @@ def prepare_batch(
         # Atom params
         for i, p in enumerate(params):
             atom_params_all[mol_idx, i] = [p.gss, p.gsp, p.gpp, p.gp2, p.hsp]
+            atom_norb_all[mol_idx, i] = p.n_basis
+            if p.n_basis == 9:
+                atom_w_all[mol_idx, i] = _one_centre_w(p)
 
         # === Build H_core ===
         H = np.zeros((n_bas, n_bas), dtype=np.float64)
 
-        # Diagonal: Uss/Upp
+        # Diagonal: Uss/Upp/Udd
         for mu in range(n_bas):
             i = b2a[mu]
             p = params[i]
-            H[mu, mu] = p.Uss if btype[mu] == 0 else p.Upp
+            if btype[mu] == 0:
+                H[mu, mu] = p.Uss
+            elif btype[mu] <= 3:
+                H[mu, mu] = p.Upp
+            else:
+                H[mu, mu] = p.Udd
 
         starts = atom_basis_start
 
-        # Off-diagonal resonance + nuclear attraction
+        # Off-diagonal resonance and electron-nuclear attraction. These reuse
+        # the same per-pair functions the sequential solver uses, rather than
+        # the sp-only copies that lived here: those assumed 4 orbitals per atom
+        # and overran their own arrays on sulfur or a halogen.
         for i in range(n_at):
             for j in range(i + 1, n_at):
-                pA, pB = params[i], params[j]
+                block = _pair_resonance_block(params[i], params[j],
+                                              coords[i], coords[j])
+                si, sj = starts[i], starts[j]
+                nA, nB = params[i].n_basis, params[j].n_basis
+                H[si:si + nA, sj:sj + nB] = block
+                H[sj:sj + nB, si:si + nA] = block.T
 
-                # Overlap for resonance
-                S_ij = overlap_molecular_frame(pA, pB, coords[i], coords[j])
-                for mu_off in range(pA.n_basis):
-                    mu = starts[i] + mu_off
-                    beta_mu = pA.beta_s if btype[mu] == 0 else pA.beta_p
-                    for nu_off in range(pB.n_basis):
-                        nu = starts[j] + nu_off
-                        beta_nu = pB.beta_s if btype[nu] == 0 else pB.beta_p
-                        H[mu, nu] = 0.5 * (beta_mu + beta_nu) * S_ij[mu_off, nu_off]
-                        H[nu, mu] = H[mu, nu]
-
-        # Nuclear attraction + w tensor
         for i in range(n_at):
+            si, nA = starts[i], params[i].n_basis
             for j in range(n_at):
                 if i == j:
                     continue
-                w_ij, e1b_ij, e2a_ij = rotate_integrals_to_molecular_frame(
-                    params[i], params[j], coords[i], coords[j],
-                )
-                # Nuclear attraction on atom i from nucleus j
-                nA = params[i].n_basis
-                for mu_a in range(nA):
-                    for nu_a in range(nA):
-                        H[starts[i] + mu_a, starts[i] + nu_a] += e1b_ij[mu_a, nu_a]
+                H[si:si + nA, si:si + nA] += _pair_core_attraction(
+                    params[i], params[j], coords[i], coords[j])
 
-                # Store w tensor (only upper triangle i<j)
-                if i < j:
-                    # w_ij is (nA, nA, nB, nB); pad it into a uniform
-                    # (MO, MO, MO, MO) block so every pair has the same stride
-                    # regardless of how many orbitals each atom carries.
-                    # rotate_integrals_to_molecular_frame already pads each
-                    # centre to its shell width, so take the extents from the
-                    # returned block rather than from n_basis — hydrogen comes
-                    # back 4-wide, not 1-wide.
-                    wa, wb = w_ij.shape[0], w_ij.shape[2]
-                    blk = np.zeros((MO, MO, MO, MO), dtype=np.float64)
-                    blk[:wa, :wa, :wb, :wb] = w_ij
-                    w_all[mol_idx, i, j] = blk.ravel()
-                    # Also store transpose for j>i access
-                    blk_t = np.zeros((MO, MO, MO, MO), dtype=np.float64)
-                    blk_t[:wb, :wb, :wa, :wa] = np.transpose(w_ij, (2, 3, 0, 1))
-                    w_all[mol_idx, j, i] = blk_t.ravel()
+        # === Two-centre integrals, packed ===
+        # Stored as lower-triangle packed pair blocks with a per-pair offset,
+        # not as a dense 4-index block padded to the widest atom in the batch.
+        # Padding cost a 100-molecule PM6 batch containing one sulfur ~5 GB
+        # because every C-H pair was inflated to 9**4; packed per-pair it is
+        # ~24 MB, and sp-only methods travel the same path as the small case.
+        for i in range(n_at):
+            for j in range(i + 1, n_at):
+                block = _two_centre_packed(params[i], params[j],
+                                           coords[i], coords[j])
+                off_ij = pair_cursor[mol_idx]
+                w_packed_rows[mol_idx].append(block.ravel())
+                pair_offset_all[mol_idx, i, j] = off_ij
+                pair_cursor[mol_idx] += block.size
+
+                # The (j, i) ordering is the transpose in packed space too.
+                off_ji = pair_cursor[mol_idx]
+                w_packed_rows[mol_idx].append(block.T.ravel())
+                pair_offset_all[mol_idx, j, i] = off_ji
+                pair_cursor[mol_idx] += block.size
 
         H_core_all[mol_idx, :n_bas, :n_bas] = H
 
         # Nuclear repulsion
         E_nuc_arr[mol_idx] = nuclear_repulsion_for_method(
             atoms, coords, param_dict, method)
+
+    # Pad the ragged per-molecule buffers into one (N, max_storage) array so
+    # the GPU sees a single contiguous upload. Molecules needing less are
+    # zero-filled; the offset table means the padding is never read.
+    max_storage = max(pair_cursor) if N else 0
+    w_all = np.zeros((N, max_storage), dtype=np.float64)
+    for m in range(N):
+        if w_packed_rows[m]:
+            flat = np.concatenate(w_packed_rows[m])
+            w_all[m, :flat.size] = flat
 
     return RM1Batch(
         n_mols=N,
@@ -249,6 +331,9 @@ def prepare_batch(
         atoms_list=atoms_list,
         H_core=H_core_all,
         w=w_all,
+        pair_offset=pair_offset_all,
+        atom_norb=atom_norb_all,
+        atom_w=atom_w_all,
         atom_params=atom_params_all,
         atom_map=atom_map_all,
         type_map=type_map_all,

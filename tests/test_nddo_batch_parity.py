@@ -60,13 +60,26 @@ def test_batch_matches_single_molecule_energy(method, smiles):
 
 @pytest.mark.parametrize("smiles", D_ORBITAL)
 def test_pm6d_d_orbital_molecules_batch_correctly(smiles):
-    """These used to raise IndexError out of prepare_batch."""
+    """d-orbital molecules must go through the batch path, not around it.
+
+    These raised IndexError out of prepare_batch originally. Then they were
+    routed to the sequential solver instead, which made this comparison
+    vacuous — "batch" *was* the sequential code, so it agreed to the last bit.
+    Now the batch store is packed per pair and the d integrals are wired in, so
+    this compares two genuinely independent implementations.
+
+    Hence two tolerances rather than one. The energy is variational, so an
+    error in the converged density shows up only at second order and the two
+    paths still agree to ~1e-12 eV. Charges are first order in that same
+    density error, so they agree to ~1e-6. Tightening the charge bound would be
+    asking the SCF to converge further than conv_tol promises.
+    """
     atoms, coords = _embed(smiles)
     one = nddo_energy(atoms, coords, method="PM6_D")
     many = nddo_energy_batch([(atoms, coords)], method="PM6_D", use_metal=False)[0]
 
     assert many["energy_eV"] == pytest.approx(one["energy_eV"], abs=1e-9)
-    assert many["charges"] == pytest.approx(np.asarray(one["charges"]), abs=1e-9)
+    assert many["charges"] == pytest.approx(np.asarray(one["charges"]), abs=1e-5)
 
 
 def test_mixed_sp_and_d_batch_keeps_input_order():
