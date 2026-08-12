@@ -21,7 +21,7 @@ from .integrals import (compute_nuclear_repulsion, nuclear_repulsion_for_method,
                         pair_repulsion_for_method)
 
 
-def _pair_terms(params, coords, i, j, starts, P, n_basis):
+def _pair_terms(params, coords, i, j, starts, P, n_basis, w=None):
     """Everything about the pair (i, j) that moves when either atom moves.
 
     Returns (dH, dT): the pair's additive contribution to the core Hamiltonian
@@ -54,12 +54,47 @@ def _pair_terms(params, coords, i, j, starts, P, n_basis):
     # symmetric in the pair — (i,j) lands on i's diagonal block and (j,i) on
     # j's — but e1b and e2a are exactly those two orderings, so asking for the
     # rotation three times was paying three times for one answer.
-    w, e1b, e2a = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    if w is None:
+        w, e1b, e2a = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    else:
+        # e1b and e2a are slices of w, so a batched caller need only supply w.
+        e1b = -float(pB.n_valence) * w[:, :, 0, 0]
+        e2a = -float(pA.n_valence) * w[0, 0, :, :]
     dH[sA:sA + nA, sA:sA + nA] += e1b[:nA, :nA]
     dH[sB:sB + nB, sB:sB + nB] += e2a[:nB, :nB]
     dT = _pair_fock_twocentre(np.zeros((n_basis, n_basis)), P,
                               pA, pB, sA, sB, rA, rB, w=w)
     return dH, dT
+
+
+
+def _pair_terms_many(params, coords, pairs, starts, P, n_basis):
+    """`_pair_terms` for a list of pairs, rotating them in one vectorised call.
+
+    The scalar rotation costs ~75 us per pair and was the single largest line
+    in a gradient profile. Grouping the pairs and rotating them together turns
+    that into a handful of array operations; the assembly below stays per pair,
+    but it is only numpy slicing.
+
+    d-bearing pairs fall back to the scalar path — their integrals come from a
+    different routine, and there are few of them.
+    """
+    from .rotation_batch import rotate_pairs
+
+    sp, dd = [], []
+    for i, j in pairs:
+        (sp if params[i].n_basis <= 4 and params[j].n_basis <= 4 else dd).append((i, j))
+
+    out = {}
+    if sp:
+        ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
+                          [(coords[i], coords[j]) for i, j in sp])
+        for k, (i, j) in enumerate(sp):
+            out[(i, j)] = _pair_terms(params, coords, i, j, starts, P, n_basis,
+                                      w=ws[k])
+    for i, j in dd:
+        out[(i, j)] = _pair_terms(params, coords, i, j, starts, P, n_basis)
+    return out
 
 
 def analytical_gradient(
@@ -102,13 +137,11 @@ def analytical_gradient(
     # The one-centre Fock block is whatever F is not explained by H and the
     # two-centre pairs. It depends only on P and the atom parameters, so it is
     # the same at every displaced geometry and never needs rebuilding.
+    all_pairs = [(i, j) for i in range(n_atoms) for j in range(i + 1, n_atoms)]
+    pair_ref = _pair_terms_many(params, coords, all_pairs, starts, P, n_basis)
     T_ref = np.zeros((n_basis, n_basis))
-    pair_ref = {}
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            dH, dT = _pair_terms(params, coords, i, j, starts, P, n_basis)
-            pair_ref[(i, j)] = (dH, dT)
-            T_ref += dT
+    for _dH, dT in pair_ref.values():
+        T_ref += dT
     G_one = F_ref - H_ref - T_ref
 
     # Core-core repulsion is a plain sum over pairs, so it gets the same
@@ -122,12 +155,11 @@ def analytical_gradient(
     def energy_with_atom_moved(a: int, shifted: np.ndarray) -> float:
         H = H_ref.copy()
         T = T_ref.copy()
-        for j in range(n_atoms):
-            if j == a:
-                continue
-            key = (a, j) if a < j else (j, a)
+        dirty = [((a, j) if a < j else (j, a)) for j in range(n_atoms) if j != a]
+        fresh = _pair_terms_many(params, shifted, dirty, starts, P, n_basis)
+        for key in dirty:
             old_H, old_T = pair_ref[key]
-            new_H, new_T = _pair_terms(params, shifted, *key, starts, P, n_basis)
+            new_H, new_T = fresh[key]
             H += new_H - old_H
             T += new_T - old_T
         F = H + G_one + T

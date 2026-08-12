@@ -172,3 +172,68 @@ def rotate_hh_batch(ri: np.ndarray) -> np.ndarray:
     w = np.zeros((ri.shape[0], 4, 4, 4, 4))
     w[:, 0, 0, 0, 0] = ri[:, 0]
     return w
+
+
+def rotate_pairs(pair_params, pair_coords):
+    """Rotated tensors for a heterogeneous list of sp pairs.
+
+    Args:
+        pair_params: sequence of (pA, pB) ElementParams, sp only (n_basis <= 4).
+        pair_coords: sequence of (coordA, coordB).
+
+    Returns:
+        (n_pairs, 4, 4, 4, 4). ``e1b`` and ``e2a`` are not returned because
+        they are just slices of it: ``e1b = -Z_B * w[:, :, 0, 0]`` and
+        ``e2a = -Z_A * w[0, 0, :, :]``, which holds for every pair type
+        (verified to round-off against the scalar routine).
+
+    Pairs are grouped by type — HH, XH, XX — because each has its own set of
+    local-frame integrals, and each group is rotated in one vectorised call.
+    """
+    from .rotation import _rotation_matrix
+    from .two_center_integrals import two_center_integrals
+
+    n = len(pair_params)
+    out = np.zeros((n, 4, 4, 4, 4))
+    groups: dict[str, list[int]] = {"HH": [], "XH": [], "XX": []}
+    swapped: list[int] = []
+    ri_all = np.zeros((n, 22))
+    r0 = np.zeros((n, 3))
+    r1 = np.zeros((n, 3))
+    r2 = np.zeros((n, 3))
+
+    for idx, ((pA, pB), (rA, rB)) in enumerate(zip(pair_params, pair_coords)):
+        delta = rB - rA
+        R = float(np.linalg.norm(delta))
+        if R < 1e-10:
+            continue
+        ri, _core, pair_type = two_center_integrals(pA, pB, R)
+        if pair_type == "HX":
+            # A is the hydrogen. The scalar routine solves the pair the other
+            # way round and transposes, so do the same: recompute in the
+            # swapped orientation and flip the result at the end.
+            pA, pB = pB, pA
+            rA, rB = rB, rA
+            delta = rB - rA
+            ri, _core, pair_type = two_center_integrals(pA, pB, R)
+            swapped.append(idx)
+        rot = _rotation_matrix(-delta / R)
+        r0[idx], r1[idx], r2[idx] = rot[0], rot[1], rot[2]
+        ri_all[idx, :len(ri)] = ri
+        groups[pair_type].append(idx)
+
+    for pair_type, idxs in groups.items():
+        if not idxs:
+            continue
+        sel = np.array(idxs)
+        if pair_type == "XX":
+            out[sel] = rotate_xx_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
+        elif pair_type == "XH":
+            out[sel] = rotate_xh_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
+        else:
+            out[sel] = rotate_hh_batch(ri_all[sel])
+
+    if swapped:
+        sel = np.array(swapped)
+        out[sel] = np.transpose(out[sel], (0, 3, 4, 1, 2))
+    return out
