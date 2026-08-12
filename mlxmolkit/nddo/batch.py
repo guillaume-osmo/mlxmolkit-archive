@@ -231,136 +231,151 @@ def prepare_batch(
 
     atoms_list = []
     coords_list = []
-    _nuc_keys, _nuc_z, _nuc_p, _nuc_c = [], [], [], []
 
-    # Every sp pair in the whole batch is rotated in one vectorised call
-    # before the per-molecule loop below. Doing it inside the loop meant one
-    # scalar rotation per pair per molecule, which was ~69% of prepare_batch.
-    from .rotation_batch import rotate_pairs
-    _pw_keys, _pw_params, _pw_coords = [], [], []
-    for mol_idx, (atoms, coords) in enumerate(molecules):
-        coords_arr = np.asarray(coords, dtype=np.float64)
-        mol_params = [param_dict[z] for z in atoms]
-        for i in range(len(atoms)):
-            for j in range(i + 1, len(atoms)):
-                if mol_params[i].n_basis <= 4 and mol_params[j].n_basis <= 4:
-                    _pw_keys.append((mol_idx, i, j))
-                    _pw_params.append((mol_params[i], mol_params[j]))
-                    _pw_coords.append((coords_arr[i], coords_arr[j]))
-    if _pw_keys:
-        _rotated = rotate_pairs(_pw_params, _pw_coords)
-        pair_w = {key: _rotated[k] for k, key in enumerate(_pw_keys)}
+    # ---- one pair enumeration for the whole batch -------------------------
+    # prepare_batch used to walk every molecule's atom pairs seven times: three
+    # here to build the spec lists for the bulk precomputes, and four more in
+    # the per-molecule loop below. The enumeration is identical every time and
+    # only the predicate differs, so it is built once and the groupings are
+    # masks over it. np.triu_indices emits the same (0,1),(0,2),...,(1,2),...
+    # order the nested loops did, which the packed-pair cursor depends on.
+    #
+    # Every pair also gets a dense id. The precomputed results are indexed by
+    # it instead of by a (mol_idx, i, j) tuple: keying them on tuples cost
+    # 730838 dict lookups per batch, and hashing a 3-tuple is not free.
+    params_by_mol = [[param_dict[z] for z in atoms] for atoms, _c in molecules]
+    coords_by_mol = [np.asarray(c, dtype=np.float64) for _a, c in molecules]
+
+    _mol, _i, _j, _nA, _nB = [], [], [], [], []
+    mol_pair_start = np.zeros(N + 1, dtype=np.int64)
+    for m, ps in enumerate(params_by_mol):
+        i_m, j_m = np.triu_indices(len(ps), k=1)
+        norb = np.array([p.n_basis for p in ps], dtype=np.int32)
+        _mol.append(np.full(i_m.size, m, dtype=np.int32))
+        _i.append(i_m.astype(np.int32))
+        _j.append(j_m.astype(np.int32))
+        _nA.append(norb[i_m])
+        _nB.append(norb[j_m])
+        mol_pair_start[m + 1] = mol_pair_start[m] + i_m.size
+
+    atom_flat_start = np.zeros(N + 1, dtype=np.int64)
+    for m, ps in enumerate(params_by_mol):
+        atom_flat_start[m + 1] = atom_flat_start[m] + len(ps)
+
+    if N:
+        pair_mol = np.concatenate(_mol)
+        pair_i = np.concatenate(_i)
+        pair_j = np.concatenate(_j)
+        pair_nA = np.concatenate(_nA)
+        pair_nB = np.concatenate(_nB)
     else:
-        pair_w = {}
+        pair_mol = pair_i = pair_j = pair_nA = pair_nB = np.zeros(0, dtype=np.int32)
+    n_pairs = pair_mol.size
+
+    # An sp pair is one both of whose atoms fit in 4 orbitals; everything else
+    # needs the d path. One mask, two index sets, two dense slot maps.
+    sp_mask = (pair_nA <= 4) & (pair_nB <= 4)
+    sp_ids = np.flatnonzero(sp_mask)
+    d_ids = np.flatnonzero(~sp_mask)
+    sp_slot = np.full(n_pairs, -1, dtype=np.int64)
+    sp_slot[sp_ids] = np.arange(sp_ids.size)
+    d_slot = np.full(n_pairs, -1, dtype=np.int64)
+    d_slot[d_ids] = np.arange(d_ids.size)
+
+    def _params_of(ids):
+        return [(params_by_mol[pair_mol[k]][pair_i[k]],
+                 params_by_mol[pair_mol[k]][pair_j[k]]) for k in ids]
+
+    def _coords_of(ids):
+        return [(coords_by_mol[pair_mol[k]][pair_i[k]],
+                 coords_by_mol[pair_mol[k]][pair_j[k]]) for k in ids]
+
+    sp_params, sp_coords = _params_of(sp_ids), _coords_of(sp_ids)
+    d_params, d_coords = _params_of(d_ids), _coords_of(d_ids)
+    d_specs = [(pA, pB, rA, rB) for (pA, pB), (rA, rB) in zip(d_params, d_coords)]
+
+    # Every sp pair in the whole batch is rotated in one vectorised call.
+    # Doing it inside the per-molecule loop meant one scalar rotation per pair,
+    # which was ~69% of prepare_batch.
+    from .rotation_batch import rotate_pairs
+    pair_w = rotate_pairs(sp_params, sp_coords) if sp_ids.size else None
 
     # d-bearing pairs the same way. two_elec_two_center_int is vectorised over
     # a pair axis, so asking it for one pair at a time cost 2.58 ms each and
     # made a batch with 10% d-containing molecules twice as expensive per
     # molecule as an sp-only one.
     from .d_two_center import _tetci_pairs_w
-    _d_keys, _d_specs = [], []
-    for mol_idx, (atoms, coords) in enumerate(molecules):
-        coords_arr = np.asarray(coords, dtype=np.float64)
-        mol_params = [param_dict[z] for z in atoms]
-        for i in range(len(atoms)):
-            for j in range(i + 1, len(atoms)):
-                if mol_params[i].n_basis == 9 or mol_params[j].n_basis == 9:
-                    _d_keys.append((mol_idx, i, j))
-                    _d_specs.append((mol_params[i], mol_params[j],
-                                     coords_arr[i], coords_arr[j]))
-    pair_tetci = (dict(zip(_d_keys, _tetci_pairs_w(_d_specs)))
-                  if _d_keys else {})
+    pair_tetci = _tetci_pairs_w(d_specs) if d_ids.size else None
 
-    # The resonance overlap for those same pairs, likewise in one call:
-    # diatom_overlap_matrixD is written for a batch and was being handed one
-    # pair at a time at ~1.4 ms each.
+    # Resonance overlaps. diatom_overlap_matrixD is written for a batch and was
+    # being handed one pair at a time at ~1.4 ms each; overlap_pairs routes
+    # anything its table does not cover — d orbitals, or qn > 3 like Br and I —
+    # back to the scalar routine itself.
     from .overlap_d import overlap_d_batch
-    pair_overlap = (dict(zip(_d_keys, overlap_d_batch(_d_specs)))
-                    if _d_keys else {})
+    from .overlap_batch import overlap_pairs
+    overlap_d = overlap_d_batch(d_specs) if d_ids.size else None
+    overlap_sp = overlap_pairs(
+        [(pA, pB, rA, rB) for (pA, pB), (rA, rB) in zip(sp_params, sp_coords)]
+    ) if sp_ids.size else None
 
-    # Electron-nuclear attraction on the d atoms. yh_e1b_contribution rebuilds
-    # the 15x45 Wigner-D coefficient machinery one row at a time; over an
-    # 800-molecule batch that was 589 ms, the largest single cost left here.
-    # Only the direction whose *first* atom carries d orbitals takes that path.
+    # Electron-nuclear attraction on the d atoms, and on the sp atom of a mixed
+    # pair. Both directions of every d pair land in one of the two lists.
     from .tetci_yh import yh_e1b_batch
-    _att_keys, _att_pp, _att_pc = [], [], []
-    # The other direction of a mixed pair — the sp atom seen by the d atom's
-    # nucleus — took the scalar sp rotation instead, 5000 calls and the largest
-    # cost left once the d side was batched. It is the same rotate_pairs the
-    # sp-only path already uses, and e1b is a slice of what it returns.
-    _sp_att_keys, _sp_att_params, _sp_att_coords = [], [], []
-    for (mol_idx, i, j), (pA, pB, rA, rB) in zip(_d_keys, _d_specs):
+    _yh_at, _yh_pp, _yh_pc = [], [], []
+    _sp_at, _sp_att_params, _sp_att_coords = [], [], []
+    for pos, k in enumerate(d_ids):
+        pA, pB, rA, rB = d_specs[pos]
         for slot, (pX, pY, rX, rY) in enumerate(((pA, pB, rA, rB), (pB, pA, rB, rA))):
             if pX.n_basis == 9:
-                _att_keys.append((mol_idx, i, j, slot))
-                _att_pp.append((pX, pY))
-                _att_pc.append((rX, rY))
+                _yh_at.append((pos, slot))
+                _yh_pp.append((pX, pY))
+                _yh_pc.append((rX, rY))
             else:
-                _sp_att_keys.append((mol_idx, i, j, slot))
+                _sp_at.append((pos, slot))
                 _sp_att_params.append((pX, pY))
                 _sp_att_coords.append((rX, rY))
-    pair_attraction = (dict(zip(_att_keys, yh_e1b_batch(_att_pp, _att_pc)))
-                       if _att_keys else {})
-    if _sp_att_keys:
-        _w = rotate_pairs(_sp_att_params, _sp_att_coords)
-        for k, key in enumerate(_sp_att_keys):
-            nX = _sp_att_params[k][0].n_basis
-            pair_attraction[key] = (
-                -float(_sp_att_params[k][1].n_valence) * _w[k][:nX, :nX, 0, 0])
-
-    # Resonance overlaps for the sp pairs, which are the bulk of any organic
-    # batch. overlap_pairs routes anything its table does not cover — d
-    # orbitals, or qn > 3 like Br and I — back to the scalar routine itself.
-    from .overlap_batch import overlap_pairs
-    _sp_keys, _sp_specs = [], []
-    for mol_idx, (atoms, coords) in enumerate(molecules):
-        coords_arr = np.asarray(coords, dtype=np.float64)
-        mol_params = [param_dict[z] for z in atoms]
-        for i in range(len(atoms)):
-            for j in range(i + 1, len(atoms)):
-                if mol_params[i].n_basis <= 4 and mol_params[j].n_basis <= 4:
-                    _sp_keys.append((mol_idx, i, j))
-                    _sp_specs.append((mol_params[i], mol_params[j],
-                                      coords_arr[i], coords_arr[j]))
-    if _sp_keys:
-        pair_overlap.update(zip(_sp_keys, overlap_pairs(_sp_specs)))
+    pair_attraction: list = [[None, None] for _ in range(d_ids.size)]
+    if _yh_at:
+        for (pos, slot), blk in zip(_yh_at, yh_e1b_batch(_yh_pp, _yh_pc)):
+            pair_attraction[pos][slot] = blk
+    if _sp_at:
+        _w_att = rotate_pairs(_sp_att_params, _sp_att_coords)
+        for n, (pos, slot) in enumerate(_sp_at):
+            nX = _sp_att_params[n][0].n_basis
+            pair_attraction[pos][slot] = (
+                -float(_sp_att_params[n][1].n_valence) * _w_att[n][:nX, :nX, 0, 0])
 
     # Resonance blocks in bulk. With the overlap already computed this is only
     # the Wolfsberg-Helmholz weighting 0.5*(beta_mu + beta_nu)*S, which is an
     # outer sum over orbital indices — 65400 per-pair calls became one
-    # expression per orbital-width shape.
-    pair_resonance: dict = {}
+    # expression per element pair.
+    pair_resonance: list = [None] * sp_ids.size
     _res_shapes: dict[tuple, list] = {}
-    for key, (pA, pB, _a, _b) in zip(_sp_keys, _sp_specs):
-        S = pair_overlap.get(key)
-        if S is not None:
-            _res_shapes.setdefault((pA.Z, pB.Z), []).append((key, S))
-    for (zA, zB), items in _res_shapes.items():
+    for pos, (pA, pB) in enumerate(sp_params):
+        _res_shapes.setdefault((pA.Z, pB.Z), []).append(pos)
+    for (zA, zB), positions in _res_shapes.items():
         pA, pB = param_dict[zA], param_dict[zB]
         betaA = np.array([_beta_for_orbital(pA, k) for k in range(pA.n_basis)])
         betaB = np.array([_beta_for_orbital(pB, k) for k in range(pB.n_basis)])
         weight = 0.5 * (betaA[:, None] + betaB[None, :])
-        stack = np.stack([S for _k, S in items]) * weight
-        for pos, (key, _S) in enumerate(items):
-            pair_resonance[key] = stack[pos]
+        stack = np.stack([overlap_sp[pos] for pos in positions]) * weight
+        for n, pos in enumerate(positions):
+            pair_resonance[pos] = stack[n]
 
     # Pack every sp pair's two-electron block in bulk, grouped by orbital
     # widths. pack() called per pair was 132 ms across 64640 calls on an
     # 800-molecule batch; the index map is the same for every pair of a given
     # shape, so each shape is one scatter.
     from .packing import pack_batch
-    pair_packed: dict = {}
+    pair_packed: list = [None] * sp_ids.size
     by_shape: dict[tuple, list] = {}
-    for key, (pA, pB, _rA, _rB) in zip(_sp_keys, _sp_specs):
-        dense = pair_w.get(key)
-        if dense is None:
-            continue
-        by_shape.setdefault((pA.n_basis, pB.n_basis), []).append((key, dense))
-    for (nA, nB), items in by_shape.items():
-        stack = np.stack([d[:nA, :nA, :nB, :nB] for _k, d in items])
+    for pos, (pA, pB) in enumerate(sp_params):
+        by_shape.setdefault((pA.n_basis, pB.n_basis), []).append(pos)
+    for (nA, nB), positions in by_shape.items():
+        stack = np.stack([pair_w[pos][:nA, :nA, :nB, :nB] for pos in positions])
         packed = pack_batch(stack, nA, nB)
-        for pos, (key, _d) in enumerate(items):
-            pair_packed[key] = packed[pos]
+        for n, pos in enumerate(positions):
+            pair_packed[pos] = packed[n]
 
     for mol_idx, (atoms, coords) in enumerate(molecules):
         coords = np.array(coords, dtype=np.float64)
@@ -428,96 +443,90 @@ def prepare_batch(
 
         starts = atom_basis_start
 
-        # Off-diagonal resonance and electron-nuclear attraction. These reuse
-        # the same per-pair functions the sequential solver uses, rather than
-        # the sp-only copies that lived here: those assumed 4 orbitals per atom
-        # and overran their own arrays on sulfur or a halogen.
-        for i in range(n_at):
-            for j in range(i + 1, n_at):
-                block = pair_resonance.get((mol_idx, i, j))
-                if block is None:
-                    block = _pair_resonance_block(
-                        params[i], params[j], coords[i], coords[j],
-                        overlap=pair_overlap.get((mol_idx, i, j)))
-                si, sj = starts[i], starts[j]
-                nA, nB = params[i].n_basis, params[j].n_basis
-                H[si:si + nA, sj:sj + nB] = block
-                H[sj:sj + nB, si:si + nA] = block.T
+        # One walk over this molecule's slice of the pair table, doing what
+        # four separate (i, j) walks used to: resonance, electron-nuclear
+        # attraction, packing, and the core-core term list. Each precomputed
+        # result is reached by the pair's dense id rather than by hashing an
+        # (mol_idx, i, j) tuple.
+        starts = atom_basis_start
+        pm6_core = method in PM6_CORE_CORE_METHODS
 
-        # Electron-nuclear attraction. One rotation of the pair (i, j) yields the
-        # attraction on i from j *and* on j from i, so the unordered loop below
-        # does half the work the ordered one did. d pairs keep the 9x9 Wigner-D
-        # path, which is not expressible through the sp rotation.
-        for i in range(n_at):
-            si, nA = starts[i], params[i].n_basis
-            for j in range(i + 1, n_at):
-                sj, nB = starts[j], params[j].n_basis
-                pA, pB = params[i], params[j]
-                if pA.n_basis == 9 or pB.n_basis == 9:
-                    blk = pair_attraction.get((mol_idx, i, j, 0))
-                    H[si:si + nA, si:si + nA] += (
-                        blk if blk is not None
-                        else _pair_core_attraction(pA, pB, coords[i], coords[j]))
-                    blk = pair_attraction.get((mol_idx, i, j, 1))
-                    H[sj:sj + nB, sj:sj + nB] += (
-                        blk if blk is not None
-                        else _pair_core_attraction(pB, pA, coords[j], coords[i]))
-                else:
-                    w_ij = pair_w[(mol_idx, i, j)]
-                    # e1b and e2a are slices of the rotated tensor.
-                    H[si:si + nA, si:si + nA] += (
-                        -float(pB.n_valence) * w_ij[:nA, :nA, 0, 0])
-                    H[sj:sj + nB, sj:sj + nB] += (
-                        -float(pA.n_valence) * w_ij[0, 0, :nB, :nB])
+        for pid in range(mol_pair_start[mol_idx], mol_pair_start[mol_idx + 1]):
+            i, j = int(pair_i[pid]), int(pair_j[pid])
+            pA, pB = params[i], params[j]
+            nA, nB = int(pair_nA[pid]), int(pair_nB[pid])
+            si, sj = starts[i], starts[j]
+            sp_pos = int(sp_slot[pid])
 
-        # === Two-centre integrals, packed ===
-        # Stored as lower-triangle packed pair blocks with a per-pair offset,
-        # not as a dense 4-index block padded to the widest atom in the batch.
-        # Padding cost a 100-molecule PM6 batch containing one sulfur ~5 GB
-        # because every C-H pair was inflated to 9**4; packed per-pair it is
-        # ~24 MB, and sp-only methods travel the same path as the small case.
-        for i in range(n_at):
-            for j in range(i + 1, n_at):
-                block = pair_packed.get((mol_idx, i, j))
-                if block is None:
-                    block = _two_centre_packed(
-                        params[i], params[j], coords[i], coords[j],
-                        dense=pair_w.get((mol_idx, i, j)),
-                        tetci=pair_tetci.get((mol_idx, i, j)))
-                off_ij = pair_cursor[mol_idx]
-                w_packed_rows[mol_idx].append(block.ravel())
-                pair_offset_all[mol_idx, i, j] = off_ij
-                pair_cursor[mol_idx] += block.size
+            # Resonance. The batched block covers every sp pair; the d path
+            # keeps the per-pair routine, which reuses the precomputed overlap.
+            if sp_pos >= 0:
+                block = pair_resonance[sp_pos]
+            else:
+                block = _pair_resonance_block(
+                    pA, pB, coords[i], coords[j],
+                    overlap=overlap_d[int(d_slot[pid])])
+            H[si:si + nA, sj:sj + nB] = block
+            H[sj:sj + nB, si:si + nA] = block.T
 
-                # The (j, i) ordering is the transpose in packed space too.
-                off_ji = pair_cursor[mol_idx]
-                w_packed_rows[mol_idx].append(block.T.ravel())
-                pair_offset_all[mol_idx, j, i] = off_ji
-                pair_cursor[mol_idx] += block.size
+            # Electron-nuclear attraction. One rotation of the pair yields the
+            # attraction on i from j *and* on j from i, so this does half the
+            # work an ordered loop would.
+            if sp_pos >= 0:
+                w_ij = pair_w[sp_pos]
+                H[si:si + nA, si:si + nA] += (
+                    -float(pB.n_valence) * w_ij[:nA, :nA, 0, 0])
+                H[sj:sj + nB, sj:sj + nB] += (
+                    -float(pA.n_valence) * w_ij[0, 0, :nB, :nB])
+            else:
+                blk_a, blk_b = pair_attraction[int(d_slot[pid])]
+                H[si:si + nA, si:si + nA] += blk_a
+                H[sj:sj + nB, sj:sj + nB] += blk_b
+
+            # Two-centre integrals, stored as lower-triangle packed pair blocks
+            # with a per-pair offset rather than a dense 4-index block padded to
+            # the widest atom in the batch. Padding cost a 100-molecule PM6
+            # batch containing one sulfur ~5 GB because every C-H pair was
+            # inflated to 9**4; packed per-pair it is ~24 MB.
+            if sp_pos >= 0:
+                block = pair_packed[sp_pos]
+            else:
+                block = _two_centre_packed(
+                    pA, pB, coords[i], coords[j],
+                    dense=None, tetci=pair_tetci[int(d_slot[pid])])
+            rows = w_packed_rows[mol_idx]
+            pair_offset_all[mol_idx, i, j] = pair_cursor[mol_idx]
+            rows.append(block.ravel())
+            pair_cursor[mol_idx] += block.size
+            # The (j, i) ordering is the transpose in packed space too.
+            pair_offset_all[mol_idx, j, i] = pair_cursor[mol_idx]
+            rows.append(block.T.ravel())
+            pair_cursor[mol_idx] += block.size
 
         H_core_all[mol_idx, :n_bas, :n_bas] = H
 
-        # Nuclear repulsion
-        if method in PM6_CORE_CORE_METHODS:
-            # Summed from the batched per-pair terms below.
-            for i in range(n_at):
-                for j in range(i + 1, n_at):
-                    _nuc_keys.append(mol_idx)
-                    _nuc_z.append((atoms[i], atoms[j]))
-                    _nuc_p.append((params[i], params[j]))
-                    _nuc_c.append((coords[i], coords[j]))
-        else:
+        # The AM1-style core-core form stays per molecule; PM6's is summed from
+        # the batched per-pair terms after the loop.
+        if not pm6_core:
             E_nuc_arr[mol_idx] = nuclear_repulsion_for_method(
                 atoms, coords, param_dict, method)
 
-    # PM6 core-core: every pair in the batch in one call, then summed back
-    # per molecule. The AM1-style form stays per molecule above.
-    if _nuc_keys:
+    # PM6 core-core: every pair in the batch in one call, then summed back per
+    # molecule. The AM1-style form stays per molecule above. Both endpoints
+    # come straight off the pair table by fancy indexing — collecting them in
+    # the loop meant four list appends per pair and two more comprehensions to
+    # turn them back into arrays.
+    if method in PM6_CORE_CORE_METHODS and n_pairs:
         from .pwcct import pm6_pair_repulsion_batch
+        flat_z = np.concatenate([np.asarray(a, dtype=np.int64)
+                                 for a, _c in molecules])
+        flat_c = np.concatenate(coords_by_mol)
+        base = atom_flat_start[pair_mol]
+        ia, ja = base + pair_i, base + pair_j
         terms = pm6_pair_repulsion_batch(
-            [z[0] for z in _nuc_z], [z[1] for z in _nuc_z], _nuc_p,
-            np.array([c[0] for c in _nuc_c]), np.array([c[1] for c in _nuc_c]))
-        np.add.at(E_nuc_arr, np.asarray(_nuc_keys), terms)
+            flat_z[ia], flat_z[ja], None, flat_c[ia], flat_c[ja],
+            param_dict=param_dict)
+        np.add.at(E_nuc_arr, pair_mol, terms)
 
     # Pad the ragged per-molecule buffers into one (N, max_storage) array so
     # the GPU sees a single contiguous upload. Molecules needing less are

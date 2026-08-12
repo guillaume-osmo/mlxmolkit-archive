@@ -120,7 +120,7 @@ def pm6_nuclear_repulsion(
         for i in range(n_atoms) for j in range(i + 1, n_atoms)))
 
 
-def pm6_pair_repulsion_batch(zi, zj, pair_params, coordI, coordJ):
+def pm6_pair_repulsion_batch(zi, zj, pair_params, coordI, coordJ, param_dict=None):
     """PM6 core-core repulsion for many pairs at once, in eV.
 
     Same arithmetic as :func:`pm6_pair_repulsion`; the two element-dependent
@@ -134,6 +134,9 @@ def pm6_pair_repulsion_batch(zi, zj, pair_params, coordI, coordJ):
     Args:
         zi, zj: (P,) atomic numbers.
         pair_params: sequence of (pA, pB) ElementParams, aligned with zi/zj.
+            Ignored when `param_dict` is given.
+        param_dict: {Z: ElementParams}. Supplying it skips the per-pair walk
+            that would otherwise rediscover which elements the batch holds.
         coordI, coordJ: (P, 3) coordinates in Angstrom.
     """
     zi = np.asarray(zi, dtype=np.int64)
@@ -141,10 +144,16 @@ def pm6_pair_repulsion_batch(zi, zj, pair_params, coordI, coordJ):
     R_ang = np.linalg.norm(np.asarray(coordJ) - np.asarray(coordI), axis=1)
     R_bohr = R_ang * ANG_TO_BOHR
 
-    by_z = {}
-    for (pA, pB), a, b in zip(pair_params, zi, zj):
-        by_z.setdefault(int(a), pA)
-        by_z.setdefault(int(b), pB)
+    if param_dict is not None:
+        # The caller already has the parameters keyed by element, so there is
+        # no reason to walk every pair to rediscover which elements occur.
+        by_z = {int(z): param_dict[int(z)]
+                for z in np.unique(np.concatenate([zi, zj]))}
+    else:
+        by_z = {}
+        for (pA, pB), a, b in zip(pair_params, zi, zj):
+            by_z.setdefault(int(a), pA)
+            by_z.setdefault(int(b), pB)
     top = max(by_z) + 1
     n_val = np.zeros(top)
     gss = np.zeros(top)
@@ -165,13 +174,15 @@ def pm6_pair_repulsion_batch(zi, zj, pair_params, coordI, coordJ):
     unpolcore = 1e-8 * ((zi.astype(float) ** (1.0 / 3)
                          + zj.astype(float) ** (1.0 / 3)) / R_ang) ** 12
 
-    pw = {}
-    for a, b in zip(zi, zj):
-        key = (int(a), int(b))
-        if key not in pw:
-            pw[key] = get_pwcct(*key)
-    chi = np.array([pw[(int(a), int(b))][0] for a, b in zip(zi, zj)])
-    alp = np.array([pw[(int(a), int(b))][1] for a, b in zip(zi, zj)])
+    # PWCCT is a function of the element pair, so it tabulates the same way
+    # n_val and gss do above: a handful of entries read by fancy indexing,
+    # rather than a dict walk and two list comprehensions over every pair.
+    chi_tab = np.zeros((top, top))
+    alp_tab = np.zeros((top, top))
+    for a in by_z:
+        for b in by_z:
+            chi_tab[a, b], alp_tab[a, b] = get_pwcct(a, b)
+    chi, alp = chi_tab[zi, zj], alp_tab[zi, zj]
 
     is_XH = (np.isin(zi, (6, 7, 8)) & (zj == 1)) | (np.isin(zj, (6, 7, 8)) & (zi == 1))
     damp = np.where(is_XH,
