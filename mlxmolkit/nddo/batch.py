@@ -30,8 +30,12 @@ class RM1Batch:
 
     # Padded matrices (N, MB, MB) — MB = max_basis
     H_core: np.ndarray         # (N, MB, MB) core Hamiltonian
-    # Two-center w tensor (N, MA, MA, 4, 4, 4, 4) flattened last 4 dims
-    w: np.ndarray              # (N, MA, MA, 256)
+    # Two-center w tensor (N, MA, MA, MO, MO, MO, MO) flattened last 4 dims,
+    # where MO is the largest per-atom orbital count in the batch: 4 for an
+    # sp basis, 9 once any atom carries d orbitals. Blocks for atoms with
+    # fewer orbitals are zero-padded up to MO, so the stride is uniform.
+    w: np.ndarray              # (N, MA, MA, MO**4)
+    max_orb: int               # MO
 
     # Per-atom parameters for Fock kernel
     atom_params: np.ndarray    # (N, MA, 5) [gss,gsp,gpp,gp2,hsp]
@@ -100,6 +104,11 @@ def prepare_batch(
 
     MB = max_basis
     MA = max_atoms
+    # Widest single-atom basis in the batch. Hydrogen contributes 1, an sp
+    # atom 4, an atom with d orbitals 9. The w tensor is sized MO**4 so a
+    # 9-orbital atom fits; for an sp-only batch MO is 4 and the layout is
+    # byte-for-byte what it has always been.
+    MO = max(param_dict[z].n_basis for atoms, _ in molecules for z in atoms)
 
     # Allocate padded arrays
     n_atoms_arr = np.zeros(N, dtype=np.int32)
@@ -107,7 +116,7 @@ def prepare_batch(
     n_occ_arr = np.zeros(N, dtype=np.int32)
 
     H_core_all = np.zeros((N, MB, MB), dtype=np.float64)
-    w_all = np.zeros((N, MA, MA, 256), dtype=np.float64)
+    w_all = np.zeros((N, MA, MA, MO ** 4), dtype=np.float64)
     atom_params_all = np.zeros((N, MA, 5), dtype=np.float64)
     atom_map_all = np.zeros((N, MB), dtype=np.int32)
     type_map_all = np.zeros((N, MB), dtype=np.int32)
@@ -207,10 +216,21 @@ def prepare_batch(
 
                 # Store w tensor (only upper triangle i<j)
                 if i < j:
-                    w_all[mol_idx, i, j] = w_ij.flatten()
+                    # w_ij is (nA, nA, nB, nB); pad it into a uniform
+                    # (MO, MO, MO, MO) block so every pair has the same stride
+                    # regardless of how many orbitals each atom carries.
+                    # rotate_integrals_to_molecular_frame already pads each
+                    # centre to its shell width, so take the extents from the
+                    # returned block rather than from n_basis — hydrogen comes
+                    # back 4-wide, not 1-wide.
+                    wa, wb = w_ij.shape[0], w_ij.shape[2]
+                    blk = np.zeros((MO, MO, MO, MO), dtype=np.float64)
+                    blk[:wa, :wa, :wb, :wb] = w_ij
+                    w_all[mol_idx, i, j] = blk.ravel()
                     # Also store transpose for j>i access
-                    w_t = np.transpose(w_ij, (2, 3, 0, 1))
-                    w_all[mol_idx, j, i] = w_t.flatten()
+                    blk_t = np.zeros((MO, MO, MO, MO), dtype=np.float64)
+                    blk_t[:wb, :wb, :wa, :wa] = np.transpose(w_ij, (2, 3, 0, 1))
+                    w_all[mol_idx, j, i] = blk_t.ravel()
 
         H_core_all[mol_idx, :n_bas, :n_bas] = H
 
@@ -222,6 +242,7 @@ def prepare_batch(
         n_mols=N,
         max_atoms=MA,
         max_basis=MB,
+        max_orb=MO,
         n_atoms_arr=n_atoms_arr,
         n_basis_arr=n_basis_arr,
         n_occ_arr=n_occ_arr,

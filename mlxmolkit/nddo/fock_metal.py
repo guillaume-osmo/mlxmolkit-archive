@@ -20,7 +20,11 @@ uint tid = thread_position_in_grid.x;
 int n_mols = (int)config[0];
 int MB = (int)config[1];      // max_basis (padded)
 int MA = (int)config[2];      // max_atoms (padded)
+int MO = (int)config[3];      // widest per-atom basis: 4 for sp, 9 with d
 int MB2 = MB * MB;
+int MO2 = MO * MO;
+int MO3 = MO2 * MO;
+int MO4 = MO3 * MO;
 
 if (tid >= (uint)(n_mols * MB2)) return;
 
@@ -43,7 +47,7 @@ int mol_MB2 = mol * MB2;
 int mol_MA  = mol * (MA + 1);
 int mol_MA5 = mol * MA * 5;
 int mol_MB  = mol * MB;
-int mol_W   = mol * MA * MA * 256;
+int mol_W   = mol * MA * MA * MO4;
 
 // Atom info for mu and nu
 int atom_mu = atom_map[mol_MB + mu];
@@ -113,7 +117,7 @@ if (atom_mu == atom_nu) {
 // =========================================================
 // TWO-CENTER: Coulomb + Exchange using full w tensor
 // =========================================================
-// w tensor layout: w[mol, atom_i, atom_j, k*64 + l*16 + m*4 + n]
+// w tensor layout: w[mol, atom_i, atom_j, k*MO3 + l*MO2 + m*MO + n]
 //   where k,l index on atom_i (0..3), m,n on atom_j (0..3)
 
 int mu_off = mu - atom_starts[mol_MA + atom_mu];
@@ -128,13 +132,13 @@ if (atom_mu == atom_nu) {
         int b_end = atom_starts[mol_MA + b + 1];
         int nB = b_end - b_start;
         // w index for pair (atom_mu, b)
-        int w_base = mol_W + atom_mu * MA * 256 + b * 256;
+        int w_base = mol_W + atom_mu * MA * MO4 + b * MO4;
         for (int ls = 0; ls < nB; ls++) {
             for (int ss = 0; ss < nB; ss++) {
                 int lam = b_start + ls;
                 int sig = b_start + ss;
                 // w[mu_off, nu_off, ls, ss]
-                int w_idx = mu_off * 64 + nu_off * 16 + ls * 4 + ss;
+                int w_idx = mu_off * MO3 + nu_off * MO2 + ls * MO + ss;
                 f += P[mol_MB2 + lam * MB + sig] * w[w_base + w_idx];
             }
         }
@@ -158,13 +162,13 @@ if (atom_mu == atom_nu) {
     // F[mu_A, lam_B] -= 0.5 * sum_{nu_A on A, sig_B on B} P[nu_A, sig_B] * w[A,B,mu_off,nu_off_A,lam_off_B,sig_off_B]
     // But w is stored as w[A,B, kk,ll, mm,nn] where kk,ll are on A and mm,nn on B
     float exch = 0.0f;
-    int w_base = mol_W + a * MA * 256 + b * 256;
+    int w_base = mol_W + a * MA * MO4 + b * MO4;
     for (int nA_off = 0; nA_off < nA; nA_off++) {
         for (int sB_off = 0; sB_off < nB; sB_off++) {
             int nu_global = a_start + nA_off;
             int sig_global = b_start + sB_off;
             // w[A,B, mu_off, nA_off, lam_off, sB_off]
-            int w_idx = mu_off * 64 + nA_off * 16 + lam_off * 4 + sB_off;
+            int w_idx = mu_off * MO3 + nA_off * MO2 + lam_off * MO + sB_off;
             exch += P[mol_MB2 + nu_global * MB + sig_global] * w[w_base + w_idx];
         }
     }
@@ -219,7 +223,8 @@ class MetalFockContext:
         self._atom_starts = mx.array(batch.atom_starts.flatten().astype(np.int32))
         self._n_atoms_arr = mx.array(batch.n_atoms_arr.astype(np.int32))
         self._n_basis_arr = mx.array(batch.n_basis_arr.astype(np.int32))
-        self._config = mx.array(np.array([N, MB, MA], dtype=np.float32))
+        self._config = mx.array(np.array([N, MB, MA, batch.max_orb],
+                                        dtype=np.float32))
         self._kernel = _get_fock_batch_kernel()
 
     def build_fock(self, P: np.ndarray) -> np.ndarray:
@@ -341,7 +346,8 @@ def build_fock_batch_cpu(batch) -> np.ndarray:
                 sB = starts[b]
                 nA = starts[a + 1] - sA
                 nB = starts[b + 1] - sB
-                w = batch.w[mol, a, b].reshape(4, 4, 4, 4)
+                MO = batch.max_orb
+                w = batch.w[mol, a, b].reshape(MO, MO, MO, MO)
 
                 for mu_a in range(nA):
                     for nu_a in range(nA):
