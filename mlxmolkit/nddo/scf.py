@@ -312,7 +312,7 @@ def _beta_for_orbital(p, orb: int) -> float:
     return p.beta_d
 
 
-def _pair_resonance_block(pA, pB, rA, rB):
+def _pair_resonance_block(pA, pB, rA, rB, overlap=None):
     """Off-diagonal resonance block H[A, B] for one atom pair, shape (nA, nB).
 
     Wolfsberg-Helmholz: H_uv = 0.5 (beta_u + beta_v) S_uv.
@@ -322,7 +322,9 @@ def _pair_resonance_block(pA, pB, rA, rB):
     touching it unchanged, which is O(N) work instead of O(N^2).
     """
     nA, nB = pA.n_basis, pB.n_basis
-    if nA > 4 or nB > 4:
+    if overlap is not None:
+        S = overlap
+    elif nA > 4 or nB > 4:
         S = overlap_d_molecular_frame(pA, pB, rA, rB)
     else:
         S = overlap_molecular_frame(pA, pB, rA, rB)

@@ -238,6 +238,13 @@ def prepare_batch(
     pair_tetci = (dict(zip(_d_keys, _tetci_pairs_w(_d_specs)))
                   if _d_keys else {})
 
+    # The resonance overlap for those same pairs, likewise in one call:
+    # diatom_overlap_matrixD is written for a batch and was being handed one
+    # pair at a time at ~1.4 ms each.
+    from .overlap_d import overlap_d_batch
+    pair_overlap = (dict(zip(_d_keys, overlap_d_batch(_d_specs)))
+                    if _d_keys else {})
+
     for mol_idx, (atoms, coords) in enumerate(molecules):
         coords = np.array(coords, dtype=np.float64)
         n_at = len(atoms)
@@ -310,8 +317,9 @@ def prepare_batch(
         # and overran their own arrays on sulfur or a halogen.
         for i in range(n_at):
             for j in range(i + 1, n_at):
-                block = _pair_resonance_block(params[i], params[j],
-                                              coords[i], coords[j])
+                block = _pair_resonance_block(
+                    params[i], params[j], coords[i], coords[j],
+                    overlap=pair_overlap.get((mol_idx, i, j)))
                 si, sj = starts[i], starts[j]
                 nA, nB = params[i].n_basis, params[j].n_basis
                 H[si:si + nA, sj:sj + nB] = block

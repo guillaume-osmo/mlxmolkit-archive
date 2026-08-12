@@ -206,6 +206,68 @@ def _pyseqm_overlap_matrix(pA, pB, coordA, coordB):
     return S
 
 
+
+def overlap_d_batch(pair_specs):
+    """Molecular-frame overlaps for MANY d-bearing pairs, in one call.
+
+    ``diatom_overlap_matrixD`` is written for a batch — its own comments give
+    every shape as ``(npairs, ...)`` — but :func:`_pyseqm_overlap_matrix` wraps
+    each pair in length-one arrays and takes ``[0]``, at ~1.4 ms a pair.
+
+    Args:
+        pair_specs: sequence of (pA, pB, coordA, coordB).
+
+    Returns:
+        list of (nA, nB) arrays, or None for a pair the routine cannot do,
+        matching :func:`_pyseqm_overlap_matrix` entry by entry.
+    """
+    from ._pyseqm_port.diat_overlapD_np import diatom_overlap_matrixD
+    from ._pyseqm_port.constants_np import qn_int, qnD_int
+
+    if not pair_specs:
+        return []
+
+    ni, nj, xij, rij, zi, zj, meta = [], [], [], [], [], [], []
+    for pA, pB, cA, cB in pair_specs:
+        if float(np.linalg.norm(cB - cA)) < 1e-10:
+            meta.append(None)
+            continue
+        swap = pA.Z < pB.Z
+        p1, p2 = (pB, pA) if swap else (pA, pB)
+        c1, c2 = (cB, cA) if swap else (cA, cB)
+        delta = c2 - c1
+        dist = float(np.linalg.norm(delta))
+        ni.append(int(p1.Z)); nj.append(int(p2.Z))
+        xij.append(delta / dist)
+        rij.append(dist * ANG_TO_BOHR)
+        zi.append([p1.zeta_s, p1.zeta_p, getattr(p1, "zeta_d", 0.0)])
+        zj.append([p2.zeta_s, p2.zeta_p, getattr(p2, "zeta_d", 0.0)])
+        meta.append((len(ni) - 1, swap, p1.n_basis, p2.n_basis))
+
+    if not ni:
+        return [None] * len(pair_specs)
+
+    try:
+        S_all = diatom_overlap_matrixD(
+            np.asarray(ni, dtype=np.int64), np.asarray(nj, dtype=np.int64),
+            np.asarray(xij, dtype=np.float64), np.asarray(rij, dtype=np.float64),
+            np.asarray(zi, dtype=np.float64), np.asarray(zj, dtype=np.float64),
+            qn_int, qnD_int,
+        )
+    except Exception:
+        return [None] * len(pair_specs)
+
+    out = []
+    for entry in meta:
+        if entry is None:
+            out.append(None)
+            continue
+        k, swap, n1, n2 = entry
+        S = S_all[k][:n1, :n2].copy()
+        out.append(S.T if swap else S)
+    return out
+
+
 def overlap_d_molecular_frame(
     pA, pB,
     coordA: np.ndarray, coordB: np.ndarray,
