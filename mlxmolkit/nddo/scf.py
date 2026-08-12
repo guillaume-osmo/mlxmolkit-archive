@@ -303,6 +303,58 @@ def _overlap_ss(zA: float, zB: float, R_bohr: float, nA: int, nB: int) -> float:
     return np.exp(-rho)  # fallback
 
 
+def _beta_for_orbital(p, orb: int) -> float:
+    """Resonance parameter for orbital `orb` of an atom (0=s, 1-3=p, 4-8=d)."""
+    if orb == 0:
+        return p.beta_s
+    if orb <= 3:
+        return p.beta_p
+    return p.beta_d
+
+
+def _pair_resonance_block(pA, pB, rA, rB):
+    """Off-diagonal resonance block H[A, B] for one atom pair, shape (nA, nB).
+
+    Wolfsberg-Helmholz: H_uv = 0.5 (beta_u + beta_v) S_uv.
+
+    Split out of :func:`_build_core_hamiltonian` so a gradient can rebuild only
+    the pairs that actually moved: displacing one atom leaves every pair not
+    touching it unchanged, which is O(N) work instead of O(N^2).
+    """
+    nA, nB = pA.n_basis, pB.n_basis
+    if nA > 4 or nB > 4:
+        S = overlap_d_molecular_frame(pA, pB, rA, rB)
+    else:
+        S = overlap_molecular_frame(pA, pB, rA, rB)
+
+    block = np.empty((nA, nB))
+    for mu in range(nA):
+        beta_mu = _beta_for_orbital(pA, mu)
+        for nu in range(nB):
+            block[mu, nu] = 0.5 * (beta_mu + _beta_for_orbital(pB, nu)) * S[mu, nu]
+    return block
+
+
+def _pair_core_attraction(pA, pB, rA, rB):
+    """Electron-nuclear attraction on atom A from nucleus B, shape (nA, nA).
+
+    Added to A's own diagonal block. When A carries d orbitals the full 9x9
+    Wigner-D rotated block supersedes the sp-only one rather than adding to it.
+    """
+    nA = pA.n_basis
+    block = np.zeros((nA, nA))
+
+    if nA == 9 and pB.n_basis in (1, 4, 9):
+        from .tetci_yh import yh_e1b_contribution
+        block[:, :] = yh_e1b_contribution(pA, pB, rA, rB)
+        return block
+
+    _, e1b, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    n_sp = min(nA, 4)
+    block[:n_sp, :n_sp] = e1b[:n_sp, :n_sp]
+    return block
+
+
 def _build_core_hamiltonian(atoms, coords, info):
     """Build core Hamiltonian H_core."""
     n_basis = info['n_basis']
@@ -326,81 +378,23 @@ def _build_core_hamiltonian(atoms, coords, info):
             H[mu, mu] = p.Udd
 
     # Off-diagonal: resonance integrals using proper Slater overlap
-    # H_μν = 0.5 * (beta_μ + beta_ν) * S_μν  (Wolfsberg-Helmholz)
     n_atoms = len(atoms)
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
-            pA = params[i]
-            pB = params[j]
-
-            # Overlap — uses d-orbital overlap for PM6, sp overlap otherwise
-            nA = pA.n_basis
-            nB = pB.n_basis
-
-            if nA > 4 or nB > 4:
-                # Full d-orbital overlap (proper Slater integrals)
-                S_ij = overlap_d_molecular_frame(pA, pB, coords[i], coords[j])
-            else:
-                S_ij = overlap_molecular_frame(pA, pB, coords[i], coords[j])
-
-            for mu_off in range(nA):
-                mu = starts[i] + mu_off
-                if btype[mu] == 0:
-                    beta_mu = pA.beta_s
-                elif btype[mu] <= 3:
-                    beta_mu = pA.beta_p
-                else:
-                    beta_mu = pA.beta_d
-
-                for nu_off in range(nB):
-                    nu = starts[j] + nu_off
-                    if btype[nu] == 0:
-                        beta_nu = pB.beta_s
-                    elif btype[nu] <= 3:
-                        beta_nu = pB.beta_p
-                    else:
-                        beta_nu = pB.beta_d
-
-                    H[mu, nu] = 0.5 * (beta_mu + beta_nu) * S_ij[mu_off, nu_off]
-                    H[nu, mu] = H[mu, nu]
+            block = _pair_resonance_block(params[i], params[j], coords[i], coords[j])
+            si, sj = starts[i], starts[j]
+            nA, nB = params[i].n_basis, params[j].n_basis
+            H[si:si + nA, sj:sj + nB] = block
+            H[sj:sj + nB, si:si + nA] = block.T
 
     # Electron-nuclear attraction using properly rotated integrals
-    # Note: rotate_integrals works on sp (4×4) block only
     for i in range(n_atoms):
+        si, nA = starts[i], params[i].n_basis
         for j in range(n_atoms):
             if i == j:
                 continue
-            _, e1b_ij, _ = rotate_integrals_to_molecular_frame(
-                params[i], params[j], coords[i], coords[j],
-            )
-            # e1b is (min(nA,4), min(nA,4)) — only sp block
-            nA_sp = min(params[i].n_basis, 4)
-            for mu_a in range(nA_sp):
-                for nu_a in range(nA_sp):
-                    H[starts[i] + mu_a, starts[i] + nu_a] += e1b_ij[mu_a, nu_a]
-            # d-orbital electron-nuclear attraction. Triggered whenever A
-            # has d-orbitals — the (μν_A | s_B s_B) integral for e-n
-            # attraction only depends on B through Z_B (= pB.n_valence)
-            # and rho0_B (from gss_B), so the same code path handles YH
-            # (B is H), YX (B is sp heavy) and YY (B has d-orbitals too).
-            # Uses the proper PYSEQM-equivalent 45-element local-frame
-            # integral + RotateCore Wigner-D rotation in
-            # tetci_yh.yh_e1b_contribution. This REPLACES the sp-only
-            # contribution above with the full 9×9 H_core block for atom A.
-            if params[i].n_basis == 9 and params[j].n_basis in (1, 4, 9):
-                from .tetci_yh import yh_e1b_contribution
-                e1b_full = yh_e1b_contribution(
-                    params[i], params[j], coords[i], coords[j]
-                )
-                # Subtract the sp contribution we already added (avoid double-count),
-                # then add the full 9×9 block.
-                sA = starts[i]
-                for mu in range(nA_sp):
-                    for nu in range(nA_sp):
-                        H[sA + mu, sA + nu] -= e1b_ij[mu, nu]
-                for mu in range(9):
-                    for nu in range(9):
-                        H[sA + mu, sA + nu] += e1b_full[mu, nu]
+            H[si:si + nA, si:si + nA] += _pair_core_attraction(
+                params[i], params[j], coords[i], coords[j])
 
     return H
 
