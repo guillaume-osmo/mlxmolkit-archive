@@ -13,9 +13,9 @@ import re
 import time
 from collections import defaultdict
 
-from mlxmolkit.rm1.pipeline import rm1_from_smiles, _smiles_to_3d
-from mlxmolkit.rm1.scf import rm1_energy, rm1_energy_batch
-from mlxmolkit.rm1.methods import get_params
+from mlxmolkit.nddo.pipeline import rm1_from_smiles, _smiles_to_3d
+from mlxmolkit.nddo.scf import rm1_energy, rm1_energy_batch
+from mlxmolkit.nddo.methods import get_params
 
 # ================================================================
 # Step 1: Load reference data from Excel

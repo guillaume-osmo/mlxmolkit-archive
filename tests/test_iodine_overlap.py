@@ -10,9 +10,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from mlxmolkit.rm1 import nddo_energy
-from mlxmolkit.rm1.methods import get_params
-from mlxmolkit.rm1.overlap_d import overlap_d_molecular_frame
+from mlxmolkit.nddo import nddo_energy
+from mlxmolkit.nddo.methods import get_params
+from mlxmolkit.nddo.overlap_d import overlap_d_molecular_frame
 
 P = get_params("PM6_D")
 

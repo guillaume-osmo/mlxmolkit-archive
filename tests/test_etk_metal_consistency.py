@@ -132,12 +132,37 @@ def test_etkdg_variant_shortcuts_match_rdkit_embed_parameter_flags():
         "useMacrocycle14config": 4,
         "ETversion": 5,
     }
+    checked = []
     for variant, expected in ETKDG_VARIANTS.items():
         if variant == "DG":
             continue
-        params = getattr(rdDistGeom, variant)()
+        factory = getattr(rdDistGeom, variant, None)
+        if factory is None:
+            # A combination RDKit does not name (e.g. ETKDGv3sr, the union of
+            # ETKDGv3 and srETKDGv3). There is nothing to compare it against —
+            # test_variants_without_an_rdkit_factory_are_deliberate covers it.
+            continue
+        params = factory()
         for attr, idx in expected_attrs.items():
             assert getattr(params, attr) == expected[idx], f"{variant}.{attr}"
+        checked.append(variant)
+
+    assert set(checked) == {"KDG", "ETDG", "ETDGv2", "ETKDG", "ETKDGv2",
+                            "ETKDGv3", "srETKDGv3"}, (
+        f"RDKit's own variants must all be checked, got {sorted(checked)}"
+    )
+
+
+def test_variants_without_an_rdkit_factory_are_deliberate():
+    """Anything not in RDKit is ours, and must be a real flag combination."""
+    extra = {v for v in ETKDG_VARIANTS
+             if v != "DG" and getattr(rdDistGeom, v, None) is None}
+    assert extra == {"ETKDGv3sr"}, (
+        f"unexpected non-RDKit variant(s): {extra - {'ETKDGv3sr'}}"
+    )
+    flags = ETKDG_VARIANTS["ETKDGv3sr"]
+    assert len(flags) == 6 and all(isinstance(f, bool) for f in flags[:5])
+    assert flags[5] == 2
 
 
 def test_etk_variant_term_families_are_not_mixed():

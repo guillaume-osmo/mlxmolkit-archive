@@ -2,7 +2,7 @@
 SMILES → RDKit 3D → RM1 energy pipeline.
 
 Usage:
-    from mlxmolkit.rm1.pipeline import rm1_from_smiles, rm1_from_smiles_batch
+    from mlxmolkit.nddo.pipeline import rm1_from_smiles, rm1_from_smiles_batch
 
     result = rm1_from_smiles("c1ccccc1")  # benzene
     results = rm1_from_smiles_batch(["O", "C", "CC", "c1ccccc1"])

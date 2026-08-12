@@ -38,7 +38,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from mlxmolkit.rm1 import nddo_energy
+from mlxmolkit.nddo import nddo_energy
 
 _ns: dict = {}
 exec((pathlib.Path(__file__).parent / "_mopac_ref_generated.py").read_text(), _ns)

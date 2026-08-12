@@ -105,10 +105,10 @@ def _run_native(atoms, coords):
     occupied at iter 0, then heavy damping freezes the wrong basin.
     DIIS-driven extrapolation finds the right basin reliably.
     """
-    from mlxmolkit.rm1.scf import (
+    from mlxmolkit.nddo.scf import (
         _build_basis_info, _build_core_hamiltonian, _build_fock,
     )
-    from mlxmolkit.rm1.methods import get_params
+    from mlxmolkit.nddo.methods import get_params
 
     PARAMS = get_params("PM6_D")
     coords = np.asarray(coords, dtype=np.float64)

@@ -8,7 +8,7 @@ These tests guard the critical numerical invariants:
 Reference values were captured from PYSEQM 2.0.0 (LANL, BSD-3) on
 2026-05-24 and hardcoded so the tests run without a PYSEQM dependency.
 
-If you change ANY of the vendored code in mlxmolkit/rm1/_pyseqm_port/
+If you change ANY of the vendored code in mlxmolkit/nddo/_pyseqm_port/
 and these tests break, the change has introduced a numerical regression.
 """
 from __future__ import annotations
@@ -16,14 +16,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from mlxmolkit.rm1._pyseqm_port.constants_np import qn_int, qnD_int
-from mlxmolkit.rm1._pyseqm_port.diat_overlapD_np import diatom_overlap_matrixD
-from mlxmolkit.rm1._pyseqm_port.two_elec_two_center_int_np import (
+from mlxmolkit.nddo._pyseqm_port.constants_np import qn_int, qnD_int
+from mlxmolkit.nddo._pyseqm_port.diat_overlapD_np import diatom_overlap_matrixD
+from mlxmolkit.nddo._pyseqm_port.two_elec_two_center_int_np import (
     two_elec_two_center_int,
 )
-from mlxmolkit.rm1.params import ANG_TO_BOHR
-from mlxmolkit.rm1.methods import METHOD_PARAMS
-from mlxmolkit.rm1 import d_two_center as d2c
+from mlxmolkit.nddo.params import ANG_TO_BOHR
+from mlxmolkit.nddo.methods import METHOD_PARAMS
+from mlxmolkit.nddo import d_two_center as d2c
 
 
 # ----------------------------------------------------------------------
@@ -105,7 +105,7 @@ def test_overlap_is_symmetric_under_atom_label_swap():
     must be transposes. diatom_overlap_matrixD requires qni>=qnj
     internally, so the swap routing in overlap_d._pyseqm_overlap_matrix
     must give the right answer regardless of caller ordering."""
-    from mlxmolkit.rm1.overlap_d import _pyseqm_overlap_matrix
+    from mlxmolkit.nddo.overlap_d import _pyseqm_overlap_matrix
     PARAMS = METHOD_PARAMS['PM6_D']
     # PHYSICAL geometry: S at origin, H at +x. Same in both calls.
     coord_S = np.array([0., 0., 0.])
@@ -130,7 +130,7 @@ def test_tetci_ri_sc_bit_exact():
       ri[1] = -1.717..., NOT zero. If you see all zeros except ri[0]/[2]/[3],
       the rho/dd/qq arrays are getting truncated to integer dtype somewhere.
     """
-    from mlxmolkit.rm1._pyseqm_port import two_elec_two_center_int_np as tetci_mod
+    from mlxmolkit.nddo._pyseqm_port import two_elec_two_center_int_np as tetci_mod
 
     captured = {}
     orig_wq = tetci_mod.w_withquaternion
@@ -233,7 +233,7 @@ def test_rho_arrays_are_float_dtype():
     to the bare 1/r Coulomb."""
     import inspect
     src = inspect.getsource(
-        __import__('mlxmolkit.rm1._pyseqm_port.two_elec_two_center_int_np',
+        __import__('mlxmolkit.nddo._pyseqm_port.two_elec_two_center_int_np',
                    fromlist=['two_elec_two_center_int']).two_elec_two_center_int
     )
     # We expect explicit float64 init for the rho/dd/qq arrays.
@@ -253,10 +253,10 @@ def test_rho_arrays_are_float_dtype():
 def _run_native_scf(atoms, coords):
     """Mini SCF driver — copy of tests.test_pm6_d_native._run_native to
     avoid the brittle relative-import path."""
-    from mlxmolkit.rm1.scf import (
+    from mlxmolkit.nddo.scf import (
         _build_basis_info, _build_core_hamiltonian, _build_fock,
     )
-    from mlxmolkit.rm1.methods import get_params
+    from mlxmolkit.nddo.methods import get_params
 
     PARAMS = get_params("PM6_D")
     coords = np.asarray(coords, dtype=np.float64)

@@ -51,7 +51,7 @@ examples close to these public names.
 | Morgan/Tanimoto/Butina | `fp_uint8_to_uint32`, `tanimoto_matrix_metal_u32`, `tanimoto_neighbors_blockwise`, `butina_tanimoto_mlx` | `tanimoto_*`, `butina.py`, `butina_metal.py` |
 | Conformers | `generate_conformers_nk`, `ConformerResult`, `PipelineResult` | `conformer_pipeline_v2.py`, `conformer_metal.py`, `shared_batch.py` |
 | MMFF | `run_mmff=True` in conformer generation, optimizer modules | `mmff_*`, Metal kernels |
-| QM / NDDO | `mlxmolkit.rm1.nddo_energy`, `nddo_energy_batch`, `pm6_d3h4_correction` | `mlxmolkit/rm1/*` |
+| QM / NDDO | `mlxmolkit.nddo.nddo_energy`, `nddo_energy_batch`, `pm6_d3h4_correction` | `mlxmolkit/nddo/*` |
 | ESP/RESP labels | `connolly_surface_grid`, `fit_esp_charges_mlx`, `fit_resp_charges_mlx`, `pm6_esp_resp_charge_labels` | `esp_resp.py` |
 | AM1-BCC | `am1_bcc_charges_from_rdkit_mol(s)`, `symmetrize_charges_by_topology` | `am1bcc.py` |
 | Learned charge model | `GeometricChargePredictor`, `predict_partial_charges_*` | `charge_model.py`, `charge_training_dataset.py` |
@@ -133,7 +133,7 @@ match. It is not a general cross-molecule shape overlay.
 The current low-level API is function-oriented:
 
 ```python
-from mlxmolkit.rm1 import nddo_energy, pm6_d3h4_correction
+from mlxmolkit.nddo import nddo_energy, pm6_d3h4_correction
 
 result = nddo_energy(atoms, coords, method="PM6_D", molecular_charge=0)
 correction = pm6_d3h4_correction(atoms, coords)

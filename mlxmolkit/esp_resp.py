@@ -305,7 +305,7 @@ def pm6_esp_resp_charge_labels(
     atom_array = np.asarray(atoms, dtype=np.int64)
     coord_array = _as_coords(coords)
     if grid_coords is None or esp_values is None:
-        from mlxmolkit.rm1 import nddo_energy
+        from mlxmolkit.nddo import nddo_energy
 
         scf = nddo_energy(
             atom_array.tolist(),
@@ -321,7 +321,7 @@ def pm6_esp_resp_charge_labels(
             atomic_multipoles_from_density,
             nddo_esp_on_grid,
         )
-        from mlxmolkit.rm1.methods import get_params
+        from mlxmolkit.nddo.methods import get_params
 
         params = [get_params(method)[int(z)] for z in atom_array.tolist()]
         q_mono, dip, _quad = atomic_multipoles_from_density(

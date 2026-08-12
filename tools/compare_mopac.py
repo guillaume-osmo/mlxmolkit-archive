@@ -1,4 +1,4 @@
-"""Compare mlxmolkit.rm1 PM6 against OpenMOPAC (ground truth) on fixed geometries.
+"""Compare mlxmolkit.nddo PM6 against OpenMOPAC (ground truth) on fixed geometries.
 
 For each molecule: one fixed RDKit geometry (ETKDGv3 seed=1 + MMFF) ->
   * MOPAC `PM6 1SCF`            -> FINAL HEAT OF FORMATION + NET ATOMIC CHARGES
@@ -16,7 +16,7 @@ import numpy as np
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 
-from mlxmolkit.rm1 import nddo_energy
+from mlxmolkit.nddo import nddo_energy
 
 RDLogger.DisableLog("rdApp.*")
 MOPAC = "/Users/guillaume-osmo/miniconda3/envs/osmo/bin/mopac"

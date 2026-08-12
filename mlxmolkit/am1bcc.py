@@ -10,8 +10,8 @@ import numpy as np
 
 import mlx.core as mx
 
-from mlxmolkit.rm1 import nddo_energy, nddo_energy_batch
-from mlxmolkit.rm1.methods import METHOD_PARAMS
+from mlxmolkit.nddo import nddo_energy, nddo_energy_batch
+from mlxmolkit.nddo.methods import METHOD_PARAMS
 
 
 @dataclass(frozen=True)
@@ -593,7 +593,7 @@ def am1_bcc_charges_from_rdkit_mol(
         n_bonds_assigned=work_mol.GetNumBonds(),
         metadata={
             "method": "AM1-BCC",
-            "am1_backend": f"mlxmolkit.rm1.nddo_energy(method='{am1_method}')",
+            "am1_backend": f"mlxmolkit.nddo.nddo_energy(method='{am1_method}')",
             "bcc_source": "OpenFF Recharge original-am1-bcc.json",
             "bcc_aromaticity": "OpenFF Recharge AM1BCC aromaticity model ported to RDKit",
             "scf_converged": bool(am1.get("converged", False)),
@@ -729,7 +729,7 @@ def am1_bcc_charges_from_rdkit_mols(
                 metadata={
                     "method": "AM1-BCC",
                     "am1_backend": (
-                        "mlxmolkit.rm1.nddo_energy_batch"
+                        "mlxmolkit.nddo.nddo_energy_batch"
                         f"(method='{am1_method}', use_metal={use_metal})"
                     ),
                     "bcc_source": "OpenFF Recharge original-am1-bcc.json",

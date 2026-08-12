@@ -32,6 +32,18 @@ ETKDG_VARIANTS = {
     "ETKDGv2":   (True,  True,  False, False, False, 2),
     "ETKDGv3":   (True,  True,  False, True,  True,  2),
     "srETKDGv3": (True,  True,  True,  False, False, 2),
+    # Not an RDKit variant. RDKit's table makes small-ring and macrocycle
+    # knowledge mutually exclusive — srETKDGv3 turns the macrocycle terms off,
+    # ETKDGv3 turns the small-ring terms off — although the two act on
+    # different molecules and never compete. This is their union.
+    #
+    # Measured over 400 molecules (100 each acyclic / single-ring / fused /
+    # macrocyclic) from the 12k ePOM subset, scored with RDKit's own MMFF94:
+    # it has the fewest catastrophic failures of any setting tried, 8 molecules
+    # above 5 kcal/mol against 12 for ETKDGv3 and 15 for RDKit's own ETKDGv3.
+    # Typical-case differences are within noise — see
+    # tools/bench_etkdg_variants.py.
+    "ETKDGv3sr": (True,  True,  True,  True,  True,  2),
 }
 
 
@@ -148,7 +160,11 @@ def extract_etk_params(
     ETKDGv2    True         True             False      False      False        2
     ETKDGv3    True         True             False      True       True         2
     srETKDGv3  True         True             True       False      False        2
+    ETKDGv3sr  True         True             True       True       True         2
     ========== ============ ================ ========== ========== ============ ==========
+
+    ``ETKDGv3sr`` is not one of RDKit's — it is the union of ETKDGv3 and
+    srETKDGv3, which RDKit offers only as alternatives.
     """
     # Variant shortcut
     torsion_embed_params = None

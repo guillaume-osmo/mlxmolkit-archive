@@ -16,7 +16,7 @@ import math
 import numpy as np
 import pytest
 
-from mlxmolkit.rm1.pm6_d3h4 import (
+from mlxmolkit.nddo.pm6_d3h4 import (
     d3_energy, h4_energy, hh_repulsion, pm6_d3h4_correction,
     _poly_hh, _pauling_coordination, _load_c6ab, _load_r0ab,
     PM6_D3H4_DISP, BOHR, RCOV,
