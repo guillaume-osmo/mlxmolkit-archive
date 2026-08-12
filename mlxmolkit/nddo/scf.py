@@ -399,6 +399,40 @@ def _build_core_hamiltonian(atoms, coords, info):
     return H
 
 
+def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB):
+    """Two-centre Coulomb/exchange contribution of ONE atom pair, applied to F.
+
+    Split out of :func:`_build_fock` for the same reason as the core-Hamiltonian
+    pair terms: this is the only part of the Fock build that moves when a
+    nucleus moves, so a gradient can refresh just the pairs that changed. The
+    one-centre block above depends solely on P and the atom parameters and is
+    invariant under displacement.
+
+    F is modified in place for the sp part and returned, because the d path
+    (d_two_center_fock) returns a new array.
+    """
+    w, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    nA_sp = min(pA.n_basis, 4)
+    nB_sp = min(pB.n_basis, 4)
+    #   F[mu nu_A] += sum P[la si_B] w        (J on A)
+    #   F[la si_B] += sum P[mu nu_A] w        (J on B)
+    #   F[mu la_AB] -= 0.5 sum P[nu si_AB] w  (K)
+    w_sp = w[:nA_sp, :nA_sp, :nB_sp, :nB_sp]
+    P_AA = P[sA:sA + nA_sp, sA:sA + nA_sp]
+    P_BB = P[sB:sB + nB_sp, sB:sB + nB_sp]
+    P_AB = P[sA:sA + nA_sp, sB:sB + nB_sp]
+    F[sA:sA + nA_sp, sA:sA + nA_sp] += np.einsum('abcd,cd->ab', w_sp, P_BB)
+    F[sB:sB + nB_sp, sB:sB + nB_sp] += np.einsum('abcd,ab->cd', w_sp, P_AA)
+    K_sp = -0.5 * np.einsum('abcd,bd->ac', w_sp, P_AB)
+    F[sA:sA + nA_sp, sB:sB + nB_sp] += K_sp
+    F[sB:sB + nB_sp, sA:sA + nA_sp] += K_sp.T
+
+    if pA.n_basis == 9 or pB.n_basis == 9:
+        from .d_two_center import d_two_center_fock
+        F = d_two_center_fock(F, P, pA, pB, sA, sB, rA, rB)
+    return F
+
+
 def _build_fock(H, P, info, atoms, coords):
     """Build Fock matrix F = H + G(P).
 
@@ -508,39 +542,10 @@ def _build_fock(H, P, info, atoms, coords):
                     F[pl, pk] += P[pl, pk] * pp_fac_off
 
     # === Two-center contribution (full 10x10 w tensor) ===
-    from .two_center_d import two_center_w_10x10
-
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
-            pA = params[i]
-            pB = params[j]
-            sA = starts[i]
-            sB = starts[j]
-
-            # 4x4 w tensor for sp block (verified against PYSEQM)
-            w, e1b_ij, e2a_ij = rotate_integrals_to_molecular_frame(
-                pA, pB, coords[i], coords[j],
-            )
-            nA_sp = min(pA.n_basis, 4)
-            nB_sp = min(pB.n_basis, 4)
-            # Vectorized sp two-center via einsum (replaces 4×4×4×4 loop):
-            #   F[μν_A] += Σ P[λσ_B] w[μν, λσ]   (J on A)
-            #   F[λσ_B] += Σ P[μν_A] w[μν, λσ]   (J on B)
-            #   F[μλ_AB] -= 0.5 Σ P[νσ_AB] w[μν, λσ]  (K)
-            w_sp = w[:nA_sp, :nA_sp, :nB_sp, :nB_sp]
-            P_AA = P[sA:sA + nA_sp, sA:sA + nA_sp]
-            P_BB = P[sB:sB + nB_sp, sB:sB + nB_sp]
-            P_AB = P[sA:sA + nA_sp, sB:sB + nB_sp]
-            F[sA:sA + nA_sp, sA:sA + nA_sp] += np.einsum('abcd,cd->ab', w_sp, P_BB)
-            F[sB:sB + nB_sp, sB:sB + nB_sp] += np.einsum('abcd,ab->cd', w_sp, P_AA)
-            K_sp = -0.5 * np.einsum('abcd,bd->ac', w_sp, P_AB)
-            F[sA:sA + nA_sp, sB:sB + nB_sp] += K_sp
-            F[sB:sB + nB_sp, sA:sA + nA_sp] += K_sp.T
-
-            # d-orbital two-center: proper rho3-6 based multipole integrals
-            if pA.n_basis == 9 or pB.n_basis == 9:
-                from .d_two_center import d_two_center_fock
-                F = d_two_center_fock(F, P, pA, pB, sA, sB, coords[i], coords[j])
+            F = _pair_fock_twocentre(F, P, params[i], params[j],
+                                     starts[i], starts[j], coords[i], coords[j])
 
     return F
 
