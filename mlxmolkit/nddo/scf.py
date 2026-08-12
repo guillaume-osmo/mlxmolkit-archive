@@ -1392,7 +1392,17 @@ def rm1_energy_batch_mlx(
     """
     from .batch import prepare_batch
     from .fock_metal import MetalFockContext
-    from mlx_addons.linalg import solve_lu
+    # mlx_addons is a private package and is not on PyPI, so an unguarded
+    # import of it here disabled this entire path for anyone without it: the
+    # ImportError was caught upstream and silently dropped the batch SCF back
+    # to the legacy route, per-molecule numpy eigh with a host round-trip on
+    # every Fock build. The DIIS solve is a batch of systems no larger than
+    # 7x7 (the history is capped at 6), which mx.linalg.solve handles.
+    try:
+        from mlx_addons.linalg import solve_lu
+    except ImportError:
+        def solve_lu(A, rhs):
+            return mx.linalg.solve(A, rhs, stream=mx.cpu)
 
     # This path runs the SCF in float32, whose density-RMS noise floor is
     # ~1e-5. A tighter conv_tol (e.g. the 1e-6 default) can never be tripped —
