@@ -292,7 +292,9 @@ def main() -> None:
             "n_atoms": mol.GetNumAtoms(),
             "n_heavy": mol.GetNumHeavyAtoms(),
             "n_rot_bonds": Descriptors.NumRotatableBonds(mol),
-            "n_odour_terms": int(score),
+            # `score` (the odour-descriptor count) ranks candidates for
+            # typicality but is deliberately NOT written out: the published
+            # set carries structures and chemical classes only, no odour data.
             "classes": "|".join(sorted(tags[i])) or "other",
         })
     out = pd.DataFrame(rows).sort_values(["classes", "mw"]).reset_index(drop=True)
