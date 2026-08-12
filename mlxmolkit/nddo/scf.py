@@ -1113,33 +1113,11 @@ def nddo_energy_batch(
     # d-orbital subset simply does not get the GPU speedup.
     charges_in = (list(molecular_charges) if molecular_charges is not None
                   else [0.0] * N)
-    d_positions = [i for i, (mol_atoms, _) in enumerate(molecules)
-                   if any(PARAMS[z].n_basis > 4 for z in mol_atoms)]
-    if d_positions:
-        d_set = set(d_positions)
-        sp_positions = [i for i in range(N) if i not in d_set]
-        merged: list[dict] = [None] * N
-        if sp_positions:
-            # Nothing here has d orbitals, so this cannot recurse again.
-            sp_results = nddo_energy_batch(
-                [molecules[i] for i in sp_positions],
-                max_iter=max_iter, conv_tol=conv_tol, use_metal=use_metal,
-                verbose=verbose, method=method,
-                molecular_charges=[charges_in[i] for i in sp_positions],
-                density_solver=density_solver,
-            )
-            for pos, res in zip(sp_positions, sp_results):
-                merged[pos] = res
-        if verbose:
-            print(f"  {len(d_positions)}/{N} molecules contain d-orbital "
-                  f"elements under {method}; solving those sequentially")
-        for i in d_positions:
-            mol_atoms, mol_coords = molecules[i]
-            merged[i] = nddo_energy(
-                mol_atoms, mol_coords, max_iter=max_iter, conv_tol=conv_tol,
-                verbose=False, method=method, molecular_charge=charges_in[i],
-            )
-        return merged
+    # d-orbital molecules used to be split out and solved sequentially: the
+    # batch two-centre store was sp-shaped and could not hold a 9-orbital
+    # atom. It is packed per pair now, and the Metal kernel indexes it and
+    # applies the one-centre W integrals, so they go through the batch path
+    # like anything else.
 
     batch = prepare_batch(molecules, param_dict=PARAMS,
                           molecular_charges=molecular_charges,
