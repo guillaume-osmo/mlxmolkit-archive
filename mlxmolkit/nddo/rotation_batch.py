@@ -21,6 +21,8 @@ version, which remains the reference it is tested against.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 # The 100 (kk, ll, mm, nn) combinations with kk >= ll and mm >= nn, grouped by
@@ -174,6 +176,39 @@ def rotate_hh_batch(ri: np.ndarray) -> np.ndarray:
     return w
 
 
+
+# Off by default, and the reason is measured rather than assumed.
+#
+# rotate_xx_batch_mlx beats the NumPy rotation on the arithmetic alone — 11.9x
+# at 24000 pairs. End to end through the batched SCF it buys nothing:
+#
+#     800 molecules, 5 repeats     median      min     max
+#       NumPy rotation             1.94 s     1.89    1.99
+#       MLX rotation               1.96 s     1.95    1.98
+#     median ratio 0.99x, distributions overlap
+#
+# The rotation is ~26% of prepare_batch, so Amdahl caps the gain near 1.2x
+# before anything else; the float64 -> float32 -> device -> host round trip at
+# the boundary then spends the rest. It also costs 7.3e-04 eV of agreement with
+# the NumPy path, which is float32.
+#
+# This becomes worth switching on when the whole of prepare_batch is on device
+# and there is no boundary to cross. Until then the flag exists so the
+# experiment can be repeated, not because it should be enabled:
+#     MLXMOLKIT_ROTATE_MLX_MIN=0 forces the GPU path.
+MLX_MIN_PAIRS = int(os.environ.get("MLXMOLKIT_ROTATE_MLX_MIN", "100000000"))
+
+
+def _use_mlx(n_pairs: int) -> bool:
+    if n_pairs < MLX_MIN_PAIRS:
+        return False
+    try:
+        import mlx.core  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def rotate_pairs(pair_params, pair_coords):
     """Rotated tensors for a heterogeneous list of sp pairs.
 
@@ -232,7 +267,13 @@ def rotate_pairs(pair_params, pair_coords):
             continue
         sel = np.array(idxs)
         if pair_type == "XX":
-            out[sel] = rotate_xx_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
+            if _use_mlx(sel.size):
+                import mlx.core as mx
+                arrs = [mx.array(a[sel].astype(np.float32))
+                        for a in (ri_all, r0, r1, r2)]
+                out[sel] = np.asarray(rotate_xx_batch_mlx(*arrs), dtype=np.float64)
+            else:
+                out[sel] = rotate_xx_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
         elif pair_type == "XH":
             out[sel] = rotate_xh_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
         else:
@@ -242,3 +283,115 @@ def rotate_pairs(pair_params, pair_coords):
         sel = np.array(swapped)
         out[sel] = np.transpose(out[sel], (0, 3, 4, 1, 2))
     return out
+
+
+# ---------------------------------------------------------------------------
+
+def _fused_scatter_plan():
+    """Flat destination indices for every (category, symmetry) slot, once.
+
+    The rotation writes each computed value into four positions — the tensor is
+    symmetric in its first index pair and its last — across nine categories, so
+    a naive implementation issues 36 scatters. Measured on (24000, 256): 36
+    separate scatters cost 5.69 ms against 1.10 ms for a single fused one, a
+    5.2x difference that is dispatch overhead, not scatter work. (For
+    reference, a gather of the same shape is 0.22-0.30 ms: scatter is
+    intrinsically 1.6-3.3x dearer, so avoid it where a gather will do.)
+
+    So the plan is built once and every value is written in one call.
+    """
+    order = ["ss_ss", "ss_ps", "ss_pp", "ps_ss", "ps_ps", "ps_pp",
+             "pp_ss", "pp_ps", "pp_pp"]
+    dest = []
+    for name in order:
+        c = _CATEGORIES[name]
+        kk, ll, mm, nn = c[:, 0], c[:, 1], c[:, 2], c[:, 3]
+        for a, b, x, y in ((kk, ll, mm, nn), (ll, kk, mm, nn),
+                           (kk, ll, nn, mm), (ll, kk, nn, mm)):
+            dest.append(a * 64 + b * 16 + x * 4 + y)
+    return order, np.concatenate(dest).astype(np.int32)
+
+
+_MLX_ORDER, _MLX_DEST = _fused_scatter_plan()
+
+
+def rotate_xx_batch_mlx(ri, r0, r1, r2):
+    """`rotate_xx_batch` on the GPU. Takes and returns ``mx.array``.
+
+    Identical arithmetic, expressed in MLX, with every write fused into one
+    scatter — see :func:`_fused_scatter_plan` for why that matters.
+
+    Worth it only in bulk. Below ~1000 pairs the dispatch overhead exceeds the
+    gain and the NumPy path is faster; a 300-molecule batch produces ~24000.
+    """
+    import mlx.core as mx
+
+    P = ri.shape[0]
+
+    def orb(name):
+        c = _CATEGORIES[name]
+        return (mx.array(c[:, 0] - 1), mx.array(c[:, 1] - 1),
+                mx.array(c[:, 2] - 1), mx.array(c[:, 3] - 1))
+
+    values = {}
+
+    c = _CATEGORIES["ss_ss"]
+    values["ss_ss"] = mx.broadcast_to(ri[:, 0:1], (P, c.shape[0]))
+
+    _, _, m, n = orb("ss_ps")
+    values["ss_ps"] = ri[:, 4:5] * r0[:, m]
+
+    _, _, m, n = orb("ss_pp")
+    values["ss_pp"] = (ri[:, 10:11] * r0[:, m] * r0[:, n]
+                       + ri[:, 11:12] * (r1[:, m] * r1[:, n] + r2[:, m] * r2[:, n]))
+
+    k, _, _, _ = orb("ps_ss")
+    values["ps_ss"] = ri[:, 1:2] * r0[:, k]
+
+    k, _, m, _ = orb("ps_ps")
+    values["ps_ps"] = (ri[:, 5:6] * r0[:, k] * r0[:, m]
+                       + ri[:, 6:7] * (r1[:, k] * r1[:, m] + r2[:, k] * r2[:, m]))
+
+    k, _, m, n = orb("ps_pp")
+    values["ps_pp"] = (
+        ri[:, 12:13] * (r0[:, k] * r0[:, m] * r0[:, n])
+        + ri[:, 13:14] * ((r1[:, m] * r1[:, n] + r2[:, m] * r2[:, n]) * r0[:, k])
+        + ri[:, 14:15] * (r1[:, k] * (r1[:, n] * r0[:, m] + r1[:, m] * r0[:, n])
+                          + r2[:, k] * (r2[:, m] * r0[:, n] + r2[:, n] * r0[:, m])))
+
+    k, l, _, _ = orb("pp_ss")
+    values["pp_ss"] = (ri[:, 2:3] * r0[:, k] * r0[:, l]
+                       + ri[:, 3:4] * (r1[:, k] * r1[:, l] + r2[:, k] * r2[:, l]))
+
+    k, l, m, _ = orb("pp_ps")
+    values["pp_ps"] = (
+        ri[:, 7:8] * (r0[:, k] * r0[:, l] * r0[:, m])
+        + ri[:, 8:9] * ((r1[:, k] * r1[:, l] + r2[:, k] * r2[:, l]) * r0[:, m])
+        + ri[:, 9:10] * (r0[:, k] * (r1[:, l] * r1[:, m] + r2[:, l] * r2[:, m])
+                         + r0[:, l] * (r1[:, k] * r1[:, m] + r2[:, k] * r2[:, m])))
+
+    k, l, m, n = orb("pp_pp")
+    t0 = r0[:, k] * r0[:, l] * r0[:, m] * r0[:, n]
+    t1 = (r1[:, k] * r1[:, l] + r2[:, k] * r2[:, l]) * r0[:, m] * r0[:, n]
+    t2 = (r1[:, m] * r1[:, n] + r2[:, m] * r2[:, n]) * r0[:, k] * r0[:, l]
+    quad = (r1[:, k] * r1[:, l] * r1[:, m] * r1[:, n]
+            + r2[:, k] * r2[:, l] * r2[:, m] * r2[:, n])
+    val5 = (r0[:, k] * (r0[:, m] * (r1[:, l] * r1[:, n] + r2[:, l] * r2[:, n])
+                        + r0[:, n] * (r1[:, l] * r1[:, m] + r2[:, l] * r2[:, m]))
+            + r0[:, l] * (r0[:, m] * (r1[:, k] * r1[:, n] + r2[:, k] * r2[:, n])
+                          + r0[:, n] * (r1[:, k] * r1[:, m] + r2[:, k] * r2[:, m])))
+    mix3 = (r1[:, k] * r1[:, l] * r2[:, m] * r2[:, n]
+            + r2[:, k] * r2[:, l] * r1[:, m] * r1[:, n])
+    cross = ((r1[:, k] * r2[:, l] + r2[:, k] * r1[:, l])
+             * (r1[:, m] * r2[:, n] + r2[:, m] * r1[:, n]))
+    values["pp_pp"] = (ri[:, 15:16] * t0 + ri[:, 16:17] * t1 + ri[:, 17:18] * t2
+                       + ri[:, 18:19] * quad + ri[:, 19:20] * val5
+                       + ri[:, 20:21] * mix3 + ri[:, 21:22] * cross)
+
+    # Each category's values repeated for its four symmetric destinations,
+    # concatenated in the same order the plan was built, then written once.
+    payload = mx.concatenate(
+        [values[name] for name in _MLX_ORDER for _ in range(4)], axis=1)
+    flat = mx.zeros((P, 256))
+    flat[:, mx.array(_MLX_DEST)] = payload
+    return mx.reshape(flat, (P, 4, 4, 4, 4))
