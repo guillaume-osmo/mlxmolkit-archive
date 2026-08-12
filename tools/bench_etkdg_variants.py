@@ -138,6 +138,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None, help="molecules per topology")
     ap.add_argument("--relax-iters", type=int, default=400)
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--raw-out", type=Path, default=None,
+                    help="also write the full per-molecule table (~1 MB)")
     ap.add_argument("--out", type=Path,
                     default=ROOT / "tests" / "data" / "bench_etkdg_variants.csv")
     args = ap.parse_args()
@@ -203,8 +205,17 @@ def main() -> None:
     # regret = how far above the best any competitor found for that molecule
     df["regret"] = df.groupby(["smiles", "ruler"])["energy"].transform(
         lambda g: g - g.min())
+    # Only the aggregate is committed: the per-molecule table is ~1 MB of data,
+    # which belongs in object storage, not in git.
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(args.out, index=False)
+    (df.groupby(["ruler", "setting", "topology"])["regret"]
+       .agg(n="size", median="median", mean="mean",
+            p90=lambda g: g.quantile(.9), max="max",
+            n_over_5kcal=lambda g: int((g > 5).sum()))
+       .reset_index()
+       .to_csv(args.out, index=False))
+    if args.raw_out:
+        df.to_csv(args.raw_out, index=False)
 
     order = [c for c, _ in competitors]
     for ruler in RULERS:
