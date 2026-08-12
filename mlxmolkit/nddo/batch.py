@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, EV_TO_KCAL
 from .overlap import overlap_molecular_frame
 from .rotation import rotate_integrals_to_molecular_frame
+from .two_center_d import two_center_w_10x10
+from .scf import _pair_resonance_block, _pair_core_attraction
 from .integrals import compute_nuclear_repulsion, nuclear_repulsion_for_method
 
 
@@ -176,43 +178,52 @@ def prepare_batch(
         # === Build H_core ===
         H = np.zeros((n_bas, n_bas), dtype=np.float64)
 
-        # Diagonal: Uss/Upp
+        # Diagonal: Uss/Upp/Udd
         for mu in range(n_bas):
             i = b2a[mu]
             p = params[i]
-            H[mu, mu] = p.Uss if btype[mu] == 0 else p.Upp
+            if btype[mu] == 0:
+                H[mu, mu] = p.Uss
+            elif btype[mu] <= 3:
+                H[mu, mu] = p.Upp
+            else:
+                H[mu, mu] = p.Udd
 
         starts = atom_basis_start
 
-        # Off-diagonal resonance + nuclear attraction
+        # Off-diagonal resonance and electron-nuclear attraction. These reuse
+        # the same per-pair functions the sequential solver uses, rather than
+        # the sp-only copies that lived here: those assumed 4 orbitals per atom
+        # and overran their own arrays on sulfur or a halogen.
         for i in range(n_at):
             for j in range(i + 1, n_at):
-                pA, pB = params[i], params[j]
+                block = _pair_resonance_block(params[i], params[j],
+                                              coords[i], coords[j])
+                si, sj = starts[i], starts[j]
+                nA, nB = params[i].n_basis, params[j].n_basis
+                H[si:si + nA, sj:sj + nB] = block
+                H[sj:sj + nB, si:si + nA] = block.T
 
-                # Overlap for resonance
-                S_ij = overlap_molecular_frame(pA, pB, coords[i], coords[j])
-                for mu_off in range(pA.n_basis):
-                    mu = starts[i] + mu_off
-                    beta_mu = pA.beta_s if btype[mu] == 0 else pA.beta_p
-                    for nu_off in range(pB.n_basis):
-                        nu = starts[j] + nu_off
-                        beta_nu = pB.beta_s if btype[nu] == 0 else pB.beta_p
-                        H[mu, nu] = 0.5 * (beta_mu + beta_nu) * S_ij[mu_off, nu_off]
-                        H[nu, mu] = H[mu, nu]
+        for i in range(n_at):
+            si, nA = starts[i], params[i].n_basis
+            for j in range(n_at):
+                if i == j:
+                    continue
+                H[si:si + nA, si:si + nA] += _pair_core_attraction(
+                    params[i], params[j], coords[i], coords[j])
 
-        # Nuclear attraction + w tensor
+        # w tensor
         for i in range(n_at):
             for j in range(n_at):
                 if i == j:
                     continue
-                w_ij, e1b_ij, e2a_ij = rotate_integrals_to_molecular_frame(
-                    params[i], params[j], coords[i], coords[j],
-                )
-                # Nuclear attraction on atom i from nucleus j
-                nA = params[i].n_basis
-                for mu_a in range(nA):
-                    for nu_a in range(nA):
-                        H[starts[i] + mu_a, starts[i] + nu_a] += e1b_ij[mu_a, nu_a]
+                if params[i].n_basis == 9 or params[j].n_basis == 9:
+                    w_ij = two_center_w_10x10(params[i], params[j],
+                                              coords[i], coords[j])
+                else:
+                    w_ij, _, _ = rotate_integrals_to_molecular_frame(
+                        params[i], params[j], coords[i], coords[j],
+                    )
 
                 # Store w tensor (only upper triangle i<j)
                 if i < j:
