@@ -66,6 +66,28 @@ def test_the_variant_table_still_marks_v3_as_the_macrocycle_variant():
     assert ETKDG_VARIANTS["ETKDGv2"][4] is False
 
 
+def test_etkdgv3sr_is_the_union_of_the_two_v3_variants():
+    """RDKit offers small-ring and macrocycle knowledge only as alternatives."""
+    small_ring, macro, macro14 = 2, 3, 4
+    v3, sr, union = (ETKDG_VARIANTS[k] for k in ("ETKDGv3", "srETKDGv3", "ETKDGv3sr"))
+    assert v3[small_ring] is False and sr[macro] is False, (
+        "RDKit's own variants are no longer mutually exclusive — "
+        "ETKDGv3sr may have stopped being useful"
+    )
+    for slot in (small_ring, macro, macro14):
+        assert union[slot] is True
+    assert union[:2] == v3[:2] and union[5] == v3[5]
+
+
+def test_the_union_variant_generates_conformers():
+    from mlxmolkit.conformer_pipeline_v2 import generate_conformers_nk as gen
+
+    got = gen([MACROCYCLE, SMALL_RINGS[2]], 3, variant="ETKDGv3sr", run_mmff=True)
+    for mol in got.molecules:
+        assert len(mol.positions_3d) == 3
+        assert np.isfinite(np.asarray(mol.positions_3d, dtype=float)).all()
+
+
 def test_selecting_v3_embeds_a_macrocycle_against_macrocycle_bounds():
     """End to end: the variant name alone must switch the bounds."""
     from mlxmolkit.conformer_pipeline_v2 import generate_conformers_nk as gen
