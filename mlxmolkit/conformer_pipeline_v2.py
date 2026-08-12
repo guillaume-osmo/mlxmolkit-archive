@@ -20,7 +20,7 @@ import numpy as np
 import mlx.core as mx
 
 from .dg_extract import DGParams, extract_dg_params, get_bounds_matrix, metric_matrix_positions
-from .etk_extract import ETKParams, extract_etk_params
+from .etk_extract import ETKDG_VARIANTS, ETKParams, extract_etk_params
 from .shared_batch import (
     SharedConstraintBatch,
     pack_shared_dg_batch,
@@ -407,6 +407,11 @@ def generate_conformers_nk(
     # Determine which ETK stages to run based on variant
     run_etk = variant != "DG"
 
+    # The macrocycle 1-4 bounds are what makes ETKDGv3 v3 for large rings, and
+    # they enter through the bounds matrix, not through the torsion terms. The
+    # variant table is the only place that knows whether they are wanted.
+    macro14 = ETKDG_VARIANTS.get(variant, (False,) * 6)[4]
+
     # ---- Extract per-molecule params (CPU, once) ----
     mols, dg_params_list, etk_params_list, mmff_params_list_all, mol_n_atoms = [], [], [], [], []
     bmats = []
@@ -416,7 +421,7 @@ def generate_conformers_nk(
             raise ValueError(f"Invalid SMILES at index {i}: {smi}")
         mol = Chem.AddHs(mol)
         mols.append(mol)
-        bmat = get_bounds_matrix(mol)
+        bmat = get_bounds_matrix(mol, use_macrocycle14config=macro14)
         bmats.append(bmat)
         dg_params_list.append(extract_dg_params(mol, bmat, dim=4))
         if run_etk:

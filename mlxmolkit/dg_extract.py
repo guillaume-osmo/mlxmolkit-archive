@@ -148,10 +148,26 @@ class TetrahedralCheckData:
     mol_indices: np.ndarray  # int32
 
 
-def get_bounds_matrix(mol: Chem.Mol) -> np.ndarray:
-    """Get distance bounds matrix from RDKit."""
-    bmat = rdDistGeom.GetMoleculeBoundsMatrix(mol)
-    return bmat
+def get_bounds_matrix(
+    mol: Chem.Mol, use_macrocycle14config: bool = False
+) -> np.ndarray:
+    """Get distance bounds matrix from RDKit.
+
+    Args:
+        mol: molecule, with hydrogens already added.
+        use_macrocycle14config: apply RDKit's macrocycle-specific 1-4 bounds,
+            the ETKDGv3 change from Wang et al. (JCIM 2020). It is off in
+            RDKit's own default, so it has to be asked for explicitly; without
+            it a macrocycle is embedded against generic 1-4 bounds and the ring
+            has far too much conformational freedom. Rings smaller than a
+            macrocycle are unaffected — the flag changes no bound on them.
+
+    Returns:
+        The bounds matrix, upper bounds in the upper triangle and lower bounds
+        in the lower triangle.
+    """
+    return rdDistGeom.GetMoleculeBoundsMatrix(
+        mol, useMacrocycle14config=use_macrocycle14config)
 
 
 def extract_dg_params(
