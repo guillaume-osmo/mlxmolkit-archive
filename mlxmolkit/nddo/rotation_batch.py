@@ -199,8 +199,17 @@ def rotate_hh_batch(ri: np.ndarray) -> np.ndarray:
 MLX_MIN_PAIRS = int(os.environ.get("MLXMOLKIT_ROTATE_MLX_MIN", "100000000"))
 
 
-def _use_mlx(n_pairs: int) -> bool:
-    if n_pairs < MLX_MIN_PAIRS:
+def _use_mlx(n_pairs: int, forced: bool | None = None) -> bool:
+    """Whether to rotate on the GPU.
+
+    `forced` is the caller's decision and wins: the GPU path is float32, so it
+    is correct only where the caller has already accepted float32 downstream.
+    Passing None falls back to the environment threshold, which exists so the
+    experiment can be repeated by hand.
+    """
+    if forced is False:
+        return False
+    if forced is not True and n_pairs < MLX_MIN_PAIRS:
         return False
     try:
         import mlx.core  # noqa: F401
@@ -209,12 +218,20 @@ def _use_mlx(n_pairs: int) -> bool:
     return True
 
 
-def rotate_pairs(pair_params, pair_coords):
+def rotate_pairs(pair_params, pair_coords, use_mlx: bool | None = None):
     """Rotated tensors for a heterogeneous list of sp pairs.
 
     Args:
         pair_params: sequence of (pA, pB) ElementParams, sp only (n_basis <= 4).
         pair_coords: sequence of (coordA, coordB).
+        use_mlx: force the GPU rotation on or off. MLX cannot do float64 on
+            Metal — `float64 is not supported on the GPU` — so the GPU path
+            returns float32, which shifts a rotated integral by ~1e-6 eV in
+            absolute terms. That is chemically nothing and eleven orders below
+            anything an SCF resolves, but it is 130x the agreement the batch
+            path otherwise has with the float64 sequential solver, so it is the
+            caller's decision, not a heuristic's. None keeps the environment
+            threshold.
 
     Returns:
         (n_pairs, 4, 4, 4, 4). ``e1b`` and ``e2a`` are not returned because
@@ -261,7 +278,7 @@ def rotate_pairs(pair_params, pair_coords):
         if sel.size == 0:
             continue
         if pair_type == "XX":
-            if _use_mlx(sel.size):
+            if _use_mlx(sel.size, use_mlx):
                 import mlx.core as mx
                 arrs = [mx.array(a[sel].astype(np.float32))
                         for a in (ri_all, r0, r1, r2)]

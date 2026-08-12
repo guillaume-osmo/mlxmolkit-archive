@@ -152,6 +152,7 @@ def prepare_batch(
     param_dict: dict = None,
     molecular_charges: list[float] | None = None,
     method: str = 'RM1',
+    use_metal: bool = False,
 ) -> RM1Batch:
     """Pre-compute all integrals for a batch of molecules.
 
@@ -163,6 +164,11 @@ def prepare_batch(
         method: NDDO method name — selects the core-core repulsion form. Must
             match the method `param_dict` came from, or PM6/PM6_D energies
             come out several eV wrong.
+        use_metal: rotate the sp pairs on the GPU. MLX has no float64 on Metal,
+            so this makes the integrals float32 — worth ~10% of prepare_batch,
+            and correct only when the caller has already accepted float32 (the
+            Metal Fock kernel). The default keeps the float64 reference path,
+            which is what the batch-vs-sequential tests compare against.
 
     Returns:
         RM1Batch with all pre-computed data
@@ -298,7 +304,8 @@ def prepare_batch(
     # Doing it inside the per-molecule loop meant one scalar rotation per pair,
     # which was ~69% of prepare_batch.
     from .rotation_batch import rotate_pairs
-    pair_w = rotate_pairs(sp_params, sp_coords) if sp_ids.size else None
+    pair_w = (rotate_pairs(sp_params, sp_coords, use_mlx=use_metal)
+              if sp_ids.size else None)
 
     # d-bearing pairs the same way. two_elec_two_center_int is vectorised over
     # a pair axis, so asking it for one pair at a time cost 2.58 ms each and

@@ -1169,7 +1169,7 @@ def nddo_energy_batch(
     # applies the one-centre W integrals, so they go through the batch path
     # like anything else.
 
-    batch = prepare_batch(molecules, param_dict=PARAMS,
+    batch = prepare_batch(molecules, param_dict=PARAMS, use_metal=use_metal,
                           molecular_charges=molecular_charges,
                           method=method)
     MB = batch.max_basis
@@ -1418,7 +1418,7 @@ def rm1_energy_batch_mlx(
     if N == 0:
         return []
 
-    batch = prepare_batch(molecules, param_dict=PARAMS,
+    batch = prepare_batch(molecules, param_dict=PARAMS, use_metal=True,   # this path is float32 end to end
                           molecular_charges=molecular_charges,
                           method=method)
     MB = batch.max_basis
