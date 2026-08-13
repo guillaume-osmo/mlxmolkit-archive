@@ -313,7 +313,7 @@ PM3_PARAMS: Dict[int, ElementParams] = {
         gauss_M=[1.607311, 1.598395, 0.0, 0.0],
     ),
     9: ElementParams(
-        Z=9, symbol="F", n_basis=4, n_valence=7, eheat=18.86,
+        Z=9, symbol="F", n_basis=4, n_valence=7, eheat=18.89,
         Uss=-110.435303, Upp=-105.685047,
         zeta_s=4.708555, zeta_p=2.491178,
         beta_s=-48.405939, beta_p=-27.74466,
@@ -324,7 +324,7 @@ PM3_PARAMS: Dict[int, ElementParams] = {
         gauss_M=[1.856859, 2.636158, 0.0, 0.0],
     ),
     15: ElementParams(
-        Z=15, symbol="P", n_basis=4, n_valence=5, eheat=75.42,
+        Z=15, symbol="P", n_basis=4, n_valence=5, eheat=75.57,
         Uss=-40.413096, Upp=-29.593052,
         zeta_s=2.017563, zeta_p=1.504732,
         beta_s=-12.615879, beta_p=-4.16004,
@@ -433,7 +433,7 @@ PM6_SP_PARAMS: Dict[int, ElementParams] = {
         gauss_M=[1.89644, 0.0, 0.0, 0.0],
     ),
     9: ElementParams(
-        Z=9, symbol="F", n_basis=4, n_valence=7, eheat=18.86,
+        Z=9, symbol="F", n_basis=4, n_valence=7, eheat=18.89,
         Uss=-140.22563, Upp=-98.77804,
         zeta_s=6.04385, zeta_p=2.90672,
         beta_s=-69.92259, beta_p=-30.44816,
@@ -444,7 +444,7 @@ PM6_SP_PARAMS: Dict[int, ElementParams] = {
         gauss_M=[1.84772, 0.0, 0.0, 0.0],
     ),
     15: ElementParams(
-        Z=15, symbol="P", n_basis=4, n_valence=5, eheat=75.42,
+        Z=15, symbol="P", n_basis=4, n_valence=5, eheat=75.57,
         Uss=-48.72991, Upp=-40.35469,
         zeta_s=2.15803, zeta_p=1.80534,
         beta_s=-14.58378, beta_p=-11.74473,
