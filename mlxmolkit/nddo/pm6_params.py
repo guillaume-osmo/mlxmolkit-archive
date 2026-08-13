@@ -59,7 +59,7 @@ PM6_FULL_PARAMS: Dict[int, ElementParams] = {
         gauss_M=[1.89644, 0.0, 0.0, 0.0],
     ),
     9: ElementParams(
-        Z=9, symbol="F", n_basis=4, n_valence=7, eheat=18.86,
+        Z=9, symbol="F", n_basis=4, n_valence=7, eheat=18.89,
         Uss=-140.22563, Upp=-98.77804,
         zeta_s=6.04385, zeta_p=2.90672,
         beta_s=-69.92259, beta_p=-30.44816,
@@ -71,7 +71,7 @@ PM6_FULL_PARAMS: Dict[int, ElementParams] = {
     ),
     # --- Elements WITH d-orbitals ---
     15: ElementParams(
-        Z=15, symbol="P", n_basis=9, n_valence=5, eheat=75.42,
+        Z=15, symbol="P", n_basis=9, n_valence=5, eheat=75.57,
         Uss=-48.72991, Upp=-40.35469,
         zeta_s=2.15803, zeta_p=1.80534,
         beta_s=-14.58378, beta_p=-11.74473,

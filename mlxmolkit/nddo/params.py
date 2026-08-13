@@ -119,7 +119,7 @@ RM1_PARAMS: Dict[int, ElementParams] = {
     ),
     # Fluorine (Z=9): 4 basis functions, 7 valence electrons
     9: ElementParams(
-        Z=9, symbol="F", n_basis=4, n_valence=7, eheat=18.86,
+        Z=9, symbol="F", n_basis=4, n_valence=7, eheat=18.89,
         Uss=-134.1836959, Upp=-107.8466092,
         zeta_s=4.4033791, zeta_p=2.6484156,
         beta_s=-70.0000051, beta_p=-32.6798271,
@@ -131,7 +131,7 @@ RM1_PARAMS: Dict[int, ElementParams] = {
     ),
     # Phosphorus (Z=15): 4 basis functions, 5 valence electrons
     15: ElementParams(
-        Z=15, symbol="P", n_basis=4, n_valence=5, eheat=75.42,
+        Z=15, symbol="P", n_basis=4, n_valence=5, eheat=75.57,
         Uss=-41.8153318, Upp=-34.3834253,
         zeta_s=2.1224012, zeta_p=1.7432795,
         beta_s=-6.1351497, beta_p=-5.9444213,
