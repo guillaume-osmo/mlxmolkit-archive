@@ -431,10 +431,12 @@ def dispersion_correction(atoms, coords, method) -> float:
     method = normalize_method(method)
     if method not in DISPERSION_METHODS:
         return 0.0
-    from .pm6_d3h4 import (d3bj_correction, pm6_d3h4_correction,
+    from .pm6_d3h4 import (PM6_D3_DISP, d3_energy, pm6_d3h4_correction,
                            pm6_d3h4x_correction)
     if method == "PM6_D3":
-        return float(d3bj_correction(atoms, coords)["e_total"])
+        # MOPAC's PM6-D3 is zero-damping with its own hard-wired parameters,
+        # not Becke-Johnson — see PM6_D3_DISP.
+        return float(d3_energy(atoms, coords, params=PM6_D3_DISP)["e_disp"])
     if method == "PM6_D3H4":
         return float(pm6_d3h4_correction(atoms, coords)["e_total"])
     return float(pm6_d3h4x_correction(atoms, coords)["e_total"])

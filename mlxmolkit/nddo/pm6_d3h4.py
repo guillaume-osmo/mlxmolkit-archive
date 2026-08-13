@@ -45,6 +45,17 @@ AU_TO_EV = AU_TO_KCAL * KCAL_TO_EV  # ≈ 27.211
 # PM6-D3H4 dispersion parameters (MOPAC parameters_for_PM6 v_par6(7..11))
 PM6_D3H4_DISP = dict(s6=0.880, alp=22.0, rs6=1.180, s8=0.0, rs8=1.0)
 
+# Plain PM6-D3 uses a different, hard-wired set — openMOPAC src/corrections/
+# dftd3.F90 selects on whether the keyword contains "D3H4":
+#
+#     else ! hard-wired
+#       s6 = 1.0d0;  rs18 = 1.0d0;  alp = 14.0d0
+#       rs6 = 1.560d0;  s18 = 1.009d0
+#
+# citing Grimme, Chem. Eur. J. 2012, 9955. Note this is zero-damping, not
+# Becke-Johnson: PM6-D3 is *not* d3bj.
+PM6_D3_DISP = dict(s6=1.0, alp=14.0, rs6=1.560, s8=1.009, rs8=1.0)
+
 # D3 with Becke-Johnson rational damping.
 #
 # A different damping function from the zero-damping above, not a
@@ -161,9 +172,28 @@ def _load_c6ab():
 
 @lru_cache(maxsize=1)
 def _load_r0ab():
-    """Return r0ab[94, 94] in Bohr."""
+    """Return r0ab[94, 94] in Bohr.
+
+    The bundled table is Grimme's, tabulated in **Angstrom** — r0ab(C,C) is
+    2.9103 A — and `edisp` compares it against interatomic distances that have
+    already been converted to Bohr, so it has to be converted here.
+
+    Getting this wrong is not a small error and it is not obvious. r0ab is a
+    *cutoff* radius, so 2.9103 read as Bohr (1.540 A) looks like a plausible C-C
+    bond length, which is exactly why it survived inspection. But it makes the
+    r^-8 damping far too weak at bonded separations — damp8 = 0.27 instead of
+    ~1e-4 — and a single bonded C-O pair then contributes 19.7 kcal/mol of
+    "dispersion". Methanol came out at -44.8 kcal/mol against MOPAC's -0.360.
+
+    Nothing caught it because `d3bj_energy`, the path validated against Grimme's
+    simple-dftd3, derives its damping radius from sqrt(C8/C6) and never reads
+    this table; `d3_energy` had only sign and relative-ordering tests.
+
+    With the conversion, methanol reproduces MOPAC's PM6-D3 dispersion to
+    -0.3602 against -0.36019.
+    """
     d = np.load(os.path.join(_DATA_DIR, "r0ab_d3.npz"))
-    return d["r0ab"].astype(np.float64)
+    return d["r0ab"].astype(np.float64) / BOHR
 
 
 # ---------------------------------------------------------------------------
