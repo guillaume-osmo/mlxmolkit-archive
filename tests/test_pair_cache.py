@@ -155,3 +155,42 @@ def test_a_geometry_the_cache_never_saw_still_works():
     with D.pair_cache([known]):
         assert np.array_equal(
             overlap_molecular_frame(params[0], params[1], coords[0], elsewhere), want)
+
+
+@pytest.mark.parametrize("smiles", ["CSc1ccccc1", "Clc1ccccc1", "c1ccsc1",
+                                    "COP(=O)(OC)OC", "CCO", "O=Cc1ccccc1"])
+def test_a_single_point_energy_is_unchanged_by_the_scf_cache(smiles):
+    """An SCF sits at one geometry for ~18 iterations and was rebuilding the
+    d two-centre integrals on every one. Installing the cache for that geometry
+    must change only the time, never the energy or the converged density."""
+    from mlxmolkit.nddo import scf
+
+    atoms, coords = geometry(smiles)
+    cached = scf.nddo_energy(atoms, coords, method="PM6", max_iter=200, conv_tol=1e-8)
+    plain = scf._nddo_energy_at_geometry(atoms, coords, method="PM6",
+                                         max_iter=200, conv_tol=1e-8)
+
+    assert abs(cached["energy_eV"] - plain["energy_eV"]) < 1e-9
+    assert cached["converged"] == plain["converged"]
+    assert np.abs(np.asarray(cached["density"])
+                  - np.asarray(plain["density"])).max() < 1e-9
+
+
+def test_an_sp_only_molecule_does_not_pay_for_a_cache_it_cannot_use():
+    """precompute_pair_w already hoists the sp rotation out of the SCF loop, so
+    building a cache for an sp-only molecule is pure overhead — measurably so
+    on a small one (ethanol 0.90x before this was gated)."""
+    from mlxmolkit.nddo import scf
+
+    atoms, coords = geometry("CCO")
+    seen = {}
+    real = D.pair_cache
+    def watched(specs):
+        seen["installed"] = True
+        return real(specs)
+    D.pair_cache = watched
+    try:
+        scf.nddo_energy(atoms, coords, method="PM6")
+    finally:
+        D.pair_cache = real
+    assert "installed" not in seen, "sp-only molecule built a cache it cannot use"

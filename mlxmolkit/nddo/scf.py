@@ -856,6 +856,81 @@ def nddo_energy(
         to PYSEQM (validated against the MOPAC binary). Set
         ``native=True`` to run the mlxmolkit path instead.
     """
+    from .d_two_center import pair_cache, _TETCI_CACHE
+
+    # An SCF sits at ONE geometry for ~18 iterations and was rebuilding the
+    # d-orbital two-centre integrals on every one of them. `precompute_pair_w`
+    # already hoists the sp rotation out of the loop; nothing did the same for
+    # the d path, which made a single-point energy on a d-bearing molecule cost
+    # more than an entire gradient (chlorobenzene 404 ms against 233 ms).
+    # Installing the cache for this one geometry is 3.5-4.1x on those molecules.
+    if _TETCI_CACHE is not None:
+        # A caller that already installed one — a gradient — covers this
+        # geometry, and rebuilding would only discard its other geometries.
+        return _nddo_energy_at_geometry(
+            atoms, coords, max_iter=max_iter, conv_tol=conv_tol, verbose=verbose,
+            use_metal=use_metal, method=method, native=native,
+            molecular_charge=molecular_charge)
+    PARAMS_ = get_params(method)
+    params_ = [PARAMS_[z] for z in atoms]
+    # sp-only molecules gain nothing — precompute_pair_w already hoists their
+    # rotation out of the SCF loop — and on a small one the cache build is a
+    # net loss (ethanol 0.90x). The d integrals are the whole point.
+    if not any(p.n_basis == 9 for p in params_):
+        return _nddo_energy_at_geometry(
+            atoms, coords, max_iter=max_iter, conv_tol=conv_tol, verbose=verbose,
+            use_metal=use_metal, method=method, native=native,
+            molecular_charge=molecular_charge)
+    coords_ = np.asarray(coords, dtype=np.float64)
+    specs_ = [(params_[i], params_[j], coords_[i], coords_[j])
+              for i in range(len(atoms)) for j in range(i + 1, len(atoms))]
+    with pair_cache(specs_):
+        return _nddo_energy_at_geometry(
+            atoms, coords, max_iter=max_iter, conv_tol=conv_tol, verbose=verbose,
+            use_metal=use_metal, method=method, native=native,
+            molecular_charge=molecular_charge)
+
+
+def _nddo_energy_at_geometry(
+
+    atoms: list[int],
+    coords: np.ndarray,
+    max_iter: int = 100,
+    conv_tol: float = 1e-6,
+    verbose: bool = False,
+    use_metal: bool = False,
+    method: str = 'RM1',
+    native: bool = False,
+    molecular_charge: float = 0.0,
+) -> dict:
+    """Compute NDDO semi-empirical single-point energy.
+
+    Args:
+        atoms: list of atomic numbers [1, 8, 1] for H2O
+        coords: (N, 3) coordinates in Angstrom
+        max_iter: max SCF iterations
+        conv_tol: density matrix convergence threshold
+        method: 'RM1', 'AM1', 'AM1_STAR', 'PM6_SP', 'PM6_D'
+        molecular_charge: net molecular charge used to set the closed-shell
+            electron count.
+        native: For ``method='PM6_D'``, force the native mlxmolkit path
+            instead of delegating to PYSEQM. The native path matches
+            PYSEQM to machine precision on the test set after the
+            2026-05-24 fixes (qn per Z, symmetric H_core, YH/YX/YY d-orb
+            Fock J/K + e-n attraction, PYSEQM-delegated diatomic overlap
+            for qn≥3). PYSEQM is still imported as a thin BSD-3-Clause
+            library for the W-integral, overlap, and per-pair w-tensor
+            computations; a fully self-contained build is documented in
+            ``NATIVE_STATUS.md``.
+
+    Returns:
+        dict with 'energy_eV', 'energy_kcal', 'converged', 'n_iter', 'density'
+
+    Note:
+        For ``method='PM6_D'`` by default the d-orbital SCF is delegated
+        to PYSEQM (validated against the MOPAC binary). Set
+        ``native=True`` to run the mlxmolkit path instead.
+    """
     # PM6_D is bit-exact via the vendored numpy PYSEQM port
     # (mlxmolkit/nddo/_pyseqm_port/), so the native path is always used.
     # `native` kw is kept for back-compat but is now a no-op.
