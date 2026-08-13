@@ -286,6 +286,12 @@ def overlap_d_molecular_frame(
     formulas only support qn={1, 2}; a from-scratch port is the documented
     remaining work in NATIVE_STATUS.md.
     """
+    from .d_two_center import _E1B_CACHE, _OVERLAP_CACHE, _pair_key
+    if _OVERLAP_CACHE is not None:
+        hit = _OVERLAP_CACHE.get(_pair_key(pA, pB, coordA, coordB))
+        if hit is not None:
+            return hit
+
     S_pys = _pyseqm_overlap_matrix(pA, pB, coordA, coordB)
     if S_pys is not None:
         return S_pys

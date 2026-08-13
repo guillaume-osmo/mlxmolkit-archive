@@ -76,8 +76,12 @@ def _pair_terms_many(params, coords, pairs, starts, P, n_basis):
     that into a handful of array operations; the assembly below stays per pair,
     but it is only numpy slicing.
 
-    d-bearing pairs fall back to the scalar path — their integrals come from a
-    different routine, and there are few of them.
+    d-bearing pairs used to fall back to the scalar path on the grounds that
+    "there are few of them". That is true of the pair count and false of the
+    cost: one d pair costs 2.58 ms in `_tetci_pair_w` against ~70 us for an sp
+    pair, so thioanisole (16 atoms, one sulfur) took 1440 ms per gradient while
+    menthol (31 atoms, no d) took 389 ms. They are batched here through the
+    same TETCI call `prepare_batch` uses.
     """
     from .rotation_batch import rotate_pairs
 
@@ -115,10 +119,58 @@ def analytical_gradient(
         gradient: (n_atoms, 3) in eV/Angstrom
     """
     from .scf import _build_basis_info, _build_core_hamiltonian, _build_fock
+    from .d_two_center import d_pair_cache
 
     PARAMS = get_params(method)
     coords = np.asarray(coords, dtype=np.float64)
     n_atoms = len(atoms)
+    info = _build_basis_info(atoms, PARAMS, molecular_charge=molecular_charge)
+    params = info['params']
+    starts = info['atom_basis_start']
+
+    # The 6N displaced geometries, built once and reused verbatim below. The
+    # TETCI cache is keyed on coordinate bytes, and a geometry rebuilt as
+    # `coords.copy(); c[a, d] += step` need not come out bit-identical, so the
+    # arrays a displacement is evaluated at must be the same objects the cache
+    # was keyed on.
+    displaced = []
+    for a in range(n_atoms):
+        for d in range(3):
+            for sign in (1.0, -1.0):
+                shifted = coords.copy()
+                shifted[a, d] += sign * step
+                displaced.append((a, d, sign, shifted))
+
+    # Every d-bearing pair this gradient will ask for, at every geometry it
+    # will ask at: the reference geometry — which the SCF, H_ref, F_ref and
+    # pair_ref all use — and each displacement's own N-1 dirty pairs. One pair
+    # costs 2.58 ms through the scalar TETCI and ~20 us batched, and a single
+    # displacement usually touches just one d pair, so batching within a
+    # displacement is nearly useless; batching across all 6N is the whole win.
+    def _is_d(i, j):
+        return params[i].n_basis == 9 or params[j].n_basis == 9
+
+    tetci_specs = [(params[i], params[j], coords[i], coords[j])
+                   for i in range(n_atoms) for j in range(i + 1, n_atoms)
+                   if _is_d(i, j)]
+    for a, _d, _sign, shifted in displaced:
+        for j in range(n_atoms):
+            if j == a:
+                continue
+            i_, j_ = (a, j) if a < j else (j, a)
+            if _is_d(i_, j_):
+                tetci_specs.append((params[i_], params[j_], shifted[i_], shifted[j_]))
+
+    with d_pair_cache(tetci_specs):
+        return _gradient_body(atoms, coords, method, step, molecular_charge,
+                              scf_result, PARAMS, info, params, starts,
+                              n_atoms, displaced)
+
+
+def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
+                   PARAMS, info, params, starts, n_atoms, displaced):
+    """The gradient itself, run inside the TETCI cache installed above."""
+    from .scf import _build_core_hamiltonian, _build_fock
 
     # `scf_result` lets a batched caller solve every molecule's SCF in one
     # dispatch and hand the converged density in, rather than each gradient
@@ -128,11 +180,6 @@ def analytical_gradient(
         molecular_charge=molecular_charge,
     )
     P = result['density']
-
-    # Reference matrices, built once.
-    info = _build_basis_info(atoms, PARAMS, molecular_charge=molecular_charge)
-    params = info['params']
-    starts = info['atom_basis_start']
     n_basis = info['n_basis']
 
     H_ref = _build_core_hamiltonian(atoms, coords, info)
@@ -179,15 +226,11 @@ def analytical_gradient(
         return E_elec + E_nuc
 
     gradient = np.zeros((n_atoms, 3))
-    for a in range(n_atoms):
-        for d in range(3):
-            plus = coords.copy()
-            minus = coords.copy()
-            plus[a, d] += step
-            minus[a, d] -= step
-            E_p = energy_with_atom_moved(a, plus)
-            E_m = energy_with_atom_moved(a, minus)
-            gradient[a, d] = (E_p - E_m) / (2.0 * step)
+    energies = [energy_with_atom_moved(a, shifted)
+                for a, _d, _sign, shifted in displaced]
+    for k in range(0, len(displaced), 2):
+        a, d, _s, _c = displaced[k]
+        gradient[a, d] = (energies[k] - energies[k + 1]) / (2.0 * step)
 
     return result, gradient
 

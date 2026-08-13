@@ -190,6 +190,12 @@ def yh_e1b_contribution(
     Returns a 9×9 array to ADD to the existing H_core slice for atom A.
     Caller is responsible for indexing into H_core at A's basis range.
     """
+    from .d_two_center import _E1B_CACHE, _pair_key
+    if _E1B_CACHE is not None:
+        hit = _E1B_CACHE.get(_pair_key(pA, pB, coordA, coordB))
+        if hit is not None:
+            return hit
+
     R = float(np.linalg.norm(coordB - coordA))
     R_bohr = R * ANG_TO_BOHR
 

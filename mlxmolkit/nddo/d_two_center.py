@@ -13,6 +13,8 @@ producing an expanded w tensor that covers all 9×9 orbital interactions.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import numpy as np
 from .params import ANG_TO_BOHR
 from .d_charge_sep import compute_d_charge_separations
@@ -53,6 +55,79 @@ def _load_pm6_csv_params():
     return out
 
 
+_TETCI_CACHE: dict | None = None
+_OVERLAP_CACHE: dict | None = None
+_E1B_CACHE: dict | None = None
+
+
+def _pair_key(p1, p2, c1, c2):
+    """Cache key for an ordered pair at a fixed geometry."""
+    return (int(p1.Z), int(p2.Z),
+            np.asarray(c1, dtype=np.float64).tobytes(),
+            np.asarray(c2, dtype=np.float64).tobytes())
+
+
+def _tetci_key(pa, pb, ca, cb):
+    """Cache key for a Z-sorted pair; either argument order maps here."""
+    return _pair_key(pa, pb, ca, cb)
+
+
+@contextmanager
+def d_pair_cache(pair_specs):
+    """Precompute every geometry-dependent d-pair quantity in `pair_specs`.
+
+    Three routines dominate a d-bearing gradient and all three are written for
+    a batch but called one pair at a time — the TETCI w tensor (2.58 ms/pair),
+    the molecular-frame overlap (~1.4 ms), and the 9x9 Wigner-D attraction.
+    This computes each in one call and installs a lookup, so the scalar entry
+    points serve from memory.
+
+    Args:
+        pair_specs: sequence of (p1, p2, coord1, coord2). TETCI entries are
+            stored under the Z-sorted key so either argument order hits; the
+            overlap and attraction are direction-dependent, so both orderings
+            are stored for them.
+
+    Outside the block every cache is restored to what it was, so nesting and
+    early exceptions cannot leave a stale geometry installed — which would be
+    silently wrong rather than merely slow.
+    """
+    global _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE
+    from .overlap_d import overlap_d_batch
+    from .tetci_yh import yh_e1b_batch
+
+    specs = list(pair_specs)
+    tetci, overlaps, e1b = {}, {}, {}
+    if specs:
+        for (p1, p2, c1, c2), (w, _flag) in zip(specs, _tetci_pairs_w(specs)):
+            if w is None:
+                continue
+            pa, pb, ca, cb = ((p1, p2, c1, c2) if p1.Z >= p2.Z
+                              else (p2, p1, c2, c1))
+            tetci[_tetci_key(pa, pb, ca, cb)] = w
+
+        # Both directions: overlap(A,B) is the transpose of overlap(B,A) and
+        # the attraction blocks are different matrices entirely, so neither
+        # canonicalises the way the TETCI key does.
+        directed = specs + [(p2, p1, c2, c1) for p1, p2, c1, c2 in specs]
+        for spec, S in zip(directed, overlap_d_batch(directed)):
+            if S is not None:
+                overlaps[_pair_key(*spec)] = S
+        d_first = [(p1, p2, c1, c2) for p1, p2, c1, c2 in directed
+                   if p1.n_basis == 9]
+        for spec, blk in zip(d_first, yh_e1b_batch(
+                [(a, b) for a, b, _c, _d in d_first],
+                [(c, d) for _a, _b, c, d in d_first])):
+            e1b[_pair_key(*spec)] = blk
+
+    prev = (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE)
+    _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE = tetci, overlaps, e1b
+    try:
+        yield
+    finally:
+        _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE = prev
+
+
 def _tetci_pair_w(p1, p2, coord1, coord2):
     """Compute the per-pair 45x45 packed w tensor via the vendored numpy
     TETCI port (no PYSEQM/torch dependency).
@@ -70,6 +145,18 @@ def _tetci_pair_w(p1, p2, coord1, coord2):
         pa, pb, ca, cb = p1, p2, coord1, coord2
     else:
         pa, pb, ca, cb = p2, p1, coord2, coord1
+
+    # A gradient evaluates the same pair from several call sites and at 6N
+    # displaced geometries, each at 2.58 ms here. `tetci_cache` lets a caller
+    # that already knows every (pair, geometry) it will need compute them all
+    # in one `_tetci_pairs_w` call and serve them from memory. The key is the
+    # Z-sorted form above, so the two argument orders `d_two_center_fock` uses
+    # collapse onto one entry.
+    if _TETCI_CACHE is not None:
+        hit = _TETCI_CACHE.get(_tetci_key(pa, pb, ca, cb))
+        if hit is not None:
+            return hit, (p1.Z >= p2.Z)
+
     Zs = [int(pa.Z), int(pb.Z)]
     coords = [np.asarray(ca, dtype=np.float64), np.asarray(cb, dtype=np.float64)]
     n_elec = int(pa.n_valence + pb.n_valence)
