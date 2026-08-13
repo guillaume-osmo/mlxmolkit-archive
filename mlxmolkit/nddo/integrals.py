@@ -267,7 +267,7 @@ def nuclear_repulsion_for_method(
     Which core-core term a method uses is a property of the method, not of the
     call site. The rule was spelled out separately in ``scf.nddo_energy`` and
     ``anal_grad``, and missing entirely from ``batch.prepare_batch``: the
-    batched path always took the AM1-style branch, so batched PM6/PM6_SP/PM6_D
+    batched path always took the AM1-style branch, so batched PM6/PM6_D
     total energies were wrong by several eV (~100-260 kcal/mol of heat of
     formation) while the electronic energy and density were correct.
 

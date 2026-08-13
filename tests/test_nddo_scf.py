@@ -96,7 +96,9 @@ def test_molecular_charge_sets_electron_count_for_anions():
     atoms = [8, 1]
     coords = np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0]])
 
-    for method in ['RM1', 'AM1', 'PM3', 'PM6', 'PM6_SP', 'PM6_D', 'AM1_STAR', 'RM1_STAR']:
+    # 'PM6_SP' (sp-only PM6) was removed in 15dfbba -- it silently mis-charges
+    # P/S/halogens by dropping their d-orbitals. 'PM6' is now the full d set.
+    for method in ['RM1', 'AM1', 'PM3', 'PM6', 'PM6_D', 'AM1_STAR', 'RM1_STAR']:
         result = nddo_energy(atoms, coords, method=method, molecular_charge=-1, max_iter=200)
         assert result['converged'], f"{method} did not converge for OH-"
         assert result['n_electrons'] == 8

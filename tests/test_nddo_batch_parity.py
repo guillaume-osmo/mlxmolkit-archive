@@ -6,7 +6,7 @@ optimisation over it, and had drifted in three ways:
 
   - the core-core repulsion branch for PM6 variants existed in `nddo_energy`
     and `anal_grad` but was missing from `prepare_batch`, so every batched
-    PM6/PM6_SP/PM6_D energy used the AM1-style term — several eV out, and
+    PM6/PM6_D energy used the AM1-style term — several eV out, and
     ~100-260 kcal/mol on the heat of formation, while the density and charges
     were correct;
   - the batched integral layout is sp-only, so PM6_D on P/S/Cl/Br/I raised

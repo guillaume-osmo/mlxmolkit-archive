@@ -264,7 +264,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smiles-col", default="SMILES")
     parser.add_argument("--id-col", default=None)
     parser.add_argument("--label-source", choices=["am1bcc", "pm6-proxy"], default="am1bcc")
-    parser.add_argument("--am1-method", choices=["AM1", "RM1", "PM3", "PM6", "PM6_SP", "PM6_D"], default="AM1")
+    parser.add_argument("--am1-method", choices=["AM1", "RM1", "PM3", "PM6", "PM6_D"], default="AM1")
     parser.add_argument("--max-mols", type=int, default=None)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--no-add-hs", action="store_true")

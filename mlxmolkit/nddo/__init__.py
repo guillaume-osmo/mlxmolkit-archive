@@ -11,9 +11,9 @@ SCF
     nddo_energy(atoms, coords, method='RM1') -> dict
         Single-molecule SCF. Returns electronic + nuclear + heat-of-formation
         energies plus the converged density. Methods: 'RM1', 'AM1', 'PM3',
-        'PM6_SP' (sp-only), 'PM6_D' (full d-orbital, requires the vendored
-        NumPy PYSEQM port — no external dep).
-        Tests: tests/test_rm1_scf.py, tests/test_pm6_d_native.py
+        'PM6' (d-orbital), 'PM6_D' (full d-orbital, requires the vendored
+        NumPy PYSEQM port — no external dep), 'AM1_STAR', 'RM1_STAR'.
+        Tests: tests/test_nddo_scf.py, tests/test_pm6_d_native.py
 
     nddo_energy_batch(atoms_list, coords_list, method='RM1') -> list[dict]
         Batched version. Tests: tests/test_rm1_scf.py
