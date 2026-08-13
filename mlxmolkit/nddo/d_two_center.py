@@ -58,6 +58,7 @@ def _load_pm6_csv_params():
 _TETCI_CACHE: dict | None = None
 _OVERLAP_CACHE: dict | None = None
 _E1B_CACHE: dict | None = None
+_ROT_CACHE: dict | None = None
 
 
 def _pair_key(p1, p2, c1, c2):
@@ -73,59 +74,78 @@ def _tetci_key(pa, pb, ca, cb):
 
 
 @contextmanager
-def d_pair_cache(pair_specs):
-    """Precompute every geometry-dependent d-pair quantity in `pair_specs`.
+def pair_cache(pair_specs):
+    """Precompute every geometry-dependent pair quantity in `pair_specs`.
 
-    Three routines dominate a d-bearing gradient and all three are written for
-    a batch but called one pair at a time — the TETCI w tensor (2.58 ms/pair),
-    the molecular-frame overlap (~1.4 ms), and the 9x9 Wigner-D attraction.
-    This computes each in one call and installs a lookup, so the scalar entry
-    points serve from memory.
+    Each of these routines is written for a batch and was being called one pair
+    at a time by the gradient, which evaluates the same pair at 6N+1 geometries:
+
+        sp rotation   rotate_pairs        86 calls of ~15 pairs for benzaldehyde,
+                                          23.6 ms; all 1092 in one call is 2.4 ms
+        overlap       overlap_pairs /     ~1.4 ms/pair scalar for the d routine
+                      overlap_d_batch
+        TETCI w       _tetci_pairs_w      2.58 ms/pair scalar
+        attraction    yh_e1b_batch        the 9x9 Wigner-D block
+
+    Batching within one displacement is nearly useless — a displacement touches
+    N-1 pairs, often just one of them d. The batch has to span every geometry
+    the caller will ask about, which is what this takes.
 
     Args:
-        pair_specs: sequence of (p1, p2, coord1, coord2). TETCI entries are
+        pair_specs: sequence of (p1, p2, coord1, coord2), sp or d. TETCI is
             stored under the Z-sorted key so either argument order hits; the
-            overlap and attraction are direction-dependent, so both orderings
-            are stored for them.
+            overlap, attraction and rotation are direction-dependent, so both
+            orderings are stored.
 
     Outside the block every cache is restored to what it was, so nesting and
     early exceptions cannot leave a stale geometry installed — which would be
     silently wrong rather than merely slow.
     """
-    global _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE
+    global _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE
+    from .overlap_batch import overlap_pairs
     from .overlap_d import overlap_d_batch
+    from .rotation_batch import rotate_pairs
     from .tetci_yh import yh_e1b_batch
 
     specs = list(pair_specs)
-    tetci, overlaps, e1b = {}, {}, {}
-    if specs:
-        for (p1, p2, c1, c2), (w, _flag) in zip(specs, _tetci_pairs_w(specs)):
+    tetci, overlaps, e1b, rot = {}, {}, {}, {}
+    is_d = lambda sp: sp[0].n_basis == 9 or sp[1].n_basis == 9
+    d_specs = [x for x in specs if is_d(x)]
+    sp_specs = [x for x in specs if not is_d(x)]
+
+    if d_specs:
+        for (p1, p2, c1, c2), (w, _flag) in zip(d_specs, _tetci_pairs_w(d_specs)):
             if w is None:
                 continue
             pa, pb, ca, cb = ((p1, p2, c1, c2) if p1.Z >= p2.Z
                               else (p2, p1, c2, c1))
             tetci[_tetci_key(pa, pb, ca, cb)] = w
-
-        # Both directions: overlap(A,B) is the transpose of overlap(B,A) and
-        # the attraction blocks are different matrices entirely, so neither
-        # canonicalises the way the TETCI key does.
-        directed = specs + [(p2, p1, c2, c1) for p1, p2, c1, c2 in specs]
+        directed = d_specs + [(b, a, d, c) for a, b, c, d in d_specs]
         for spec, S in zip(directed, overlap_d_batch(directed)):
             if S is not None:
                 overlaps[_pair_key(*spec)] = S
-        d_first = [(p1, p2, c1, c2) for p1, p2, c1, c2 in directed
-                   if p1.n_basis == 9]
+        d_first = [x for x in directed if x[0].n_basis == 9]
         for spec, blk in zip(d_first, yh_e1b_batch(
                 [(a, b) for a, b, _c, _d in d_first],
                 [(c, d) for _a, _b, c, d in d_first])):
             e1b[_pair_key(*spec)] = blk
 
-    prev = (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE)
-    _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE = tetci, overlaps, e1b
+    if sp_specs:
+        directed = sp_specs + [(b, a, d, c) for a, b, c, d in sp_specs]
+        for spec, S in zip(directed, overlap_pairs(directed)):
+            if S is not None:
+                overlaps[_pair_key(*spec)] = S
+        ws = rotate_pairs([(a, b) for a, b, _c, _d in sp_specs],
+                          [(c, d) for _a, _b, c, d in sp_specs])
+        for spec, w in zip(sp_specs, ws):
+            rot[_pair_key(*spec)] = w
+
+    prev = (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE)
+    _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE = tetci, overlaps, e1b, rot
     try:
         yield
     finally:
-        _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE = prev
+        _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE = prev
 
 
 def _tetci_pair_w(p1, p2, coord1, coord2):

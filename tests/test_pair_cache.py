@@ -1,6 +1,6 @@
 """The d-pair cache must change speed and nothing else.
 
-`d_pair_cache` precomputes the three geometry-dependent d-pair quantities — the
+`pair_cache` precomputes the three geometry-dependent d-pair quantities — the
 TETCI w tensor, the molecular-frame overlap, and the 9x9 Wigner-D attraction —
 in one batched call each, and serves the scalar entry points from memory. Every
 one of those routines is written for a batch and was being called a pair at a
@@ -53,17 +53,17 @@ def test_the_gradient_is_unchanged_by_the_cache(smiles):
     atoms, coords = geometry(smiles)
     _res, cached = analytical_gradient(atoms, coords, method="PM6")
 
-    real = D.d_pair_cache
+    real = D.pair_cache
     from contextlib import contextmanager
 
     @contextmanager
     def disabled(_specs):
         yield
-    D.d_pair_cache = disabled
+    D.pair_cache = disabled
     try:
         _res, plain = analytical_gradient(atoms, coords, method="PM6")
     finally:
-        D.d_pair_cache = real
+        D.pair_cache = real
 
     assert np.abs(cached - plain).max() < 1e-6
 
@@ -82,7 +82,7 @@ def test_an_entry_is_returned_for_the_pair_it_was_computed_for():
     rS, rC = coords[s], coords[c]
 
     want = yh_e1b_contribution(pS, pC, rS, rC)
-    with D.d_pair_cache([(pS, pC, rS, rC)]):
+    with D.pair_cache([(pS, pC, rS, rC)]):
         assert np.array_equal(yh_e1b_contribution(pS, pC, rS, rC), want)
 
 
@@ -94,23 +94,64 @@ def test_the_cache_does_not_outlive_its_geometry():
     spec = (PARAMS[16], PARAMS[6], coords[s], coords[c])
 
     assert D._TETCI_CACHE is None
-    with D.d_pair_cache([spec]):
+    with D.pair_cache([spec]):
         assert D._TETCI_CACHE is not None
-        with D.d_pair_cache([spec]):          # nesting restores the outer one
+        with D.pair_cache([spec]):          # nesting restores the outer one
             pass
         assert D._TETCI_CACHE is not None
     assert D._TETCI_CACHE is None
 
     with pytest.raises(RuntimeError):
-        with D.d_pair_cache([spec]):
+        with D.pair_cache([spec]):
             raise RuntimeError("boom")
     assert D._TETCI_CACHE is None, "an exception left a stale geometry installed"
 
 
 def test_an_empty_spec_list_installs_an_empty_cache():
     """An sp-only molecule reaches this with nothing to precompute."""
-    with D.d_pair_cache([]):
+    with D.pair_cache([]):
         assert D._TETCI_CACHE == {}
         assert D._OVERLAP_CACHE == {}
         assert D._E1B_CACHE == {}
     assert D._TETCI_CACHE is None
+
+
+def test_the_sp_rotation_is_served_and_correct():
+    """The sp rotation is the hot one for an ordinary organic molecule.
+
+    `_pair_terms_many` batched it, but only across one displacement's N-1
+    pairs: 86 calls of ~15 pairs for a benzaldehyde gradient, 23.6 ms, where
+    all 1092 pairs in one call is 2.4 ms. A wrong entry here would be invisible
+    in |g|max and show up only as a slightly wrong minimum.
+    """
+    from mlxmolkit.nddo.rotation_batch import rotate_pairs
+
+    atoms, coords = geometry("O=Cc1ccccc1")
+    params = [PARAMS[z] for z in atoms]
+    pairs = [(i, j) for i in range(len(atoms)) for j in range(i + 1, len(atoms))]
+    specs = [(params[i], params[j], coords[i], coords[j]) for i, j in pairs]
+
+    want = rotate_pairs([(a, b) for a, b, _c, _d in specs],
+                        [(c, d) for _a, _b, c, d in specs])
+    with D.pair_cache(specs):
+        assert D._ROT_CACHE is not None and len(D._ROT_CACHE) == len(specs)
+        for spec, w in zip(specs, want):
+            assert np.array_equal(D._ROT_CACHE[D._pair_key(*spec)], w)
+    assert D._ROT_CACHE is None
+
+
+def test_a_geometry_the_cache_never_saw_still_works():
+    """The cache is an optimisation, never a precondition. A caller that asks
+    about a pair outside the precomputed set must get the right answer, not a
+    KeyError and not a stale one."""
+    from mlxmolkit.nddo.overlap import overlap_molecular_frame
+
+    atoms, coords = geometry("CCO")
+    params = [PARAMS[z] for z in atoms]
+    known = (params[0], params[1], coords[0], coords[1])
+    elsewhere = coords[1] + np.array([0.37, -0.21, 0.11])
+
+    want = overlap_molecular_frame(params[0], params[1], coords[0], elsewhere)
+    with D.pair_cache([known]):
+        assert np.array_equal(
+            overlap_molecular_frame(params[0], params[1], coords[0], elsewhere), want)

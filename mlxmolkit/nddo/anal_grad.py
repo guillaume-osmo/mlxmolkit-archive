@@ -89,10 +89,19 @@ def _pair_terms_many(params, coords, pairs, starts, P, n_basis):
     for i, j in pairs:
         (sp if params[i].n_basis <= 4 and params[j].n_basis <= 4 else dd).append((i, j))
 
+    from .d_two_center import _ROT_CACHE, _pair_key
+
     out = {}
     if sp:
-        ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
-                          [(coords[i], coords[j]) for i, j in sp])
+        if _ROT_CACHE is not None:
+            ws = [_ROT_CACHE.get(_pair_key(params[i], params[j],
+                                           coords[i], coords[j])) for i, j in sp]
+            if any(w is None for w in ws):        # a geometry the cache never saw
+                ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
+                                  [(coords[i], coords[j]) for i, j in sp])
+        else:
+            ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
+                              [(coords[i], coords[j]) for i, j in sp])
         for k, (i, j) in enumerate(sp):
             out[(i, j)] = _pair_terms(params, coords, i, j, starts, P, n_basis,
                                       w=ws[k])
@@ -119,7 +128,7 @@ def analytical_gradient(
         gradient: (n_atoms, 3) in eV/Angstrom
     """
     from .scf import _build_basis_info, _build_core_hamiltonian, _build_fock
-    from .d_two_center import d_pair_cache
+    from .d_two_center import pair_cache
 
     PARAMS = get_params(method)
     coords = np.asarray(coords, dtype=np.float64)
@@ -141,27 +150,22 @@ def analytical_gradient(
                 shifted[a, d] += sign * step
                 displaced.append((a, d, sign, shifted))
 
-    # Every d-bearing pair this gradient will ask for, at every geometry it
-    # will ask at: the reference geometry — which the SCF, H_ref, F_ref and
-    # pair_ref all use — and each displacement's own N-1 dirty pairs. One pair
-    # costs 2.58 ms through the scalar TETCI and ~20 us batched, and a single
-    # displacement usually touches just one d pair, so batching within a
-    # displacement is nearly useless; batching across all 6N is the whole win.
-    def _is_d(i, j):
-        return params[i].n_basis == 9 or params[j].n_basis == 9
-
-    tetci_specs = [(params[i], params[j], coords[i], coords[j])
-                   for i in range(n_atoms) for j in range(i + 1, n_atoms)
-                   if _is_d(i, j)]
+    # Every pair this gradient will ask for, at every geometry it will ask at:
+    # the reference geometry — which the SCF, H_ref, F_ref and pair_ref all
+    # use — and each displacement's own N-1 dirty pairs. `_pair_terms_many`
+    # already batched the sp rotation, but only within one displacement: 86
+    # calls of ~15 pairs for benzaldehyde, where all 1092 in one call is 2.4 ms
+    # against 23.6. Batching across all 6N geometries is the whole win.
+    pair_specs = [(params[i], params[j], coords[i], coords[j])
+                  for i in range(n_atoms) for j in range(i + 1, n_atoms)]
     for a, _d, _sign, shifted in displaced:
         for j in range(n_atoms):
             if j == a:
                 continue
             i_, j_ = (a, j) if a < j else (j, a)
-            if _is_d(i_, j_):
-                tetci_specs.append((params[i_], params[j_], shifted[i_], shifted[j_]))
+            pair_specs.append((params[i_], params[j_], shifted[i_], shifted[j_]))
 
-    with d_pair_cache(tetci_specs):
+    with pair_cache(pair_specs):
         return _gradient_body(atoms, coords, method, step, molecular_charge,
                               scf_result, PARAMS, info, params, starts,
                               n_atoms, displaced)

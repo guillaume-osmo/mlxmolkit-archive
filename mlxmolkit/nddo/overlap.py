@@ -168,6 +168,12 @@ def overlap_molecular_frame(
         di: (nA, nB) overlap matrix in molecular frame
             Indices: 0=s, 1=px, 2=py, 3=pz
     """
+    from .d_two_center import _OVERLAP_CACHE, _pair_key
+    if _OVERLAP_CACHE is not None:
+        hit = _OVERLAP_CACHE.get(_pair_key(pA, pB, coordA, coordB))
+        if hit is not None:
+            return hit
+
     R_vec = coordB - coordA
     R = np.linalg.norm(R_vec)
     nA = pA.n_basis
