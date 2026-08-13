@@ -56,27 +56,44 @@ def test_molecules_without_a_triple_bond_match_mopac(smiles, reference):
     assert hof(smiles) == pytest.approx(reference, abs=0.5)
 
 
-@pytest.mark.xfail(reason="issue #33: C≡C core-core defect, ~11.8 kcal/mol",
-                   strict=True)
 @pytest.mark.parametrize("smiles,reference", sorted(MOPAC_HF.items()))
 def test_triple_bonded_molecules_match_mopac(smiles, reference):
     assert hof(smiles) == pytest.approx(reference, abs=0.5)
 
 
-def test_the_defect_is_a_constant_per_triple_bond_not_a_scaling_error():
-    """Pins the *shape* of the bug, which is what identifies it.
+def test_the_correction_is_a_switch_not_a_decaying_function():
+    """The property that identified the bug, kept as the property that pins it.
 
-    The error is the same ~-11.8 kcal/mol for acetylene (2 heavy atoms) as for
-    4-methylpent-2-yne (7), so it is one fixed contribution per C≡C, not
-    something accumulating over atoms or bonds. Any proposed fix that is
-    proportional to size is therefore wrong regardless of how it scores on
-    average.
+    MOPAC counts a C-C bond as acetylenic below 1.21 A, tapers to zero at
+    1.33 A through a quintic-sextic switch, and multiplies the count by 12
+    kcal/mol. It is therefore essentially a step: full weight at an alkyne's
+    1.20 A, none at an alkene's 1.34 A. No smooth function of R can imitate
+    that, which is why fitting an exponential or an R^-12 to those two
+    distances failed.
     """
-    errors = {s: hof(s) - ref for s, ref in MOPAC_HF.items()}
-    values = np.array(list(errors.values()))
-    assert values.max() < -11.0, errors
-    assert values.min() > -12.5, errors
-    assert np.ptp(values) < 0.5, f"not constant across sizes: {errors}"
+    from mlxmolkit.nddo.pwcct import c_triple_bond_correction
+
+    def correction(smiles):
+        result = _smiles_to_3d(smiles, seed=1)
+        if result is None:
+            pytest.skip(f"could not embed {smiles}")
+        return c_triple_bond_correction(result[0], result[1])
+
+    assert correction("C#C") == pytest.approx(12.0)
+    assert correction("CCC#CC(C)C") == pytest.approx(12.0)   # size-independent
+    assert correction("CC=CC") == 0.0
+    assert correction("CCCC") == 0.0
+    # C≡N is not C-C, and nitriles were always accurate without it
+    assert correction("CC#N") == 0.0
+    assert correction("N#Cc1ccccc1") == 0.0
+
+    # The switch itself, evaluated directly on a stretched acetylene.
+    import numpy as _np
+    for r, expected in ((1.15, 12.0), (1.20, 12.0), (1.40, 0.0), (1.50, 0.0)):
+        c = c_triple_bond_correction([6, 6], _np.array([[0.0, 0, 0], [r, 0, 0]]))
+        assert c == pytest.approx(expected), f"at R={r}"
+    mid = c_triple_bond_correction([6, 6], _np.array([[0.0, 0, 0], [1.27, 0, 0]]))
+    assert 0.0 < mid < 12.0, "the 1.21-1.33 taper should be partial, not a hard step"
 
 
 def test_the_density_is_right_even_where_the_energy_is_not():

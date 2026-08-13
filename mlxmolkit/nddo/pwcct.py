@@ -210,3 +210,57 @@ def pm6_pair_repulsion_batch(zi, zj, pair_params, coordI, coordJ, param_dict=Non
     t5 = np.where(KA != 0, KA * np.exp(-LA * (r - MA) ** 2), 0.0).sum(axis=1)
     t6 = np.where(KB != 0, KB * np.exp(-LB * (r - MB) ** 2), 0.0).sum(axis=1)
     return expo2 + (ZA * ZB / R_ang) * (t5 + t6)
+
+
+# MOPAC applies a flat +12 kcal/mol per C≡C to the heat of formation, and it is
+# NOT part of the SCF energy — which is why an mlxmolkit total energy can agree
+# with MOPAC's own ENPART ETOT to 0.003 eV while the heat of formation is 12
+# kcal/mol out. See issue #33.
+C_TRIPLE_BOND_KCAL = 12.0
+_CTB_RMIN = 1.21
+_CTB_RMAX = 1.33
+_CTB_PARAM1 = -5.0
+_CTB_PARAM2 = 25.0
+
+
+def c_triple_bond_correction(atoms, coords) -> float:
+    """MOPAC's `C_triple_bond_C`, in kcal/mol.
+
+    Port of openMOPAC v23 ``src/corrections/set_up_dentate.F90``. Counts C-C
+    bonds short enough to be acetylenic — full weight below 1.21 A, tapering to
+    zero at 1.33 A through the quintic-sextic switch MOPAC uses — and multiplies
+    by 12, a value its own comment calls empirical. ``src/compfg.F90`` adds the
+    result to ``atheat``, the atomic-heat term of the heat of formation.
+
+    Because it is a *switch* rather than a decaying function, no smooth term in
+    R can imitate it: it is essentially a step between 1.21 and 1.33 A. That is
+    why an alkyne at 1.20 A takes the full 12 kcal/mol and an alkene at 1.34 A
+    takes none, and why fitting an exponential or an R^-12 to the two distances
+    is hopeless.
+
+    MOPAC walks its own bond list; any C-C pair inside 1.33 A is bonded, so
+    iterating over close pairs is equivalent and needs no connectivity.
+
+    Args:
+        atoms: atomic numbers.
+        coords: (n, 3) in Angstrom.
+
+    Returns:
+        The correction in kcal/mol — zero for anything without a short C-C bond.
+    """
+    carbons = [i for i, z in enumerate(atoms) if int(z) == 6]
+    if len(carbons) < 2:
+        return 0.0
+    xyz = np.asarray(coords, dtype=np.float64)
+    total = 0.0
+    for a in range(len(carbons)):
+        for b in range(a):
+            r = float(np.linalg.norm(xyz[carbons[a]] - xyz[carbons[b]]))
+            if r < _CTB_RMIN:
+                total += 1.0
+            elif r < _CTB_RMAX:
+                t = (r - _CTB_RMIN) / (_CTB_RMAX - _CTB_RMIN)
+                total += (1.0 - 10.0 * t ** 3 + 15.0 * t ** 4 - 6.0 * t ** 5
+                          + (_CTB_PARAM1 + t * _CTB_PARAM2)
+                          * (t ** 3 - 3.0 * t ** 4 + 3.0 * t ** 5 - t ** 6))
+    return total * C_TRIPLE_BOND_KCAL

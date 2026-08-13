@@ -33,6 +33,7 @@ from .integrals import (
     EV,
 )
 from .two_center_integrals import two_center_integrals, _compute_multipole_params, EV
+from .pwcct import c_triple_bond_correction
 from .rotation import rotate_integrals_to_molecular_frame
 from .overlap import overlap_molecular_frame
 from .overlap_d import overlap_d_molecular_frame
@@ -1113,6 +1114,11 @@ def _nddo_energy_at_geometry(
     eheat_total = sum(PARAMS[z].eheat for z in atoms)
 
     E_binding_eV = E_total - E_isol_total
+    # MOPAC adds a flat 12 kcal/mol per C≡C to the atomic-heat term (its
+    # `atheat = atheat + C_triple_bond_C()` in src/compfg.F90). It is not part
+    # of the SCF energy, which is why our total energy already agreed with
+    # MOPAC's ENPART ETOT to 0.003 eV while the heat of formation did not.
+    eheat_total = eheat_total + c_triple_bond_correction(atoms, coords)
     E_hof_eV = E_binding_eV + eheat_total / EV_TO_KCAL
 
     # Mulliken partial charges (NDDO/ZDO): q_A = Z_valence(A) - Σ_{μ∈A} P_μμ.
@@ -1404,6 +1410,7 @@ def nddo_energy_batch(
         E_isol = sum(PARAMS[z].eisol for z in atoms)
         eheat = sum(PARAMS[z].eheat for z in atoms)
         E_binding = E_total - E_isol
+        eheat = eheat + c_triple_bond_correction(atoms, coords)
         E_hof = E_binding + eheat / EV_TO_KCAL
 
         # Eigenvalues
@@ -1768,6 +1775,7 @@ def rm1_energy_batch_mlx(
         E_isol = sum(PARAMS[z].eisol for z in atoms)
         eheat = sum(PARAMS[z].eheat for z in atoms)
         E_binding = E_total - E_isol
+        eheat = eheat + c_triple_bond_correction(atoms, coords)
         E_hof = E_binding + eheat / EV_TO_KCAL
         # Drop the spurious huge eigenvalues from padding.
         eigvals_active = eigvals_np[mol_idx, :nb]
