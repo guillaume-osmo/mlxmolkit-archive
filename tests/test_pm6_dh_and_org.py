@@ -27,6 +27,55 @@ def test_dh_dispersion_matches_mopac_on_methanol():
         METHANOL_DH_DISPERSION, abs=1e-5)
 
 
+# (PM6-DH+ minus PM6) from MOPAC v23.2 at RDKit ETKDG seed=1 + MMFF geometries.
+# For a molecule with no hydrogen bond the H-bond term is zero, so that
+# difference IS the dispersion and can be compared against ours directly.
+# Chosen to span alkanes, aromatics, alcohols, ethers, carbonyls, nitriles,
+# amines, amides, sulfur and halogens, over three orders of magnitude.
+MOPAC_DH_DISPERSION = {
+    "C": -0.00102, "CC": -0.04358, "CCC": -0.21462, "CCCC": -0.43595,
+    "CC(C)(C)C": -0.92876, "C1CCCCC1": -1.07326, "c1ccccc1": -0.71194,
+    "c1ccc2ccccc2c1": -2.19001, "CCCCCCCC": -1.64610, "CO": -0.00956,
+    "CCO": -0.11316, "OCCO": -0.22943, "O": -0.00021, "CC=O": -0.07897,
+    "CC(=O)C": -0.28668, "CC(=O)O": -0.17621, "CC#N": -0.11771,
+    "CSC": -0.17375, "Clc1ccccc1": -1.05613, "CCOCC": -0.68354,
+    "c1ccc(cc1)C": -1.12280, "N": -0.00052, "CN": -0.02239, "CCN": -0.16686,
+    "c1ccncc1": -0.59987, "CC(=O)N": -0.26014, "O=C(N)N": -0.18435,
+    "FC(F)(F)c1ccccc1": -1.46554,
+}
+
+
+@pytest.mark.parametrize("smiles,reference", sorted(MOPAC_DH_DISPERSION.items()))
+def test_dh_dispersion_matches_mopac_across_chemistry(smiles, reference):
+    """28 molecules, worst deviation measured at 9.2e-06 kcal/mol.
+
+    One molecule is deliberately absent: glycerol, OCC(O)CO. It has an
+    intramolecular hydrogen bond, so its DH+ correction is -2.17079 while the
+    dispersion alone is -0.72944 — the -1.44135 residual is the H-bond term,
+    which is not ported yet. It is a target, not a failure.
+    """
+    from mlxmolkit.nddo.pipeline import _smiles_to_3d
+
+    result = _smiles_to_3d(smiles, seed=1)
+    if result is None:
+        pytest.skip(f"could not embed {smiles}")
+    got = pm6_dh_dispersion(result[0], result[1])
+    assert got == pytest.approx(reference, abs=2e-4)
+
+
+def test_glycerol_isolates_the_missing_hydrogen_bond_term():
+    """Pins the size of what is still unported, so it cannot be forgotten."""
+    from mlxmolkit.nddo.pipeline import _smiles_to_3d
+
+    result = _smiles_to_3d("OCC(O)CO", seed=1)
+    if result is None:
+        pytest.skip("could not embed glycerol")
+    dispersion = pm6_dh_dispersion(result[0], result[1])
+    assert dispersion == pytest.approx(-0.72944, abs=2e-4)
+    # MOPAC's total DH+ correction here is -2.17079.
+    assert -2.17079 - dispersion == pytest.approx(-1.44135, abs=2e-4)
+
+
 def test_dh_dispersion_is_not_d3():
     """PM6-DH+ uses the older Slater-Kirkwood form, not D3. If someone ever
     'unifies' them, this catches it: D3 gives a different answer entirely."""
