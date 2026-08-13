@@ -253,7 +253,18 @@ def compute_core_hamiltonian(
 
 # Methods whose core-core term is the PM6 pairwise-corrected (PWCCT) form
 # rather than the AM1-style Gaussian-augmented one.
-PM6_CORE_CORE_METHODS = frozenset({'PM6', 'PM6_D'})
+# The dispersion variants are PM6 electronically, so they take PM6's PWCCT
+# core-core form too; they differ only by a post-SCF term on the heat of
+# formation (see dispersion_correction in pwcct.py).
+def normalize_method(method: str) -> str:
+    """Canonical method name; 'PM6-D3' and 'PM6_D3' must select the same
+    core-core form. Comparing the raw string put PM6-D3 on the AM1-style
+    core-core and 185 kcal/mol out."""
+    return str(method).upper().replace('-', '_').replace('*', '_STAR')
+
+
+PM6_CORE_CORE_METHODS = frozenset({'PM6', 'PM6_D',
+                                   'PM6_D3', 'PM6_D3H4', 'PM6_D3H4X'})
 
 
 def nuclear_repulsion_for_method(
@@ -274,7 +285,7 @@ def nuclear_repulsion_for_method(
     Route every core-core evaluation through here so the three paths cannot
     drift apart again.
     """
-    if method in PM6_CORE_CORE_METHODS:
+    if normalize_method(method) in PM6_CORE_CORE_METHODS:
         from .pwcct import pm6_nuclear_repulsion
         return pm6_nuclear_repulsion(atoms, coords, params)
     return compute_nuclear_repulsion(atoms, coords, param_dict=params)
@@ -340,7 +351,7 @@ def pair_repulsion_for_method(atoms, coords, i, j, params, method) -> float:
     one place is what stops a gradient differentiating a different energy from
     the one the SCF minimised.
     """
-    if method in PM6_CORE_CORE_METHODS:
+    if normalize_method(method) in PM6_CORE_CORE_METHODS:
         from .pwcct import pm6_pair_repulsion
         return pm6_pair_repulsion(atoms[i], atoms[j],
                                   params[atoms[i]], params[atoms[j]],

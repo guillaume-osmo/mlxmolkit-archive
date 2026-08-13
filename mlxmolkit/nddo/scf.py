@@ -34,7 +34,8 @@ from .integrals import (
 )
 from .two_center_integrals import two_center_integrals, _compute_multipole_params, EV
 from .integrals import PM6_CORE_CORE_METHODS
-from .pwcct import (c_triple_bond_correction, nhco_dihedral_correction,
+from .pwcct import (c_triple_bond_correction, dispersion_correction,
+                    nhco_dihedral_correction, normalize_method,
                     nsp2_correction)
 from .rotation import rotate_integrals_to_molecular_frame
 from .overlap import overlap_molecular_frame
@@ -837,9 +838,13 @@ def _pm6_heat_corrections(atoms, coords, method) -> float:
     them, and why an mlxmolkit total energy could agree with MOPAC's own ENPART
     partition to 0.003 eV while the heat of formation was 12 kcal/mol out.
     """
-    if method not in PM6_CORE_CORE_METHODS:
+    from .pwcct import DISPERSION_METHODS
+    canonical = normalize_method(method)
+    if (canonical not in PM6_CORE_CORE_METHODS
+            and canonical not in DISPERSION_METHODS):
         return 0.0
-    return (c_triple_bond_correction(atoms, coords)
+    return (dispersion_correction(atoms, coords, canonical)
+            + c_triple_bond_correction(atoms, coords)
             + nsp2_correction(atoms, coords)
             + nhco_dihedral_correction(atoms, coords))
 

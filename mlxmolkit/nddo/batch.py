@@ -17,7 +17,7 @@ from .packing import pack, packed_size, unpack
 from .scf import (_pair_resonance_block, _pair_core_attraction,
                   _beta_for_orbital)
 from .integrals import (compute_nuclear_repulsion, nuclear_repulsion_for_method,
-                        PM6_CORE_CORE_METHODS)
+                        PM6_CORE_CORE_METHODS, normalize_method)
 
 
 @dataclass
@@ -449,7 +449,7 @@ def prepare_batch(
         # result is reached by the pair's dense id rather than by hashing an
         # (mol_idx, i, j) tuple.
         starts = atom_basis_start
-        pm6_core = method in PM6_CORE_CORE_METHODS
+        pm6_core = normalize_method(method) in PM6_CORE_CORE_METHODS
 
         for pid in range(mol_pair_start[mol_idx], mol_pair_start[mol_idx + 1]):
             i, j = int(pair_i[pid]), int(pair_j[pid])
@@ -516,7 +516,7 @@ def prepare_batch(
     # come straight off the pair table by fancy indexing — collecting them in
     # the loop meant four list appends per pair and two more comprehensions to
     # turn them back into arrays.
-    if method in PM6_CORE_CORE_METHODS and n_pairs:
+    if normalize_method(method) in PM6_CORE_CORE_METHODS and n_pairs:
         from .pwcct import pm6_pair_repulsion_batch
         flat_z = np.concatenate([np.asarray(a, dtype=np.int64)
                                  for a, _c in molecules])

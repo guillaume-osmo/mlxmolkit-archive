@@ -600,6 +600,12 @@ METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     # carry P/S/Cl/Br/I. Kept for callers that spell it this way; a test that
     # parametrises over both is testing one method twice.
     'PM6_D': PM6_FULL_PARAMS,
+    # PM6_D3 / PM6_D3H4 / PM6_D3H4X are deliberately NOT registered yet. The
+    # electronic side is ready — they are plain PM6, and pwcct.dispersion_correction
+    # dispatches the post-SCF term — but the correction does not reproduce MOPAC:
+    # on methanol MOPAC wants -0.360 kcal/mol for D3 and +6.267 for D3H4, and we
+    # produce -2.247 and -2.308. Registering them would hand out wrong energies
+    # under a name that looks authoritative. See the tracking issue.
     'AM1_STAR': AM1_STAR_PARAMS,
     'RM1_STAR': RM1_STAR_PARAMS,
 }
