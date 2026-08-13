@@ -397,3 +397,44 @@ def nhco_dihedral_correction(atoms, coords, htype: float = HTYPE_PM6) -> float:
         angle = math.atan2(float(m1 @ n2), float(n1 @ n2))
         total += htype * math.sin(angle) ** 2
     return total
+
+
+# Post-SCF corrections that distinguish the PM6 dispersion variants. Every one
+# of these is a function of geometry alone — none touches the density, the
+# Mulliken charges or a COSMO sigma profile — so the variants share PM6's
+# parameters and SCF exactly and differ only in the heat of formation.
+DISPERSION_METHODS = frozenset({"PM6_D3", "PM6_D3H4", "PM6_D3H4X"})
+
+
+def normalize_method(method: str) -> str:
+    """Canonical method name — the same spelling `get_params` accepts.
+
+    `get_params` normalises internally, so `nddo_energy(method="PM6-D3")` picks
+    up the right parameters, but the raw string is what reaches the core-core
+    and correction checks. Without this, "PM6-D3" missed both frozensets, fell
+    through to the AM1-style core-core, and came out 185 kcal/mol wrong while
+    "PM6_D3" was right.
+    """
+    return str(method).upper().replace("-", "_").replace("*", "_STAR")
+
+
+def dispersion_correction(atoms, coords, method) -> float:
+    """Dispersion / H-bond / halogen correction for a PM6 variant, kcal/mol.
+
+    Returns 0.0 for plain PM6 and for any non-PM6 method, so callers can apply
+    it unconditionally.
+
+        PM6-D3      D3 with Becke-Johnson damping
+        PM6-D3H4    D3 + the H4 hydrogen-bond term + H-H repulsion
+        PM6-D3H4X   the above plus the halogen-bond term
+    """
+    method = normalize_method(method)
+    if method not in DISPERSION_METHODS:
+        return 0.0
+    from .pm6_d3h4 import (d3bj_correction, pm6_d3h4_correction,
+                           pm6_d3h4x_correction)
+    if method == "PM6_D3":
+        return float(d3bj_correction(atoms, coords)["e_total"])
+    if method == "PM6_D3H4":
+        return float(pm6_d3h4_correction(atoms, coords)["e_total"])
+    return float(pm6_d3h4x_correction(atoms, coords)["e_total"])
