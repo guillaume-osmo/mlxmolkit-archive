@@ -33,7 +33,9 @@ from .integrals import (
     EV,
 )
 from .two_center_integrals import two_center_integrals, _compute_multipole_params, EV
-from .pwcct import c_triple_bond_correction
+from .integrals import PM6_CORE_CORE_METHODS
+from .pwcct import (c_triple_bond_correction, nhco_dihedral_correction,
+                    nsp2_correction)
 from .rotation import rotate_integrals_to_molecular_frame
 from .overlap import overlap_molecular_frame
 from .overlap_d import overlap_d_molecular_frame
@@ -818,6 +820,30 @@ def _pm6d_via_pyseqm(atoms: list[int], coords: np.ndarray) -> dict:
     }
 
 
+def _pm6_heat_corrections(atoms, coords, method) -> float:
+    """MOPAC's molecular-mechanics corrections to the heat of formation, kcal/mol.
+
+    src/compfg.F90 adds three of these to `atheat` for PM6, none of which is
+    part of the SCF energy:
+
+        atheat = atheat + C_triple_bond_C()
+        if (method_pm6 .and. N_3_present) atheat = atheat + nsp2_correction()
+        atheat = atheat + sum_dihed             ! htype*sin(angle)**2 over O=C-N-H
+
+    The Si-O-H correction is PM7-only and post_scf_corrections applies to the
+    dispersion/hydrogen-bonding variants, so neither belongs here.
+
+    None of these exist in PYSEQM, which is why the vendored port never had
+    them, and why an mlxmolkit total energy could agree with MOPAC's own ENPART
+    partition to 0.003 eV while the heat of formation was 12 kcal/mol out.
+    """
+    if method not in PM6_CORE_CORE_METHODS:
+        return 0.0
+    return (c_triple_bond_correction(atoms, coords)
+            + nsp2_correction(atoms, coords)
+            + nhco_dihedral_correction(atoms, coords))
+
+
 def nddo_energy(
     atoms: list[int],
     coords: np.ndarray,
@@ -1118,7 +1144,7 @@ def _nddo_energy_at_geometry(
     # `atheat = atheat + C_triple_bond_C()` in src/compfg.F90). It is not part
     # of the SCF energy, which is why our total energy already agreed with
     # MOPAC's ENPART ETOT to 0.003 eV while the heat of formation did not.
-    eheat_total = eheat_total + c_triple_bond_correction(atoms, coords)
+    eheat_total = eheat_total + _pm6_heat_corrections(atoms, coords, method)
     E_hof_eV = E_binding_eV + eheat_total / EV_TO_KCAL
 
     # Mulliken partial charges (NDDO/ZDO): q_A = Z_valence(A) - Σ_{μ∈A} P_μμ.
@@ -1410,7 +1436,8 @@ def nddo_energy_batch(
         E_isol = sum(PARAMS[z].eisol for z in atoms)
         eheat = sum(PARAMS[z].eheat for z in atoms)
         E_binding = E_total - E_isol
-        eheat = eheat + c_triple_bond_correction(atoms, batch.coords_list[mol_idx])
+        eheat = eheat + _pm6_heat_corrections(
+            atoms, batch.coords_list[mol_idx], method)
         E_hof = E_binding + eheat / EV_TO_KCAL
 
         # Eigenvalues
@@ -1775,7 +1802,8 @@ def rm1_energy_batch_mlx(
         E_isol = sum(PARAMS[z].eisol for z in atoms)
         eheat = sum(PARAMS[z].eheat for z in atoms)
         E_binding = E_total - E_isol
-        eheat = eheat + c_triple_bond_correction(atoms, batch.coords_list[mol_idx])
+        eheat = eheat + _pm6_heat_corrections(
+            atoms, batch.coords_list[mol_idx], method)
         E_hof = E_binding + eheat / EV_TO_KCAL
         # Drop the spurious huge eigenvalues from padding.
         eigvals_active = eigvals_np[mol_idx, :nb]

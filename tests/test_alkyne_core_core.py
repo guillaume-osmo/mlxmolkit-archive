@@ -111,3 +111,68 @@ def test_the_density_is_right_even_where_the_energy_is_not():
     assert r["n_filled_levels"] == 20
     assert r["homo_eV"] == pytest.approx(-10.075, abs=0.002)
     assert r["lumo_eV"] == pytest.approx(2.052, abs=0.002)
+
+
+# --- the other two PM6 heat-of-formation corrections (issue #38) -------------
+
+MOPAC_HF_N = {
+    "c1cc[nH]c1": 27.908,             # pyrrole, planar N-H
+    "Cn1cccc1": 28.158,               # N-methylpyrrole, planar N with no H
+    "c1ccc2[nH]ccc2c1": 45.277,       # indole
+    "O=[N+]([O-])c1ccccc1": 19.421,   # nitrobenzene
+    "CN(C)C=O": -38.161,              # DMF, tertiary amide: no N-H
+    "CC(=O)N(C)C": -50.921,           # tertiary amide
+    "CC(=O)Nc1ccccc1": -25.309,       # acetanilide, secondary amide
+    "O=C1CCCN1": -44.368,             # 2-pyrrolidinone
+}
+
+
+@pytest.mark.parametrize("smiles,reference", sorted(MOPAC_HF_N.items()))
+def test_planar_nitrogen_molecules_match_mopac(smiles, reference):
+    """These were the worst molecules once the C≡C term landed — all nitrogen.
+
+    `nsp2_correction` gives -0.5 kcal/mol to every three-coordinate nitrogen
+    with fewer than two hydrogens, scaled by how close to planar it is.
+    """
+    assert hof(smiles) == pytest.approx(reference, abs=0.4)
+
+
+def test_nsp2_fires_on_planar_nitrogen_and_not_on_pyramidal():
+    """The gate is MOPAC's: exactly three ligands, fewer than two of them H.
+
+    Aniline and ethylenediamine have three-coordinate nitrogens too, but with
+    two hydrogens each, so MOPAC skips them — getting that condition backwards
+    would shift every primary amine by half a kcal.
+    """
+    from mlxmolkit.nddo.pwcct import nsp2_correction
+
+    def correction(smiles):
+        result = _smiles_to_3d(smiles, seed=1)
+        if result is None:
+            pytest.skip(f"could not embed {smiles}")
+        return nsp2_correction(result[0], result[1])
+
+    for planar in ("c1cc[nH]c1", "Cn1cccc1", "O=[N+]([O-])c1ccccc1"):
+        assert correction(planar) == pytest.approx(-0.5, abs=0.02), planar
+    for skipped in ("c1ccc(cc1)N", "NCCN", "CCO", "CCCC"):
+        assert correction(skipped) == 0.0, skipped
+
+
+def test_the_amide_dihedral_term_is_zero_for_a_planar_amide():
+    """`sum_dihed` is htype*sin(angle)**2, so a planar linkage costs nothing.
+
+    It also requires an N-H: a tertiary amide has no O=C-N-H system at all and
+    is skipped, which is why DMF is carried entirely by nsp2_correction.
+    """
+    from mlxmolkit.nddo.pwcct import nhco_dihedral_correction
+
+    def correction(smiles):
+        result = _smiles_to_3d(smiles, seed=1)
+        if result is None:
+            pytest.skip(f"could not embed {smiles}")
+        return nhco_dihedral_correction(result[0], result[1])
+
+    assert correction("CN(C)C=O") == 0.0, "tertiary amide has no N-H"
+    assert correction("CC(=O)N(C)C") == 0.0
+    assert 0.0 <= correction("CC(=O)Nc1ccccc1") < 0.2, "planar secondary amide"
+    assert correction("CCCC") == 0.0

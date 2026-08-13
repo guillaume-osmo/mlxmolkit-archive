@@ -264,3 +264,136 @@ def c_triple_bond_correction(atoms, coords) -> float:
                           + (_CTB_PARAM1 + t * _CTB_PARAM2)
                           * (t ** 3 - 3.0 * t ** 4 + 3.0 * t ** 5 - t ** 6))
     return total * C_TRIPLE_BOND_KCAL
+
+
+# The remaining two molecular-mechanics corrections MOPAC adds to `atheat` for
+# PM6, from src/compfg.F90:
+#
+#     if (method_pm6 .and. N_3_present) atheat = atheat + nsp2_correction()
+#     atheat = atheat + sum_dihed          ! htype*sin(angle)**2 over O=C-N-H
+#
+# Neither exists in PYSEQM, so the vendored port could never have carried them.
+HTYPE_PM6 = 2.5000   # moldat.F90: `if (method_pm6) htype = 2.5000D0`
+
+
+def _bonded(atoms, coords, scale: float = 1.25):
+    """Neighbour lists from covalent radii.
+
+    MOPAC carries its own `nbonds`/`ibonds`; this reconstructs the same
+    connectivity from geometry, which is what the corrections below need in
+    order to ask "does this nitrogen have exactly three ligands".
+    """
+    from .pm6_d3h4 import RCOV
+
+    xyz = np.asarray(coords, dtype=np.float64)
+    n = len(atoms)
+    radii = np.array([RCOV[int(z)] if int(z) < len(RCOV) else 1.5 for z in atoms])
+    neighbours = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if np.linalg.norm(xyz[i] - xyz[j]) < scale * (radii[i] + radii[j]):
+                neighbours[i].append(j)
+                neighbours[j].append(i)
+    return neighbours
+
+
+def nsp2_correction(atoms, coords) -> float:
+    """MOPAC's `nsp2_correction`, in kcal/mol.
+
+    Port of openMOPAC v23 ``src/corrections/set_up_dentate.F90``. Every nitrogen
+    with exactly three ligands, fewer than two of them hydrogen, is penalised by
+    ``-0.5 * exp(-10 * tot)`` where ``tot`` is how far the three bond angles fall
+    short of summing to 2*pi — i.e. how far from planar the centre is.
+
+    So a planar three-coordinate nitrogen — pyrrole, indole, an amide, a nitro
+    group, aniline — contributes the full -0.5 kcal/mol, and a pyramidal one
+    contributes almost nothing. That is the signature seen in the parity set:
+    after the C≡C fix the nine worst molecules were all planar-nitrogen species.
+
+    Args:
+        atoms: atomic numbers.
+        coords: (n, 3) in Angstrom.
+
+    Returns:
+        The correction in kcal/mol, zero when no qualifying nitrogen is present.
+    """
+    xyz = np.asarray(coords, dtype=np.float64)
+    neighbours = _bonded(atoms, xyz)
+    total = 0.0
+    for i, z in enumerate(atoms):
+        if int(z) != 7 or len(neighbours[i]) != 3:
+            continue
+        ligands = neighbours[i]
+        if sum(1 for j in ligands if int(atoms[j]) == 1) >= 2:
+            continue
+        angles = 0.0
+        for a in range(3):
+            for b in range(a):
+                u = xyz[ligands[a]] - xyz[i]
+                v = xyz[ligands[b]] - xyz[i]
+                cosine = u @ v / (np.linalg.norm(u) * np.linalg.norm(v))
+                angles += math.acos(max(-1.0, min(1.0, cosine)))
+        total += -0.5 * math.exp(-10.0 * (2.0 * math.pi - angles))
+    return total
+
+
+def nhco_dihedral_correction(atoms, coords, htype: float = HTYPE_PM6) -> float:
+    """MOPAC's `sum_dihed` over O=C-N-H linkages, in kcal/mol.
+
+    Port of ``setup_nhco`` in openMOPAC v23 ``src/moldat.F90`` plus the sum in
+    ``src/compfg.F90``: identify O=C-N-H systems by distance (C-O <= 1.3,
+    C-N <= 1.6, N-H <= 1.3, N-X <= 1.7), then add ``htype * sin(angle)**2`` for
+    both the O=C-N-X and O=C-N-H dihedrals. ``htype`` is 2.5 for PM6.
+
+    It is a *planarity* penalty on the amide: a planar linkage has both
+    dihedrals at 0 or 180 degrees, where sin**2 is zero, so a well-behaved amide
+    pays nothing. Tertiary amides have no N-H and are skipped entirely — for
+    those, :func:`nsp2_correction` is the whole story.
+    """
+    xyz = np.asarray(coords, dtype=np.float64)
+    z = [int(a) for a in atoms]
+    n = len(z)
+    dist = lambda a, b: float(np.linalg.norm(xyz[a] - xyz[b]))
+
+    quads, claimed = [], set()
+    for j in range(n):                                   # carbon
+        if z[j] != 6:
+            continue
+        found = False
+        for i in range(n):                               # oxygen
+            if z[i] != 8 or dist(i, j) > 1.3:
+                continue
+            for k in range(n):                           # nitrogen
+                if z[k] != 7 or dist(k, j) > 1.6:
+                    continue
+                for l in range(n):                       # hydrogen on N
+                    if z[l] != 1 or dist(k, l) > 1.3:
+                        continue
+                    for m in range(n):                   # the other substituent
+                        if m in (k, l, j) or dist(m, k) > 1.7:
+                            continue
+                        if k in claimed:                 # one entry per nitrogen
+                            continue
+                        claimed.add(k)
+                        quads.append((i, j, k, m))
+                        quads.append((i, j, k, l))
+                        found = True
+                        break
+                    if found:
+                        break
+                if found:
+                    break
+            if found:
+                break
+
+    total = 0.0
+    for i, j, k, l in quads:
+        b1 = xyz[j] - xyz[i]
+        b2 = xyz[k] - xyz[j]
+        b3 = xyz[l] - xyz[k]
+        n1 = np.cross(b1, b2)
+        n2 = np.cross(b2, b3)
+        m1 = np.cross(n1, b2 / np.linalg.norm(b2))
+        angle = math.atan2(float(m1 @ n2), float(n1 @ n2))
+        total += htype * math.sin(angle) ** 2
+    return total
