@@ -556,6 +556,44 @@ def _augment_pm6_full_from_mopac_csv() -> None:
 _augment_pm6_full_from_mopac_csv()
 
 
+# --- PM6-ORG -----------------------------------------------------------------
+PM6_ORG_PARAMS: Dict[int, ElementParams] = {}
+
+
+def _load_pm6_org() -> None:
+    """PM6-ORG's own parameter set, from the bundled MOPAC extraction.
+
+    MOPAC's switch.F90 assigns the ORG arrays wholesale — `uss = uss_org`,
+    `zs = zs_org` and so on — rather than overlaying them on PM6, so these 18
+    elements are the method's entire coverage. It does not fall back to PM6 for
+    anything else, and a molecule containing another element is out of scope.
+    """
+    csv_path = Path(__file__).resolve().parent / "data" / "parameters_PM6_ORG_MOPAC.csv"
+    if not csv_path.exists():
+        return
+    with csv_path.open(newline="") as handle:
+        for raw in csv.DictReader(handle, skipinitialspace=True):
+            row = {k.strip(): (v.strip() if v else "") for k, v in raw.items() if k}
+            z = int(row["N"])
+            has_d = abs(_sf(row, "zeta_d")) > 1e-9
+            PM6_ORG_PARAMS[z] = ElementParams(
+                Z=z, symbol=row["sym"].strip(),
+                n_basis=(1 if z == 1 else (9 if has_d else 4)),
+                n_valence=_PM6_TORE.get(z, 0), eheat=atomic_heat(z),
+                Uss=_sf(row, "U_ss"), Upp=_sf(row, "U_pp"), Udd=_sf(row, "U_dd"),
+                zeta_s=_sf(row, "zeta_s"), zeta_p=_sf(row, "zeta_p"),
+                beta_s=_sf(row, "beta_s"), beta_p=_sf(row, "beta_p"),
+                gss=_sf(row, "g_ss"), gsp=_sf(row, "g_sp"), gpp=_sf(row, "g_pp"),
+                gp2=_sf(row, "g_p2"), hsp=_sf(row, "h_sp"), alpha=_sf(row, "alpha"),
+                gauss_K=[0.0] * 4, gauss_L=[0.0] * 4, gauss_M=[0.0] * 4,
+                zeta_d=_sf(row, "zeta_d"), beta_d=_sf(row, "beta_d"),
+                F0SD=_sf(row, "F0SD"), G2SD=_sf(row, "G2SD"), has_d=has_d)
+            PM6_ORG_PARAMS[z].eisol = _compute_eisol(PM6_ORG_PARAMS[z])
+
+
+_load_pm6_org()
+
+
 def _augment_pm3_from_mopac_csv() -> None:
     """Extend PM3 to the full main-group set (Z<=53) from the bundled MOPAC CSV. PM3_PARAMS shipped only 10
     elements (values correct, coverage capped — same omission PM6 had). Standard PM3 is sp-only for main group
@@ -607,6 +645,13 @@ METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     'PM6_D3': PM6_FULL_PARAMS,
     'PM6_D3H4': PM6_FULL_PARAMS,
     'PM6_D3H4X': PM6_FULL_PARAMS,
+    # PM6_ORG is NOT registered yet. Its parameters (PM6_ORG_PARAMS) and its
+    # core-core (pwcct.pm6_org_pair_repulsion) are in place and the SCF runs,
+    # but the post-SCF corrections are not: on methanol MOPAC implies +3.2793
+    # kcal/mol of correction where the PM6-D3H4 composite gives +6.2673. The
+    # H-H repulsion alone is +6.3315, so PM6-ORG evidently carries its own
+    # H-H parameters through v_par_org rather than reusing PM6-D3H4's.
+    # Registering it would hand out energies ~3 kcal/mol wrong.
     'AM1_STAR': AM1_STAR_PARAMS,
     'RM1_STAR': RM1_STAR_PARAMS,
 }

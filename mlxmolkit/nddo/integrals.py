@@ -285,7 +285,16 @@ def nuclear_repulsion_for_method(
     Route every core-core evaluation through here so the three paths cannot
     drift apart again.
     """
-    if normalize_method(method) in PM6_CORE_CORE_METHODS:
+    canonical = normalize_method(method)
+    if canonical == 'PM6_ORG':
+        from .pwcct import pm6_org_pair_repulsion
+        coords = np.asarray(coords, dtype=np.float64)
+        n = len(atoms)
+        return float(sum(
+            pm6_org_pair_repulsion(atoms[i], atoms[j], params[atoms[i]],
+                                   params[atoms[j]], coords[i], coords[j])
+            for i in range(n) for j in range(i + 1, n)))
+    if canonical in PM6_CORE_CORE_METHODS:
         from .pwcct import pm6_nuclear_repulsion
         return pm6_nuclear_repulsion(atoms, coords, params)
     return compute_nuclear_repulsion(atoms, coords, param_dict=params)

@@ -495,3 +495,63 @@ def pm6_org_scale(zi: int, zj: int, r_ang: float, chi: float, alp: float) -> flo
         else:
             scale += _ORG_SUM * a
     return scale
+
+
+_PWCCT_ORG_CACHE: dict[tuple[int, int], tuple[float, float]] = {}
+_PWCCT_ORG_LOADED = False
+
+
+def get_pwcct_org(z1: int, z2: int):
+    """PM6-ORG's own alpb/xfac pair, from its bundled table.
+
+    PM6-ORG carries its own pair parameters; using PM6's would be a different
+    method wearing the same name.
+    """
+    global _PWCCT_ORG_LOADED
+    if not _PWCCT_ORG_LOADED:
+        path = os.path.join(os.path.dirname(__file__), "data",
+                            "PWCCT_PM6_ORG_MOPAC.csv")
+        try:
+            with open(path) as handle:
+                for line in handle:
+                    parts = line.strip().split(",")
+                    if len(parts) >= 4:
+                        a, b = int(parts[0]), int(parts[1])
+                        alp, chi = float(parts[2]), float(parts[3])
+                        _PWCCT_ORG_CACHE[(a, b)] = (chi, alp)
+                        _PWCCT_ORG_CACHE[(b, a)] = (chi, alp)
+        except FileNotFoundError:
+            pass
+        _PWCCT_ORG_LOADED = True
+    return _PWCCT_ORG_CACHE.get((int(z1), int(z2)), (0.0, 0.0))
+
+
+def pm6_org_pair_repulsion(zi, zj, pA, pB, coordI, coordJ) -> float:
+    """PM6-ORG core-core for one pair, eV.
+
+    Same assembly as :func:`pm6_pair_repulsion` — monopole term times a scaling
+    factor, plus the unpolarisable-core r^-12 term and the Gaussian VdW term —
+    but the scaling factor is `ccrep_PM6_ORG`'s and the chi/alpha come from
+    PM6-ORG's own pair table.
+    """
+    R_ang = float(np.linalg.norm(np.asarray(coordJ) - np.asarray(coordI)))
+    R_bohr = R_ang * ANG_TO_BOHR
+    ZA, ZB = float(pA.n_valence), float(pB.n_valence)
+    rho0A = 0.5 * EV / pA.gss if pA.gss > 0 else 0.0
+    rho0B = 0.5 * EV / pB.gss if pB.gss > 0 else 0.0
+    gam = EV / math.sqrt(R_bohr ** 2 + (rho0A + rho0B) ** 2)
+
+    chi, alp = get_pwcct_org(zi, zj)
+    scale = pm6_org_scale(zi, zj, R_ang, chi, alp)
+    enuclr = ZA * ZB * gam * scale
+
+    # VdW gaussians, index 1 only, as in ccrep's PM6 branch.
+    for p in (pA, pB):
+        ax = p.gauss_L[0] * (R_ang - p.gauss_M[0]) ** 2
+        if ax < 25.0:
+            enuclr += ZA * ZB / R_ang * p.gauss_K[0] * math.exp(-ax)
+    # unpolarisable core, Lennard-Jones "12" part
+    ax = R_ang / (float(zi) ** 0.3333 + float(zj) ** 0.3333)
+    if ax < 3.0:
+        enuclr += min(1e-8 / ax ** 12, 1e5)
+    return enuclr
