@@ -237,29 +237,70 @@ def principal_qn(Z: int) -> int:
 # The p^5 shell (F/Cl/Br/I) MUST use gppc=0.0, gp2c=10.0 — the previous 0.5/9.5 was a
 # mis-transcription that under-shot eisol by 0.5*(gpp-gp2) per halogen (~16 kcal/mol on Cl)
 # and had been papered over with hardcoded MOPAC correction constants (now removed).
-_EISOL_COEFFICIENTS = {
-    # Z: (ussc, uppc, gssc, gppc, gspc, gp2c, hspc)
-    1:  (1.0,  0.0,  0.0,   0.0,   0.0,  0.0,   0.0),     # H: 1s^1
-    6:  (2.0,  2.0,  1.0,  -0.5,   4.0,  1.5,  -2.0),     # C: 2s^2 2p^2
-    7:  (2.0,  3.0,  1.0,  -1.5,   6.0,  4.5,  -3.0),     # N: 2s^2 2p^3
-    8:  (2.0,  4.0,  1.0,  -0.5,   8.0,  6.5,  -4.0),     # O: 2s^2 2p^4
-    9:  (2.0,  5.0,  1.0,   0.0,  10.0, 10.0,  -5.0),     # F: 2s^2 2p^5
-    15: (2.0,  3.0,  1.0,  -1.5,   6.0,  4.5,  -3.0),     # P: 3s^2 3p^3 (same as N)
-    16: (2.0,  4.0,  1.0,  -0.5,   8.0,  6.5,  -4.0),     # S: 3s^2 3p^4 (same as O)
-    17: (2.0,  5.0,  1.0,   0.0,  10.0, 10.0,  -5.0),     # Cl: 3s^2 3p^5 (p^5 shell)
-    35: (2.0,  5.0,  1.0,   0.0,  10.0, 10.0,  -5.0),     # Br: p^5 shell
-    53: (2.0,  5.0,  1.0,   0.0,  10.0, 10.0,  -5.0),     # I: p^5 shell
-}
+# Ground-state orbital occupancies, transcribed from openMOPAC's
+# src/models/parameters_C.F90 `data ios / iop / iod`. MOPAC derives the eisol
+# coefficients from these rather than tabulating them per element, which is why
+# the previous hand-written 10-element table could not be extended: every new
+# element needed its coefficients worked out by hand, so they were left at zero.
+_IOS = ([1, 2] + [1, 2, 2, 2, 2, 2, 2, 0] + [1, 2, 2, 2, 2, 2, 2, 0]
+        + [1, 2, 2, 2, 2, 1, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 0]
+        + [1, 2, 2, 2, 1, 1, 2, 1, 1, 0, 1, 2, 2, 2, 2, 2, 2, 0]
+        + [1, 2, 2] + [2] * 14 + [2, 2, 1, 2, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2, 0])
+_IOP = ([0, 0] + [0, 0, 1, 2, 3, 4, 5, 6] + [0, 0, 1, 2, 3, 4, 5, 6]
+        + [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6]
+        + [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6]
+        + [0, 0, 0] + [0] * 14 + [0] * 9 + [1, 2, 3, 4, 5, 6])
+_IOD = ([0, 0] + [0] * 8 + [0] * 8
+        + [0, 0, 1, 2, 3, 5, 5, 6, 7, 8, 10, 0, 0, 0, 0, 0, 0, 0]
+        + [0, 0, 1, 2, 4, 5, 5, 7, 8, 10, 10, 0, 0, 0, 0, 0, 0, 0]
+        + [0, 0, 1] + [1] * 13 + [1, 2, 3, 5, 5, 6, 7, 9, 10] + [0] * 7)
+
+
+def _eisol_coefficients(z: int):
+    """MOPAC's calpar.F90 coefficients for element `z`, derived from occupancy.
+
+    Returns (ios, iop, iod, gssc, gppc, gspc, gp2c, hspc) exactly as
+    src/models/calpar.F90 builds them:
+
+        gssc = max(ios-1, 0)          gspc = ios*iop
+        gp2c = k(k-1)/2 + 0.5*l(l-1)/2      gppc = -0.5*l(l-1)/2
+        hspc = -iop*ios/2             with k = iop, l = min(iop, 6-iop)
+    """
+    if not 1 <= z <= len(_IOS):
+        return None
+    ios, iop, iod = _IOS[z - 1], _IOP[z - 1], _IOD[z - 1]
+    k = iop
+    l = min(k, 6 - k)
+    return (ios, iop, iod,
+            max(ios - 1, 0),                                 # gssc
+            -0.5 * (l * (l - 1)) / 2,                        # gppc
+            ios * k,                                         # gspc
+            (k * (k - 1)) / 2 + 0.5 * (l * (l - 1)) / 2,     # gp2c
+            -k * ios * 0.5)                                  # hspc
 
 
 def _compute_eisol(p: ElementParams) -> float:
-    """Compute isolated atom electronic energy using MOPAC/PYSEQM coefficients."""
-    if p.Z not in _EISOL_COEFFICIENTS:
+    """Isolated-atom electronic energy, eV — openMOPAC's calpar.F90 formula.
+
+        eisol = uss*ios + upp*iop + udd*iod
+              + gss*gssc + gpp*gppc + gsp*gspc + gp2*gp2c + hsp*hspc
+
+    Reproduces the ten hand-calibrated values (H, C, N, O, F, P, S, Cl, Br, I)
+    to 0.0 eV, and now covers every other element as well — those previously
+    carried eisol = 0.0, which made a heat of formation containing them wrong by
+    hundreds of kcal/mol while the SCF, the charges and the total energy stayed
+    correct.
+    """
+    coeffs = _eisol_coefficients(p.Z)
+    if coeffs is None:
         return 0.0
-    ussc, uppc, gssc, gppc, gspc, gp2c, hspc = _EISOL_COEFFICIENTS[p.Z]
-    return (ussc * p.Uss + uppc * p.Upp
-            + gssc * p.gss + gppc * p.gpp + gspc * p.gsp
-            + gp2c * p.gp2 + hspc * p.hsp)
+    ios, iop, iod, gssc, gppc, gspc, gp2c, hspc = coeffs
+    if p.Z == 1:
+        return p.Uss                       # calpar.F90:199  eisol(1) = uss(1)
+    udd = getattr(p, "Udd", 0.0) or 0.0
+    return (p.Uss * ios + p.Upp * iop + udd * iod
+            + p.gss * gssc + p.gpp * gppc + p.gsp * gspc
+            + p.gp2 * gp2c + p.hsp * hspc)
 
 
 # Set Eisol for all elements
