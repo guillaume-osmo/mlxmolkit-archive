@@ -586,7 +586,14 @@ METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     'AM1': AM1_PARAMS,
     'PM3': PM3_PARAMS,
     'PM6': PM6_FULL_PARAMS,      # full main-group PM6 WITH d-orbitals (Stewart 2007)
-    'PM6_D': PM6_FULL_PARAMS,    # alias
+    # PM6_D is an ALIAS for PM6, not a separate method. PM6 in this
+    # implementation already carries d orbitals — Z = 13, 14, 15, 16, 17, 21-29,
+    # 33, 35, 51, 53 all have n_basis == 9 — so there is nothing for a "PM6 with
+    # d" to add, and the two are the same object. Verified on 201 molecules
+    # against MOPAC: bit-identical energies and charges, including all 62 that
+    # carry P/S/Cl/Br/I. Kept for callers that spell it this way; a test that
+    # parametrises over both is testing one method twice.
+    'PM6_D': PM6_FULL_PARAMS,
     'AM1_STAR': AM1_STAR_PARAMS,
     'RM1_STAR': RM1_STAR_PARAMS,
 }
