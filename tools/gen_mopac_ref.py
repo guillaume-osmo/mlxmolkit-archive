@@ -15,7 +15,35 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 
 RDLogger.DisableLog("rdApp.*")
-MOPAC = "/Users/guillaume-osmo/miniconda3/envs/osmo/bin/mopac"
+def _find_mopac() -> str:
+    """Locate the MOPAC binary.
+
+    It is installed in the conda *base* prefix, not in the `osmo` env, so
+    neither `shutil.which` under the env nor a hardcoded env path finds it —
+    which is exactly the wrong conclusion ("MOPAC is not installed") to draw
+    from a benchmark that silently produces nothing.
+    """
+    import os
+    import shutil
+
+    found = shutil.which("mopac")
+    if found:
+        return found
+    candidates = [
+        os.path.expanduser("~/miniconda3/bin/mopac"),
+        os.path.expanduser("~/miniconda3/envs/osmo/bin/mopac"),
+        "/opt/homebrew/bin/mopac",
+        "/usr/local/bin/mopac",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    raise FileNotFoundError(
+        "MOPAC not found. Looked on PATH and in: " + ", ".join(candidates)
+    )
+
+
+MOPAC = _find_mopac()
 
 MOLS = [
     ("ethanol", "CCO"),
