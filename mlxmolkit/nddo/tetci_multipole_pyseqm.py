@@ -32,14 +32,71 @@ EV2 = EV / 4.0
 # exponents and are required by _pm6_d_param_from_key for the Slater-
 # Condon parameter computation (PYSEQM uses MAIN zeta for AIJL,
 # TAIL exponents for ds_add/dp_add/dd_add/dd0_add/dd4/dp3).
-PM6_TAIL_EXPONENTS = {
-    # Z: (s_tail, p_tail, d_tail)
-    15: (6.04271, 2.37647, 7.14775),   # P
-    16: (0.479722, 1.015507, 4.31747), # S
-    17: (0.9563, 2.46407, 6.41033),    # Cl
-    35: (3.09478, 3.06576, 2.82),      # Br
-    53: (9.13524, 6.88819, 3.79152),   # I
-}
+def _load_pm6_tail_exponents() -> dict[int, tuple[float, float, float]]:
+    """PM6's one-centre Slater exponents, from the bundled MOPAC parameter CSV.
+
+    A d-bearing PM6 atom carries *two* sets of exponents: zeta_s/p/d for the
+    basis, and a separate set MOPAC calls zsn/zpn/zdn for the one-centre
+    two-electron integrals. They are not close — silicon's are 8.388 against a
+    basis 1.753 — so using the basis set here is not an approximation, it is a
+    different integral.
+
+    This used to be a hardcoded dict of five elements: P, S, Cl, Br and I.
+    Al, Si and As fell through to the basis exponents, which put tetramethyl-
+    silane 528 kcal/mol from MOPAC and triethylaluminium 107, while the five
+    listed elements were correct. The error tracked how far zsn sat from
+    zeta_s, which is exactly what a silent fallback to the wrong exponent
+    predicts.
+
+    The CSV has carried the right values all along, in the columns
+    ``s_orb_exp_tail`` / ``p_orb_exp_tail`` / ``d_orb_exp_tail``; nothing read
+    them. Loading the table rather than listing it means a newly parameterised
+    element cannot be forgotten the same way.
+    """
+    import csv as _csv
+    from pathlib import Path as _Path
+
+    path = _Path(__file__).resolve().parent / "data" / "parameters_PM6_MOPAC.csv"
+    table: dict[int, tuple[float, float, float]] = {}
+    if not path.exists():
+        return table
+    with path.open(newline="") as handle:
+        for raw in _csv.DictReader(handle, skipinitialspace=True):
+            row = {k.strip(): (v.strip() if v else "") for k, v in raw.items() if k}
+            try:
+                z = int(row["N"])
+                trio = (float(row["s_orb_exp_tail"]), float(row["p_orb_exp_tail"]),
+                        float(row["d_orb_exp_tail"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if any(v != 0.0 for v in trio):
+                table[z] = trio
+    return table
+
+
+PM6_TAIL_EXPONENTS = _load_pm6_tail_exponents()
+
+# CRITICAL: every PM6 element with d orbitals (n_basis == 9) must appear here.
+#
+# A missing entry does not raise and does not warn. `_one_centre_w_cached` in
+# batch.py falls back to the *basis* exponents zeta_s/p/d, the SCF converges,
+# the charges stay reasonable, and the heat of formation comes out hundreds of
+# kcal/mol wrong. That is exactly how Al, Si and As were broken while P, S, Cl,
+# Br and I — the five elements someone had listed by hand — were correct:
+#
+#     tetramethylsilane   -527.7 kcal/mol from MOPAC   (zsn 8.388 vs zeta_s 1.753)
+#     triethylaluminium   -107.0                       (zsn 4.742)
+#     trimethylarsine      -15.8                       (zsn 2.007)
+#     dimethyl sulfide       0.0                       (zsn 0.480 — nearly no effect)
+#
+# The error scales with how far zsn sits from zeta_s, so an element whose two
+# exponent sets happen to be close looks fine and hides the bug.
+#
+# Loading from the CSV rather than listing by hand is what makes the table
+# complete: all 18 d-bearing PM6 elements are covered, including Sc-Cu which the
+# hand-written list never had. tests/test_tail_exponents.py asserts that
+# completeness, so a newly parameterised d element cannot slip through.
+
 
 
 def _aijl(z1: float, z2: float, n1: int, n2: int, L: int) -> float:
