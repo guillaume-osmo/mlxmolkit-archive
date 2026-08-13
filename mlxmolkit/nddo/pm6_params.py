@@ -9,7 +9,7 @@ For elements WITHOUT: n_basis=4 (or 1 for H), has_d=False
 """
 from __future__ import annotations
 
-from .params import ElementParams, _EISOL_COEFFICIENTS, _compute_eisol
+from .params import ElementParams, _compute_eisol
 from typing import Dict
 
 

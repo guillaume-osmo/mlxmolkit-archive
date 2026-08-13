@@ -16,7 +16,7 @@ import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
-from .params import ElementParams, RM1_PARAMS, _EISOL_COEFFICIENTS, _compute_eisol
+from .params import ElementParams, RM1_PARAMS, _compute_eisol
 
 
 # AM1 parameters from PYSEQM/MOPAC CSV (exact values)
@@ -505,13 +505,14 @@ for _z, _p in PM6_SP_PARAMS.items():
 
 
 # PM6 full with d-orbitals
+from .atomic_heats import atomic_heat
 from .pm6_params import PM6_FULL_PARAMS
 
 # --- Extend PM6_FULL_PARAMS to the FULL main-group periodic table from the bundled MOPAC CSV (Stewart PM6,
 # via PYSEQM). PM6 uses d-orbitals for Al,Si,P,S,Cl,Sc-Cu,As,Br,Sb,I; the sp-only variant MIS-CHARGES them
 # (e.g. sulfone S, phosphate P under-polarized), so d-PM6 is the ONLY PM6 exposed. Elements already present
-# (energy-calibrated) are kept; new ones are added charge-only (eheat=0 — density charges don't use eheat;
-# heats-of-formation would need the atomic-heat table).
+# (energy-calibrated) are kept; new ones take their atomic heat from MOPAC's own eheat table
+# (see atomic_heats.py), so heats of formation are right for them too, not just charges.
 _PM6_TORE = {1:1,3:1,4:2,5:3,6:4,7:5,8:6,9:7,11:1,12:2,13:3,14:4,15:5,16:6,17:7,19:1,20:2,21:3,22:4,23:5,
              24:6,25:7,26:8,27:9,28:10,29:11,30:12,31:3,32:4,33:5,34:6,35:7,37:1,38:2,39:3,40:4,41:5,42:6,
              43:7,44:8,45:9,46:10,47:11,48:12,49:3,50:4,51:5,52:6,53:7}
@@ -536,7 +537,7 @@ def _augment_pm6_full_from_mopac_csv() -> None:
             has_d = abs(_sf(row, "zeta_d")) > 1e-9
             PM6_FULL_PARAMS[z] = ElementParams(
                 Z=z, symbol=row["sym"].strip(), n_basis=(1 if z == 1 else (9 if has_d else 4)),
-                n_valence=_PM6_TORE[z], eheat=0.0,
+                n_valence=_PM6_TORE[z], eheat=atomic_heat(z),
                 Uss=_sf(row, "U_ss"), Upp=_sf(row, "U_pp"), Udd=_sf(row, "U_dd"),  # Udd was missing -> As off 0.2e
                 zeta_s=_sf(row, "zeta_s"), zeta_p=_sf(row, "zeta_p"),
                 beta_s=_sf(row, "beta_s"), beta_p=_sf(row, "beta_p"),
@@ -547,6 +548,10 @@ def _augment_pm6_full_from_mopac_csv() -> None:
                 gauss_M=[_sf(row, f"Gaussian{i}_M") for i in (1, 2, 3, 4)],
                 zeta_d=_sf(row, "zeta_d"), beta_d=_sf(row, "beta_d"),
                 F0SD=_sf(row, "F0SD"), G2SD=_sf(row, "G2SD"), has_d=has_d)
+            # Elements added here used to carry eisol = 0.0 alongside the
+            # placeholder eheat, which made a heat of formation containing them
+            # wrong by hundreds of kcal/mol while charges stayed correct.
+            PM6_FULL_PARAMS[z].eisol = _compute_eisol(PM6_FULL_PARAMS[z])
 
 _augment_pm6_full_from_mopac_csv()
 
@@ -555,7 +560,7 @@ def _augment_pm3_from_mopac_csv() -> None:
     """Extend PM3 to the full main-group set (Z<=53) from the bundled MOPAC CSV. PM3_PARAMS shipped only 10
     elements (values correct, coverage capped — same omission PM6 had). Standard PM3 is sp-only for main group
     (unlike PM6), and mlxmolkit's d-orbital integrals are PM6-specific, so PM3 stays sp-only here (n_basis=4,
-    charge-only eheat=0). Existing 10 kept intact. d-orbital PM3 (Al/Si/Ti/Zn/P/S...) would need the PM6 d path."""
+    atomic heat from MOPAC's eheat table). Existing 10 kept intact. d-orbital PM3 (Al/Si/Ti/Zn/P/S...) would need the PM6 d path."""
     csv_path = Path(__file__).resolve().parent / "data" / "parameters_PM3_MOPAC.csv"
     if not csv_path.exists():
         return
@@ -567,7 +572,7 @@ def _augment_pm3_from_mopac_csv() -> None:
                 continue   # skip elements PM3 never parameterized (blank/zero U_ss in the CSV)
             PM3_PARAMS[z] = ElementParams(
                 Z=z, symbol=row["sym"].strip(), n_basis=(1 if z == 1 else 4),
-                n_valence=_PM6_TORE[z], eheat=0.0,
+                n_valence=_PM6_TORE[z], eheat=atomic_heat(z),
                 Uss=_sf(row, "U_ss"), Upp=_sf(row, "U_pp"),
                 zeta_s=_sf(row, "zeta_s"), zeta_p=_sf(row, "zeta_p"),
                 beta_s=_sf(row, "beta_s"), beta_p=_sf(row, "beta_p"),
@@ -576,6 +581,7 @@ def _augment_pm3_from_mopac_csv() -> None:
                 gauss_K=[_sf(row, f"Gaussian{i}_K") for i in (1, 2, 3, 4)],
                 gauss_L=[_sf(row, f"Gaussian{i}_L") for i in (1, 2, 3, 4)],
                 gauss_M=[_sf(row, f"Gaussian{i}_M") for i in (1, 2, 3, 4)])
+            PM3_PARAMS[z].eisol = _compute_eisol(PM3_PARAMS[z])
 
 _augment_pm3_from_mopac_csv()
 
