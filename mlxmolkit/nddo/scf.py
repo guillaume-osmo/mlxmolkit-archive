@@ -910,7 +910,7 @@ def _nddo_energy_at_geometry(
         coords: (N, 3) coordinates in Angstrom
         max_iter: max SCF iterations
         conv_tol: density matrix convergence threshold
-        method: 'RM1', 'AM1', 'AM1_STAR', 'PM6_SP', 'PM6_D'
+        method: 'RM1', 'AM1', 'PM3', 'PM6', 'PM6_D', 'AM1_STAR', 'RM1_STAR'
         molecular_charge: net molecular charge used to set the closed-shell
             electron count.
         native: For ``method='PM6_D'``, force the native mlxmolkit path
