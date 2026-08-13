@@ -45,6 +45,43 @@ AU_TO_EV = AU_TO_KCAL * KCAL_TO_EV  # ≈ 27.211
 # PM6-D3H4 dispersion parameters (MOPAC parameters_for_PM6 v_par6(7..11))
 PM6_D3H4_DISP = dict(s6=0.880, alp=22.0, rs6=1.180, s8=0.0, rs8=1.0)
 
+# D3 with Becke-Johnson rational damping.
+#
+# A different damping function from the zero-damping above, not a
+# reparameterisation of it: BJ takes its damping radius from the dispersion
+# coefficients themselves, R0_AB = sqrt(C8_AB / C6_AB), rather than from the
+# tabulated r0ab cutoffs. The two are not interchangeable.
+#
+# These are the wB97M-D3BJ values, used unmodified by PM6-ML
+# (Novacek & Rezac, J. Chem. Theory Comput. 2025, 21, 678-690).
+# a1 is dimensionless, a2 is a length in Bohr.
+D3BJ_WB97M = dict(s6=1.0, s8=0.3908, a1=0.566, a2=3.128)
+
+# ---------------------------------------------------------------------------
+# Halogen-bond (X) correction parameters — E_X = sum a * exp(b * R_ab), with
+# R_ab in Angstrom and the result in kcal/mol. Port of MOPAC
+# src/corrections/disp_DnX.F90 (Apache-2.0).
+#
+# Rows are the halogen donor (Cl, Br, I), columns the acceptor (N, O, S).
+# Only iodine pairs with sulfur; the other X-S entries are absent, matching
+# MOPAC's `if (k /= 53 .and. nat(j) == 16) cycle`.
+# ---------------------------------------------------------------------------
+
+# "X" as used in D3H4X — Brahmkshatriya et al., Curr. Comput. Aided Drug Des.
+# 2013, 9, 118-129, Table 2.
+X_D3H4X = {
+    (17, 7): (1.049e12, -9.95), (35, 7): (5.560e4, -3.04), (53, 7): (5.237e8, -6.77),
+    (17, 8): (1.871e9, -7.44), (35, 8): (2.160e4, -3.30), (53, 8): (2.436e6, -4.71),
+    (53, 16): (1.051e6, -3.82),
+}
+
+# Original halogen-bond correction — Rezac & Hobza, Chem. Phys. Lett. 2011,
+# 506, 286-289. MOPAC selects these for PM6-DH2X.
+X_DH2X = {
+    (17, 7): (1.0489e12, -9.946), (35, 7): (1.0226e5, -3.236), (53, 7): (1.2751e12, -9.534),
+    (17, 8): (4.6783e8, -6.867), (35, 8): (9.6021e3, -2.900), (53, 8): (6.0912e5, -4.154),
+}
+
 # PM6-D3H4 H4 parameters (Rezáč & Hobza 2012)
 PM6_D3H4_H4 = dict(
     para_oh_o=2.32, para_oh_n=3.10,
@@ -255,6 +292,134 @@ def d3_energy(atoms, coords, params=None, rthr=15.0):
         'e8': e8 * AU_TO_KCAL,
         'e_disp': e_disp,
     }
+
+
+# ---------------------------------------------------------------------------
+# D3 dispersion (Becke-Johnson rational damping)
+# ---------------------------------------------------------------------------
+
+def d3bj_energy(atoms, coords, params=None, rthr=25.0):
+    """Compute D3 dispersion energy with Becke-Johnson damping (kcal/mol).
+
+    E_disp = -sum_{A<B} [ s6 C6_AB / (R^6 + f^6) + s8 C8_AB / (R^8 + f^8) ]
+
+    with f = a1 * R0_AB + a2 and R0_AB = sqrt(C8_AB / C6_AB).
+
+    Unlike zero-damping, BJ does not go to zero at short range but to a finite
+    constant, so it needs no r0ab table — the damping radius comes from the
+    dispersion coefficients. This is the variant PM6-ML uses.
+
+    Parameters
+    ----------
+    atoms : sequence[int]
+        Atomic numbers (1 <= Z <= 94).
+    coords : array (N, 3)
+        Cartesian coordinates in Angstrom.
+    params : dict
+        ``{s6, s8, a1, a2}``, a2 in Bohr. Defaults to the wB97M-D3BJ values
+        used by PM6-ML.
+    rthr : float
+        Pairwise cutoff in Angstrom. BJ decays as R^-6 with no exponential
+        screening, so it needs a longer cutoff than the zero-damping form.
+
+    Returns
+    -------
+    dict with keys 'e6', 'e8', 'e_disp' (all in kcal/mol).
+    """
+    if params is None:
+        params = D3BJ_WB97M
+    s6 = params['s6']; s8 = params['s8']
+    a1 = params['a1']; a2 = params['a2']
+
+    coords = np.asarray(coords, dtype=np.float64)
+    n = len(atoms)
+    if n < 2:
+        return {'e6': 0.0, 'e8': 0.0, 'e_disp': 0.0}
+
+    coords_bohr = coords / BOHR
+    rthr_bohr_sq = (rthr / BOHR) ** 2
+    rcov_bohr = 4.0 / 3.0 * RCOV / BOHR
+
+    c6ab, mxc = _load_c6ab()
+    cn = _pauling_coordination(atoms, coords_bohr, rcov_bohr)
+
+    e6 = 0.0
+    e8 = 0.0
+    for i in range(n - 1):
+        zi = atoms[i]
+        for j in range(i + 1, n):
+            zj = atoms[j]
+            rij2 = float(np.sum((coords_bohr[j] - coords_bohr[i]) ** 2))
+            if rij2 > rthr_bohr_sq:
+                continue
+            c6 = _getc6(zi, zj, cn[i], cn[j], c6ab, mxc)
+            # Same C8 convention as the zero-damping path: the tabulated
+            # R2R4 already folds in sqrt(Z) and the <r^4>/<r^2> ratio.
+            c8 = 3.0 * c6 * R2R4[zi - 1] * R2R4[zj - 1]
+
+            # BJ damping radius from the coefficients themselves.
+            r0 = np.sqrt(c8 / c6)
+            f = a1 * r0 + a2
+            f2 = f * f
+            f6 = f2 * f2 * f2
+            f8 = f6 * f2
+
+            r6 = rij2 ** 3
+            r8 = r6 * rij2
+            e6 += c6 / (r6 + f6)
+            e8 += c8 / (r8 + f8)
+
+    e6 *= -s6
+    e8 *= -s8
+    return {
+        'e6': e6 * AU_TO_KCAL,
+        'e8': e8 * AU_TO_KCAL,
+        'e_disp': (e6 + e8) * AU_TO_KCAL,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Halogen-bond (X) correction (Rezáč & Hobza 2011; Brahmkshatriya 2013)
+# ---------------------------------------------------------------------------
+
+def x_energy(atoms, coords, params=None):
+    """Halogen-bond correction (kcal/mol).
+
+    E_X = sum_{X, A} a_XA * exp(b_XA * R_XA)
+
+    over halogen donors (Cl, Br, I) and acceptors (N, O, S), with R in
+    Angstrom. Purely radial — there is no angular term, so the sigma-hole
+    directionality is not modelled explicitly.
+
+    Sulfur pairs only with iodine, matching MOPAC's guard.
+
+    Parameters
+    ----------
+    params : dict
+        Mapping ``(Z_halogen, Z_acceptor) -> (a, b)``. Defaults to the D3H4X
+        set; pass ``X_DH2X`` for the original PM6-DH2X parameters.
+    """
+    if params is None:
+        params = X_D3H4X
+
+    coords = np.asarray(coords, dtype=np.float64)
+    halogens = (17, 35, 53)
+    acceptors = (7, 8, 16)
+
+    total = 0.0
+    for i, zi in enumerate(atoms):
+        if zi not in halogens:
+            continue
+        for j, zj in enumerate(atoms):
+            if zj not in acceptors:
+                continue
+            ab = params.get((zi, zj))
+            if ab is None:
+                continue
+            a, b = ab
+            r = float(np.linalg.norm(coords[j] - coords[i]))
+            total += a * np.exp(b * r)
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -509,4 +674,38 @@ def pm6_d3h4_correction(atoms, coords):
         'e_hb': e_hb,
         'e_hh': e_hh,
         'e_total': disp['e_disp'] + e_hb + e_hh,
+    }
+
+
+def pm6_d3h4x_correction(atoms, coords, x_params=None):
+    """PM6-D3H4 plus the halogen-bond (X) term.
+
+    Identical to :func:`pm6_d3h4_correction` for molecules with no Cl, Br or
+    I — the X term is exactly zero there, so this is a safe default for
+    halogen-containing chemistry without changing anything else.
+
+    Returns the same keys plus ``'e_x'``.
+    """
+    base = pm6_d3h4_correction(atoms, coords)
+    e_x = x_energy(atoms, coords, params=x_params)
+    base['e_x'] = e_x
+    base['e_total'] += e_x
+    return base
+
+
+def d3bj_correction(atoms, coords, params=None):
+    """D3(BJ) dispersion on its own, in the PM6-ML combination.
+
+    PM6-ML is ``E_PM6 + dE_ML + dE_D3(BJ)`` — note it uses *unmodified* PM6
+    with BJ dispersion, not the D3H4X correction stack. Provided here so the
+    dispersion half of that combination is available without the ML term.
+
+    Returns a dict shaped like the other corrections.
+    """
+    disp = d3bj_energy(atoms, coords, params=params)
+    return {
+        'e_disp': disp['e_disp'],
+        'e6': disp['e6'],
+        'e8': disp['e8'],
+        'e_total': disp['e_disp'],
     }
