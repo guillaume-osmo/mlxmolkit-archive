@@ -440,3 +440,58 @@ def dispersion_correction(atoms, coords, method) -> float:
     if method == "PM6_D3H4":
         return float(pm6_d3h4_correction(atoms, coords)["e_total"])
     return float(pm6_d3h4x_correction(atoms, coords)["e_total"])
+
+
+# --- PM6-ORG core-core -------------------------------------------------------
+# Port of openMOPAC src/integrals/ccrep.F90 `ccrep_PM6_ORG`. PM6-ORG keeps PM6's
+# general form and X-H special case but adds a Gaussian steric term to thirteen
+# element pairs:
+#
+#     if (r - parC > 0) scale = scale + sum*parA*exp(-parB*(r-parC)**2)
+#     else              scale = scale + sum*parA
+#
+# with `sum` a saved local fixed at 0.01. Values are v_par_org(n) from
+# src/models/parameters_for_PM6_ORG_C.F90.
+_ORG_SUM = 0.01
+_ORG_STERIC = {
+    (1, 1):   (1.95072, 9.93668, 1.73449),   # H-H   par16/17/18
+    (6, 1):   (0.97354, 3.16312, 1.85191),   # C-H   par19/11/12
+    (7, 1):   (0.99964, 4.85533, 1.78033),   # N-H   par38/39/40
+    (8, 1):   (1.88549, 1.29664, 1.12466),   # O-H   par3/4/5
+    (16, 1):  (0.22856, 6.08399, 2.44074),   # S-H   par44/45/46
+    (6, 6):   (0.03076, 5.89911, 2.54117),   # C-C   par13/14/15
+    (7, 6):   (0.07450, 7.59406, 2.83229),   # N-C   par35/36/37
+    (8, 6):   (0.11796, 4.71122, 2.33136),   # C-O   par20/21/22
+    (16, 6):  (0.06917, 5.86395, 2.08820),   # S-C   par29/30/31
+    (8, 7):   (0.06759, 7.83635, 2.39365),   # N-O   par26/27/28
+    (16, 7):  (0.15561, 4.94374, 3.15741),   # S-N   par41/42/43
+    (8, 8):   (0.22071, 6.65530, 2.28968),   # O-O   par32/33/34
+    (16, 8):  (-0.01164, 7.15358, 2.75879),  # S-O   par23/24/25
+}
+# C-C triple-bond term, v_par_org(1) and (2) — the same values PM6 uses.
+_ORG_CC_PAR1, _ORG_CC_PAR2 = 9.278465, 5.983752
+
+
+def pm6_org_scale(zi: int, zj: int, r_ang: float, chi: float, alp: float) -> float:
+    """The PM6-ORG core-core scaling factor, dimensionless.
+
+    Mirrors `ccrep_PM6_ORG`. The base is PM6's, including the r**2 form for
+    C-H / N-H / O-H, and then a steric Gaussian is added per element pair.
+    Note that C-H, N-H and O-H *rebuild* the base rather than adding to it,
+    while every other pair adds — following the Fortran exactly.
+    """
+    i, j = max(int(zi), int(zj)), min(int(zi), int(zj))
+    base = 1.0 + 2.0 * chi * math.exp(-alp * (r_ang + 0.0003 * r_ang ** 6))
+    if j == 1 and i in (6, 7, 8):
+        base = 1.0 + 2.0 * chi * math.exp(-alp * r_ang ** 2)
+    scale = base
+    if j == 6 and i == 6:
+        scale += _ORG_CC_PAR1 * math.exp(-_ORG_CC_PAR2 * r_ang)
+    steric = _ORG_STERIC.get((i, j))
+    if steric is not None:
+        a, b, c = steric
+        if r_ang - c > 0.0:
+            scale += _ORG_SUM * a * math.exp(-b * (r_ang - c) ** 2)
+        else:
+            scale += _ORG_SUM * a
+    return scale
