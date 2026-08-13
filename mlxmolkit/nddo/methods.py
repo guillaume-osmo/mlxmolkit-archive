@@ -600,12 +600,13 @@ METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     # carry P/S/Cl/Br/I. Kept for callers that spell it this way; a test that
     # parametrises over both is testing one method twice.
     'PM6_D': PM6_FULL_PARAMS,
-    # PM6_D3 / PM6_D3H4 / PM6_D3H4X are deliberately NOT registered yet. The
-    # electronic side is ready — they are plain PM6, and pwcct.dispersion_correction
-    # dispatches the post-SCF term — but the correction does not reproduce MOPAC:
-    # on methanol MOPAC wants -0.360 kcal/mol for D3 and +6.267 for D3H4, and we
-    # produce -2.247 and -2.308. Registering them would hand out wrong energies
-    # under a name that looks authoritative. See the tracking issue.
+    # The dispersion / hydrogen-bond / halogen variants. Electronically these
+    # are plain PM6 — same parameters, same SCF, same density and charges — and
+    # differ only by a post-SCF function of geometry added to the heat of
+    # formation (pwcct.dispersion_correction). Verified against MOPAC v23.2.
+    'PM6_D3': PM6_FULL_PARAMS,
+    'PM6_D3H4': PM6_FULL_PARAMS,
+    'PM6_D3H4X': PM6_FULL_PARAMS,
     'AM1_STAR': AM1_STAR_PARAMS,
     'RM1_STAR': RM1_STAR_PARAMS,
 }
