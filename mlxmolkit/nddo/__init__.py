@@ -24,6 +24,18 @@ PM6-D3H4 corrections (post-SCF)
         + HH-repulsion (eV). Tests: tests/test_pm6_d3h4.py
 
     d3_energy(atoms, coords) -> float
+        D3 dispersion, zero damping (the PM6-D3H4 variant).
+
+    d3bj_energy(atoms, coords) -> dict
+        D3 dispersion, Becke-Johnson rational damping. Validated against
+        Grimme's simple-dftd3 to ~1e-9 relative. This is the variant PM6-ML
+        uses; it is NOT interchangeable with the zero-damping form.
+
+    x_energy(atoms, coords) -> float
+        Halogen-bond correction for Cl/Br/I with N/O/S.
+
+    pm6_d3h4x_correction(atoms, coords) -> dict
+        PM6-D3H4 plus the halogen-bond term.
     h4_energy(atoms, coords) -> float
     hh_repulsion(atoms, coords) -> float
         Individual components.
@@ -51,7 +63,11 @@ from .scf import nddo_energy, nddo_energy_batch
 from .gradient import nddo_gradient, nddo_optimize, nddo_optimize_batch
 from .pm6_d3h4 import (
     pm6_d3h4_correction,
+    pm6_d3h4x_correction,
+    d3bj_correction,
     d3_energy,
+    d3bj_energy,
+    x_energy,
     h4_energy,
     hh_repulsion,
 )
@@ -68,7 +84,11 @@ __all__ = [
     "nddo_optimize_batch",
     # PM6-D3H4 corrections
     "pm6_d3h4_correction",
+    "pm6_d3h4x_correction",
+    "d3bj_correction",
     "d3_energy",
+    "d3bj_energy",
+    "x_energy",
     "h4_energy",
     "hh_repulsion",
     # Parameters
