@@ -1410,7 +1410,7 @@ def nddo_energy_batch(
         E_isol = sum(PARAMS[z].eisol for z in atoms)
         eheat = sum(PARAMS[z].eheat for z in atoms)
         E_binding = E_total - E_isol
-        eheat = eheat + c_triple_bond_correction(atoms, coords)
+        eheat = eheat + c_triple_bond_correction(atoms, batch.coords_list[mol_idx])
         E_hof = E_binding + eheat / EV_TO_KCAL
 
         # Eigenvalues
@@ -1775,7 +1775,7 @@ def rm1_energy_batch_mlx(
         E_isol = sum(PARAMS[z].eisol for z in atoms)
         eheat = sum(PARAMS[z].eheat for z in atoms)
         E_binding = E_total - E_isol
-        eheat = eheat + c_triple_bond_correction(atoms, coords)
+        eheat = eheat + c_triple_bond_correction(atoms, batch.coords_list[mol_idx])
         E_hof = E_binding + eheat / EV_TO_KCAL
         # Drop the spurious huge eigenvalues from padding.
         eigvals_active = eigvals_np[mol_idx, :nb]
