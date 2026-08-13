@@ -15,7 +15,12 @@ where gam = EV / sqrt(R_bohr² + (rho0_A + rho0_B)²)
       f(R) = R_ang^2                  (C-H, N-H, O-H special)
 
 Special cases:
-  C-C: extra 9.28 * exp(-5.98 * R_ang) * Z_A*Z_B*gam term
+  C-C: extra par1 * exp(-par2 * R_ang) * Z_A*Z_B*gam term, where
+       par1 = v_par6(1) = 9.278465 and par2 = v_par6(2) = 5.983752.
+       MOPAC src/models/parameters_for_PM6_C.F90 lines 1449-1450 label these
+       "scalar/exponent correction of C-C triple bonds"; they are applied in
+       src/integrals/ccrep.F90 as `scale = scale + par1*exp(-par2*r)`, i.e.
+       inside the factor multiplying Z_A*Z_B*gab, which is the form used here.
 """
 from __future__ import annotations
 
@@ -26,6 +31,13 @@ from typing import Dict, Tuple
 from .params import ANG_TO_BOHR
 
 EV = 27.21
+
+# MOPAC's v_par6(1) and v_par6(2), from src/models/parameters_for_PM6_C.F90,
+# where they are commented "Used in ccrep for scalar/exponent correction of C-C
+# triple bonds". This code previously rounded them to 9.28 and 5.98, which is
+# worth ~0.01 eV on a C-C pair at triple-bond range.
+_CC_PAR1 = 9.278465
+_CC_PAR2 = 5.983752
 
 # PWCCT parameters cache
 _PWCCT_CACHE: Dict[Tuple[int, int], Tuple[float, float]] = {}
@@ -95,7 +107,7 @@ def pm6_pair_repulsion(zi: int, zj: int, pA, pB,
             1.0 + 2.0 * chi * math.exp(-alp * (R_ang + 0.0003 * R_ang ** 6)))
 
     if zi == 6 and zj == 6:
-        expo2 += ZA * ZB * gam * 9.28 * math.exp(-5.98 * R_ang)
+        expo2 += ZA * ZB * gam * _CC_PAR1 * math.exp(-_CC_PAR2 * R_ang)
 
     t4 = ZA * ZB / R_ang
     t5 = sum(pA.gauss_K[k] * math.exp(-pA.gauss_L[k] * (R_ang - pA.gauss_M[k]) ** 2)
@@ -190,7 +202,7 @@ def pm6_pair_repulsion_batch(zi, zj, pair_params, coordI, coordJ, param_dict=Non
                     np.exp(-alp * (R_ang + 0.0003 * R_ang ** 6)))
     expo2 = unpolcore + ZA * ZB * gam * (1.0 + 2.0 * chi * damp)
     expo2 = np.where((zi == 6) & (zj == 6),
-                     expo2 + ZA * ZB * gam * 9.28 * np.exp(-5.98 * R_ang), expo2)
+                     expo2 + ZA * ZB * gam * _CC_PAR1 * np.exp(-_CC_PAR2 * R_ang), expo2)
 
     KA, LA, MA = gK[zi], gL[zi], gM[zi]
     KB, LB, MB = gK[zj], gL[zj], gM[zj]
