@@ -106,7 +106,13 @@ def _cubic_backtrack(
 def mmff_optimize_batch(
     mol: Chem.Mol,
     conf_ids: Optional[list[int]] = None,
-    max_iters: int = 200,
+    # 1000, not 200. This loop early-exits per conformer on grad_tol, so the
+    # cap is a bound and not a cost: measured 56.8 / 55.2 / 55.0 / 52.8 ms at
+    # 200 / 500 / 1000 / 2000 on five molecules that all converge under 100
+    # iterations. At 200 a drug-like set converged 0/9 conformers, at 500 6/9,
+    # at 1000 9/9 — so the old default was reporting non-convergence that the
+    # optimizer would have reached for free. See #29.
+    max_iters: int = 1000,
     grad_tol: float = 1e-4,
     method: str = "lbfgs",
     m: int = 10,
@@ -418,7 +424,7 @@ def mmff_optimize_batch(
 
 def mmff_optimize_molecules_batch(
     mols: list[Chem.Mol],
-    max_iters: int = 200,
+    max_iters: int = 1000,
     grad_tol: float = 1e-4,
     method: str = "lbfgs",
     m: int = 10,
