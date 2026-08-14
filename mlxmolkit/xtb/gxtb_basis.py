@@ -175,10 +175,12 @@ def build_gxtb_qvszp_basis(
             if l > 2:
                 continue
 
-            exp_scale = float(GXTB_PARAMS["ps_h0_qvszp_exp_scal"][Z - 1, ish])
-            if exp_scale == 0.0:
-                exp_scale = 1.0
-            alphas = np.asarray(qshell.exponents, dtype=np.float64) * exp_scale
+            # The q-vSZP overlap/density basis uses BASE exponents; the charge
+            # dependence lives in the contraction coefficients below.  The
+            # ``ps_h0_qvszp_exp_scal`` table is an H0-only effective-basis
+            # scaling and must NOT touch the overlap basis (verified against the
+            # released g-xTB molden: base exps reproduce S to machine precision).
+            alphas = np.asarray(qshell.exponents, dtype=np.float64)
             raw_coeffs = np.asarray(qshell.coefficients, dtype=np.float64) + (
                 np.asarray(qshell.coefficients_env, dtype=np.float64) * qeff_atom[atom_idx]
             )
@@ -201,10 +203,12 @@ def build_gxtb_qvszp_basis(
                 float(GXTB_PARAMS["pa_tb3_hubbard_derivs"][Z - 1])
                 * float(GXTB_PARAMS["pg_tb3_kshell"][l])
             )
-            shell_fourth.append(
-                float(GXTB_PARAMS["pa_tb3_hubbard_derivs"][Z - 1])
-                * float(GXTB_PARAMS["pg_tb4_kshell"][l])
-            )
+            # 4th-order onsite hardness Gamma4_sh = pg_tb4_kshell[l] * K4TH (=0.036).
+            # Binary-exact (add_coulomb 0x41a0b4: ldr d25,[x1,0xbe8]=0.036 ; fmul on
+            # pg_tb4_kshell): the per-element pa_tb3_hubbard_derivs factor is NOT
+            # present here. The 0.036 lives in scf_gxtb.GXTB_K4TH_SCALE, so this table
+            # holds pg_tb4_kshell[l] alone.
+            shell_fourth.append(float(GXTB_PARAMS["pg_tb4_kshell"][l]))
             shell_exchange.append(
                 float(GXTB_PARAMS["ps_fock_shell_hubbard"][Z - 1, ish])
                 * float(GXTB_PARAMS["pg_fock_kq"][l])

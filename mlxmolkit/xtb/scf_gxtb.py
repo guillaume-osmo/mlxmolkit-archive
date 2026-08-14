@@ -20,16 +20,33 @@ from .params_gxtb import GXTB_PARAMS
 EV_PER_HARTREE = 27.211386245988
 KCAL_PER_HARTREE = 627.5094740631
 GXTB_TB2_KEXP = 0.294621155
+# Two-body third-order scalars, stored consecutively in the binary param block as
+# (2.3, 0.2093327496, 1.3) and read by get_taumat_0d._omp_fn.0 as:
+#   off-site prefactor (k3)        = 2.3
+#   on-site  prefactor (rexp)      = 0.2093327496   (A2-validated vs Ne)
+#   off-site exp decay (kx)        = 1.3
+# The earlier port swapped KX<->REXP, blowing the term up (E3 ~ -127 Ha, MAE 1.86).
 GXTB_TB3_K = 2.3
-GXTB_TB3_KX = 0.2093327496
-GXTB_TB3_REXP = 1.3
+GXTB_TB3_KX = 1.3
+GXTB_TB3_REXP = 0.2093327496
+# 4th-order onsite hardness Gamma4_sh = shell_fourth * K4TH_SCALE, where
+# shell_fourth = pg_tb4_kshell[l] (NO pa_tb3_hubbard_derivs factor; see gxtb_basis).
+# Binary-exact: add_coulomb 0x41a0b4 loads DAT_005dbbe8 = 0.036 and multiplies
+# pg_tb4_kshell directly -- no per-element hubbard factor. Energy = sum q^4 Gamma4/24,
+# potential = q^3 Gamma4/6 (the /6 and /24 below are the only divisors).
+GXTB_K4TH_SCALE = 0.036
 GXTB_TB1_KX = 1.0
 GXTB_TB1_KDIS = 0.025
 GXTB_TB1_KS = 0.666666666
 GXTB_TB1_CN_EPS = 1.0e-12
+# Mulliken-Fock-exchange range-separation scalars. VERIFIED against the released
+# g-xTB binary: the exact constants new_exchange_fock receives are baked at
+# libxtb __const 0x73b4d8.. = {gexp=1.38265972, lrscale=0.85, omega=0.2, frscale=0.15}.
+# NB: the public gp3.f90 source declares fock_omega=0.300, but that branch is STALE;
+# the released binary uses omega=0.2 (this value). Binary is authoritative.
 GXTB_MFX_FR_SCALE = 0.15
 GXTB_MFX_LR_SCALE = 0.85
-GXTB_MFX_OMEGA = 0.20
+GXTB_MFX_OMEGA = 0.2
 GXTB_MFX_GEXP = 1.3826597204
 GXTB_HALIDE_INCREMENT_CORRECTION = {
     # Oracle-calibrated additive shifts for the extracted release increments.
@@ -220,71 +237,27 @@ def _mfx_fock_energy(P: np.ndarray, S: np.ndarray, gamma_ao: np.ndarray) -> tupl
 
 
 def _third_order_twobody(
-    coords_bohr: np.ndarray,
-    shell_atom: np.ndarray,
-    shell_hardness: np.ndarray,
-    shell_gamma: np.ndarray,
+    basis,
+    atoms: np.ndarray,
+    coords_ang: np.ndarray,
     qsh: np.ndarray,
-    *,
-    k3: float = GXTB_TB3_K,
-    kx: float = GXTB_TB3_KX,
-    rexp: float = GXTB_TB3_REXP,
 ) -> tuple[float, np.ndarray]:
-    """Approximate g-xTB two-body third-order TB term from SI Eq. 129-133.
+    """Binary-exact g-xTB two-body third-order (``coulomb_thirdorder_twobody``).
 
-    The released binary constructs ``new_twobody_thirdorder`` rather than the
-    classic onsite GFN2 term.  This function mirrors the SI algebra using the
-    extracted shell Γ table and the visible binary scalar literals.
+    Thin adapter over :func:`mlxmolkit.xtb.gxtb_aes.gxtb_twobody_thirdorder`, which
+    holds the decoded tau-matrix algebra: harmonic-averaged effective shell
+    hardness ``eta_eff = eta_base*(1 + pa_tb2_hubbard_cn*(sqrt(cn+1e-12)-1e-6))``
+    with ``eta_base = ps_tb2_shell_hubbard*pa_hubbard_parameter`` (no cn slope), an
+    off-site ``k3*x*(1-0.5*kx*x)*exp(-kx*x)`` kernel and an on-site (incl. diagonal)
+    ``-REXP*gamma^2`` block.  Returns ``(energy, V_shell)``.
     """
 
-    coords = np.asarray(coords_bohr, dtype=np.float64)
-    atom = np.asarray(shell_atom, dtype=np.int64)
-    hard = np.asarray(shell_hardness, dtype=np.float64)
-    gamma = np.asarray(shell_gamma, dtype=np.float64)
+    from .gxtb_aes import gxtb_twobody_thirdorder
+
     q = np.asarray(qsh, dtype=np.float64)
-    n_shell = q.size
-    if n_shell == 0:
+    if q.size == 0:
         return 0.0, np.zeros(0, dtype=np.float64)
-
-    n_atom = int(atom.max()) + 1
-    qat = np.bincount(atom, weights=q, minlength=n_atom)
-    shell_pot = np.zeros(n_shell, dtype=np.float64)
-    atom_pot = np.zeros(n_atom, dtype=np.float64)
-    energy = 0.0
-
-    for i in range(n_shell):
-        ai = int(atom[i])
-        ui = max(float(hard[i]), 1.0e-12)
-        qi = float(q[i])
-        for j in range(n_shell):
-            aj = int(atom[j])
-            uj = max(float(hard[j]), 1.0e-12)
-            qj = float(q[j])
-            if ai == aj:
-                tau_i = -0.5 / (ui * ui)
-                tau_j = -0.5 / (uj * uj)
-            else:
-                rij = float(np.linalg.norm(coords[ai] - coords[aj]))
-                uavg = 0.5 * (ui + uj)
-                damp = math.exp(-float(kx) * uavg * (rij ** float(rexp)))
-                common = float(k3) * damp
-                tau_i = common * (
-                    uavg * rij - 0.5 * float(kx) * (uavg * uavg) * (rij ** (float(rexp) + 1.0))
-                )
-                tau_j = tau_i
-
-            ti = tau_i * float(gamma[i])
-            tj = tau_j * float(gamma[j])
-            pair_shift = qat[ai] * ti + qat[aj] * tj
-            pref = (qi * qj) / 6.0
-            energy += pref * pair_shift
-            shell_pot[i] += (qj * pair_shift) / 6.0
-            shell_pot[j] += (qi * pair_shift) / 6.0
-            atom_pot[ai] += pref * ti
-            atom_pot[aj] += pref * tj
-
-    shell_pot += atom_pot[atom]
-    return float(energy), shell_pot
+    return gxtb_twobody_thirdorder(q, basis, atoms, coords_ang)
 
 
 def _shell_local_indices(shell_atom: np.ndarray) -> np.ndarray:
@@ -419,6 +392,18 @@ def gxtb_energy(
     use_fourth_order: bool = False,
     use_diis: bool = True,
     use_halide_increment_correction: bool = True,
+    use_aes: bool = False,
+    use_onecenter: bool = False,
+    onecenter_scale: float = 1.0,
+    onsite_potential: bool = False,
+    onsite_sign: float = 1.0,
+    onsite_charge_factor: bool = False,
+    onsite_diag: int = 0,
+    onsite_mapping: tuple = (2, 0, 1),
+    use_aniso_h0: bool = False,
+    aniso_h0_scale: float = 1.0,
+    use_twobody3: bool = False,
+    use_bocorr: bool = False,
     scc_scale: float = 1.0,
     verbose: bool = False,
 ) -> dict[str, object]:
@@ -440,11 +425,17 @@ def gxtb_energy(
     H_eht, shell_self = build_hcore_gxtb(atoms, coords, basis)
     H_acp = build_gxtb_acp_hamiltonian(atoms, coords, basis, enabled=use_acp_hamiltonian)
     H0 = H_eht + H_acp
+    if use_aniso_h0:
+        from .gxtb_aes import gxtb_aniso_h0
+        H0 = H0 + aniso_h0_scale * gxtb_aniso_h0(basis, atoms, coords)
     n_basis = S.shape[0]
     n_shell = basis.shell_atom.size
     coords_bohr = coords * ANG_TO_BOHR
     jmat = _coulomb_matrix(coords_bohr, basis.shell_atom, basis.shell_hardness)
     gamma_mfx = _mfx_gamma_ao(atoms, coords, basis) if use_mfx_exchange else None
+    if use_bocorr and gamma_mfx is not None:
+        from .gxtb_aes import gxtb_bocorr_gamma
+        gamma_mfx = gamma_mfx + gxtb_bocorr_gamma(basis, atoms, coords)
 
     z_ref = basis.shell_zref
     n_elec_f = float(np.sum(z_ref)) - float(charge)
@@ -481,17 +472,57 @@ def gxtb_energy(
             V_first = V_first + V_first_offsite
         V_third = qsh * qsh * basis.shell_third if use_third_order else 0.0
         _, V_third_twobody = (
-            _third_order_twobody(coords_bohr, basis.shell_atom, basis.shell_hardness, basis.shell_third, qsh)
+            _third_order_twobody(basis, atoms, coords, qsh)
             if use_twobody_third_order
             else (0.0, 0.0)
         )
-        V_fourth = qsh * qsh * qsh * basis.shell_fourth if use_fourth_order else 0.0
+        V_fourth = qsh * qsh * qsh * basis.shell_fourth * GXTB_K4TH_SCALE / 6.0 if use_fourth_order else 0.0
         V_exchange = basis.shell_exchange * qsh if use_exchange else 0.0
-        V_sh = V_first + scc_scale * (V_coul + V_third + V_third_twobody + V_fourth + V_exchange)
+        V_tb3 = 0.0
+        if use_twobody3:
+            from .gxtb_aes import gxtb_twobody_thirdorder
+            _, V_tb3 = gxtb_twobody_thirdorder(qsh, basis, atoms, coords)
+        V_sh = V_first + scc_scale * (V_coul + V_third + V_third_twobody + V_fourth + V_exchange + V_tb3)
         F = _fock_from_shell_potential(H0, S, basis.bf_to_shell, V_sh)
         if gamma_mfx is not None:
             _, F_mfx = _mfx_fock_energy(P, S, gamma_mfx)
             F = F + F_mfx
+        if use_aes and it > 0:
+            from .gxtb_aes import gxtb_aes_fock
+            F_aes, _ = gxtb_aes_fock(P, basis, atoms, coords)
+            F = F + F_aes
+        if use_onecenter and it > 0:
+            if onsite_potential == 3:
+                from .gxtb_aes import gxtb_onsite_fock_exact
+                F_os = gxtb_onsite_fock_exact(P, S, basis, atoms, mapping=onsite_mapping)
+                F = F + onsite_sign * onecenter_scale * F_os
+            elif onsite_potential:
+                if onsite_charge_factor:
+                    from .gxtb_aes import gxtb_onsite_potential_q
+                    V_os = gxtb_onsite_potential_q(P, S, basis, atoms, qsh)
+                else:
+                    from .gxtb_aes import gxtb_onsite_potential
+                    V_os = gxtb_onsite_potential(P, S, basis, atoms)
+                if onsite_diag == 2:
+                    # EXACT get_kfock fold (disasm-derived): M = 0.25*OS(V)+0.5*OS(V)+0.25*diag(V)
+                    # where OS(V)[j,i]=V[i]*S[j,i] (overlap-sandwich daxpy column form);
+                    # then fock = -0.125*(M+M^T) off-diag, -0.25*M diag.
+                    M = 0.75 * (S * V_os[None, :])
+                    M = M + np.diag(0.25 * V_os)
+                    F_os = -0.125 * (M + M.T)
+                elif onsite_diag:
+                    # pure one-center (block-local): no cross-atom overlap coupling
+                    F_os = np.diag(V_os)
+                else:
+                    # anti-binding shell-potential fold (single S-sandwich, like Coulomb
+                    # but POSITIVE): F += +0.5*(V_mu+V_nu)*S  ->  F_diag += V_mu
+                    F_os = 0.5 * (V_os[:, None] + V_os[None, :]) * S
+                F = F + onsite_sign * onecenter_scale * F_os
+            else:
+                from .gxtb_aes import gxtb_onsite_gamma_density
+                og = gxtb_onsite_gamma_density(P, S, basis, atoms)
+                _, F_os = _mfx_fock_energy(P, S, og)
+                F = F + onecenter_scale * F_os
 
         if use_diis and it >= diis_warmup:
             e_diis = F @ P @ S - S @ P @ F
@@ -537,17 +568,26 @@ def gxtb_energy(
         V_first = V_first + V_first_offsite
     V_third = qsh * qsh * basis.shell_third if use_third_order else 0.0
     _, V_third_twobody = (
-        _third_order_twobody(coords_bohr, basis.shell_atom, basis.shell_hardness, basis.shell_third, qsh)
+        _third_order_twobody(basis, atoms, coords, qsh)
         if use_twobody_third_order
         else (0.0, 0.0)
     )
-    V_fourth = qsh * qsh * qsh * basis.shell_fourth if use_fourth_order else 0.0
+    V_fourth = qsh * qsh * qsh * basis.shell_fourth * GXTB_K4TH_SCALE / 6.0 if use_fourth_order else 0.0
     V_exchange = basis.shell_exchange * qsh if use_exchange else 0.0
-    V_sh = V_first + scc_scale * (V_coul + V_third + V_third_twobody + V_fourth + V_exchange)
+    V_tb3 = 0.0
+    if use_twobody3:
+        from .gxtb_aes import gxtb_twobody_thirdorder
+        _, V_tb3 = gxtb_twobody_thirdorder(qsh, basis, atoms, coords)
+    V_sh = V_first + scc_scale * (V_coul + V_third + V_third_twobody + V_fourth + V_exchange + V_tb3)
     F = _fock_from_shell_potential(H0, S, basis.bf_to_shell, V_sh)
     if gamma_mfx is not None:
         _, F_mfx = _mfx_fock_energy(P, S, gamma_mfx)
         F = F + F_mfx
+    E_aes = 0.0
+    if use_aes:
+        from .gxtb_aes import gxtb_aes_fock
+        F_aes, E_aes = gxtb_aes_fock(P, basis, atoms, coords)
+        F = F + F_aes
     eigvals, C = _solve_generalized(F, S)
     P = 2.0 * (C[:, :n_occ] @ C[:, :n_occ].T)
     qsh = _mulliken_shell_charges(P, S, basis.bf_to_shell, n_shell, z_ref)
@@ -573,12 +613,12 @@ def gxtb_energy(
     )
     E_third_twobody = (
         scc_scale
-        * _third_order_twobody(coords_bohr, basis.shell_atom, basis.shell_hardness, basis.shell_third, qsh)[0]
+        * _third_order_twobody(basis, atoms, coords, qsh)[0]
         if use_twobody_third_order
         else 0.0
     )
     E_fourth = (
-        scc_scale * float(np.sum(qsh**4 * basis.shell_fourth) / 4.0)
+        scc_scale * float(np.sum(qsh**4 * basis.shell_fourth * GXTB_K4TH_SCALE) / 24.0)
         if use_fourth_order
         else 0.0
     )
