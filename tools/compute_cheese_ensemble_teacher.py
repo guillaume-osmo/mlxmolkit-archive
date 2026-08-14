@@ -91,6 +91,40 @@ def conformer_batch(cache: EnsembleCache, indices: Sequence[int], *, canonicaliz
     return cheese_batch(atoms, coords, charges, pad_to=cache.max_atoms), np.asarray(owners, dtype=np.int32)
 
 
+def principal_sign_flip(mol_index: int, conf_index: int, *, seed: int) -> np.ndarray:
+    """Deterministic +/-1 sign vector for the three principal axes.
+
+    Principal-axis canonicalisation fixes the axes but not their direction: an
+    eigenvector and its negation are equally valid, so two conformers of the
+    same molecule can canonicalise to mirrored frames. `--principal-sign-mode
+    random_even` deliberately samples that ambiguity instead of always taking
+    whatever sign the eigensolver returned, so a teacher trained on these
+    conformers cannot learn the eigensolver's arbitrary convention.
+
+    Only the four patterns with an *even* number of negations are drawn —
+    (+,+,+), (+,-,-), (-,+,-), (-,-,+) — because those have determinant +1 and
+    are therefore rotations. The odd patterns are reflections and would mirror
+    the molecule, which changes its chirality rather than its orientation.
+
+    Seeded on (seed, mol_index, conf_index) so a run is reproducible and each
+    conformer gets its own draw.
+
+    Args:
+        mol_index: index of the molecule in the ensemble.
+        conf_index: index of the conformer within that molecule.
+        seed: base seed for the run.
+
+    Returns:
+        (3,) float32 array of +1.0 / -1.0 with an even number of -1 entries.
+    """
+    EVEN_PATTERNS = np.array(
+        [[1.0, 1.0, 1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0]],
+        dtype=np.float32,
+    )
+    rng = np.random.default_rng((int(seed), int(mol_index), int(conf_index)))
+    return EVEN_PATTERNS[int(rng.integers(len(EVEN_PATTERNS)))]
+
+
 def best_pair_scores(
     scores: np.ndarray,
     row_owner: np.ndarray,

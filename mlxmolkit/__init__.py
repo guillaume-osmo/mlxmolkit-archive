@@ -22,6 +22,18 @@ from mlxmolkit.butina import (
 )
 from mlxmolkit.morgan_cpu import morgan_fp_bytes_from_mols, morgan_fp_bytes_from_smiles
 
+# --- Shape/electrostatic descriptors (CHEESE) ---
+# Re-exported so `mlxmolkit.cheese_batch` and `opencheese.cheese_batch` are the
+# same object. opencheese.descriptors imports these from mlxmolkit.cheese, and
+# tests/test_opencheese_namespace.py asserts the two namespaces agree by
+# identity — without this line that test fails at import in a clean clone.
+from mlxmolkit.cheese import (
+    CheeseBatch,
+    cheese_batch,
+    cheese_batch_from_rdkit_mols,
+    cheese_similarity_matrix_mlx,
+)
+
 # --- Dense-FP pipeline (ERG / cosine) ---
 from mlxmolkit.erg_features import erg_fp_from_mols, erg_fp_from_smiles
 from mlxmolkit.cosine_dense import (
