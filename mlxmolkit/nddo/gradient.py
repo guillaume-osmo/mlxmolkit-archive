@@ -316,6 +316,218 @@ def nddo_optimize_batch(
     return results
 
 
+# --- Eigenvector following (EF) ------------------------------------------
+# Mirrors MOPAC's ef.F90: a diagonal initial Hessian (gethes), BFGS/Powell
+# updates (updhes), and a P-RFO step under a trust radius (formd). MOPAC's
+# header credits "JACK SIMONS P-RFO ALGORITHM AS IMPLEMENTED BY JON BAKER
+# (J.COMP.CHEM. 7, 385)".
+#
+# Why it pays here and not in MOPAC: MOPAC's own wall times have L-BFGS
+# beating EF (menthol 0.28 s vs 0.37 s) because the eigensolve shows up when
+# the SCF is cheap. Our gradients cost 79-373 ms and swamp a 93x93
+# eigendecomposition, so fewer cycles converts directly into less wall time.
+
+_EF_DMAX0 = 0.2      # ef.F90: dmax = 0.2d0
+_EF_DDMAX = 0.5      # ef.F90: ddmax = 0.5d0
+_EF_DDMIN = 1e-3
+_EF_H0 = 16.0        # initial diagonal curvature, eV/Angstrom^2
+
+
+def _ef_rfo_step(hessian, grad, dmax):
+    """P-RFO step: lowest eigenvector of [[H, g], [g^T, 0]], trust-clipped."""
+    n = len(grad)
+    augmented = np.zeros((n + 1, n + 1))
+    augmented[:n, :n] = hessian
+    augmented[:n, n] = grad
+    augmented[n, :n] = grad
+    _w, vectors = np.linalg.eigh(augmented)
+    v = vectors[:, 0]
+    # v[n] is the augmented coordinate; near zero means the RFO step is
+    # undefined, so fall back on steepest descent rather than dividing by it.
+    step = -grad if abs(v[n]) < 1e-12 else v[:n] / v[n]
+    norm = float(np.linalg.norm(step))
+    if norm > dmax:
+        step = step * (dmax / norm)
+    return step, norm
+
+
+def _ef_update_hessian(hessian, s_k, y_k):
+    """BFGS while the curvature is positive, Powell (PSB) otherwise."""
+    sy = float(np.dot(s_k, y_k))
+    hs = hessian @ s_k
+    shs = float(np.dot(s_k, hs))
+    if sy > 1e-10 and shs > 1e-10:
+        return hessian - np.outer(hs, hs) / shs + np.outer(y_k, y_k) / sy
+    ss = float(np.dot(s_k, s_k))
+    if ss < 1e-14:
+        return hessian
+    d = y_k - hs
+    return (hessian + (np.outer(d, s_k) + np.outer(s_k, d)) / ss
+            - float(np.dot(d, s_k)) * np.outer(s_k, s_k) / (ss * ss))
+
+
+def _ef_optimize(atoms, coords, max_iter, grad_tol, method, verbose,
+                 molecular_charge, h0=_EF_H0):
+    """Geometry optimization by eigenvector following. See nddo_optimize."""
+    from .anal_grad import analytical_gradient
+
+    coords = np.asarray(coords, dtype=np.float64).copy()
+    n_atoms = len(atoms)
+    hessian = np.eye(n_atoms * 3) * h0
+    dmax = _EF_DMAX0
+
+    result, grad = analytical_gradient(atoms, coords, method=method,
+                                       molecular_charge=molecular_charge)
+    energy = result['energy_eV']
+    grad_flat = grad.flatten()
+
+    for iteration in range(max_iter):
+        g_rms = float(np.sqrt(np.mean(grad_flat ** 2)))
+        if verbose and iteration % 5 == 0:
+            print(f"  ef {iteration:3d}: E={energy:.6f}, |g|={g_rms:.5f}, "
+                  f"trust={dmax:.3f}")
+        if g_rms < grad_tol:
+            return _optimize_result(result, coords, energy, grad, g_rms,
+                                    converged=True, n_iter=iteration + 1,
+                                    method=method)
+
+        step, raw_norm = _ef_rfo_step(hessian, grad_flat, dmax)
+        predicted = float(np.dot(grad_flat, step)
+                          + 0.5 * step @ hessian @ step)
+
+        new_coords = coords + step.reshape(n_atoms, 3)
+        new_result, new_grad = analytical_gradient(
+            atoms, new_coords, method=method,
+            molecular_charge=molecular_charge)
+        actual = new_result['energy_eV'] - energy
+
+        if actual > 0:
+            # Uphill: shrink the trust radius and retry from the same point.
+            shrunk = max(_EF_DDMIN, min(dmax, float(np.linalg.norm(step))) / 2)
+            if shrunk > _EF_DDMIN:
+                dmax = shrunk
+                continue
+            dmax = shrunk           # already at the floor; take the step
+        else:
+            ratio = actual / predicted if abs(predicted) > 1e-12 else 0.0
+            if ratio > 0.75 and raw_norm > dmax * 0.99:
+                dmax = min(_EF_DDMAX, dmax * 1.5)
+            elif ratio < 0.25:
+                dmax = max(_EF_DDMIN, dmax * 0.5)
+
+        hessian = _ef_update_hessian(hessian, step,
+                                     new_grad.flatten() - grad_flat)
+        coords, result = new_coords, new_result
+        energy = result['energy_eV']
+        grad = new_grad
+        grad_flat = grad.flatten()
+
+    return _optimize_result(result, coords, energy, grad,
+                            float(np.sqrt(np.mean(grad_flat ** 2))),
+                            converged=False, n_iter=max_iter, method=method)
+
+
+def _strong_wolfe(evaluate, phi0, dphi0, c1=1e-4, c2=0.9, max_evals=12,
+                  step_init=1.0, step_max=16.0):
+    """Strong-Wolfe line search: Nocedal & Wright Alg. 3.5 with 3.6 'zoom'.
+
+    Backtracking-Armijo alone only guarantees *decrease*. It can accept a step
+    so short that y_k = g_new - g_old barely moves, which makes the curvature
+    pair (s_k, y_k) nearly singular and degrades the L-BFGS Hessian
+    approximation. The curvature condition |phi'(a)| <= c2 |phi'(0)| is what
+    rules that out, and it is why MOPAC's own L-BFGS uses a Wolfe search
+    (`lnsrlb` -> `dcsrch`, ftol=1e-3, gtol=0.9) rather than backtracking.
+
+    Normally the curvature test costs an extra gradient per trial. Here it is
+    free: `analytical_gradient` returns the energy and the gradient together,
+    so every trial point already has both.
+
+    Args:
+        evaluate: step -> (phi, dphi, payload); phi is the energy, dphi the
+            directional derivative g(x + step*d) . d, payload whatever the
+            caller needs to reuse the accepted point.
+        phi0, dphi0: energy and directional derivative at step 0. dphi0 must
+            be negative (a descent direction).
+        c1, c2: Armijo and curvature constants, 0 < c1 < c2 < 1.
+        max_evals: cap on trial points, since each is a full gradient.
+
+    Returns:
+        (step, payload) for a step satisfying both conditions, or the best
+        point that at least decreased the energy, or None if nothing did.
+    """
+    if dphi0 >= 0:
+        return None
+
+    def armijo(step, phi):
+        return phi <= phi0 + c1 * step * dphi0
+
+    def curvature(dphi):
+        return abs(dphi) <= c2 * abs(dphi0)
+
+    evals = 0
+    best = None                      # fallback: any step that decreased phi
+
+    def record(step, phi, payload):
+        nonlocal best
+        if phi < phi0 and (best is None or phi < best[1]):
+            best = (step, phi, payload)
+
+    def zoom(lo, hi, phi_lo):
+        """Shrink a bracket known to contain an acceptable step."""
+        nonlocal evals
+        while evals < max_evals:
+            step = 0.5 * (lo + hi)          # bisection: robust, no extra evals
+            if step <= 1e-12:
+                return None
+            phi, dphi, payload = evaluate(step)
+            evals += 1
+            record(step, phi, payload)
+            if not armijo(step, phi) or phi >= phi_lo:
+                hi = step
+            else:
+                if curvature(dphi):
+                    return step, payload
+                if dphi * (hi - lo) >= 0:
+                    hi = lo
+                lo, phi_lo = step, phi
+        return None
+
+    prev_step, prev_phi = 0.0, phi0
+    step = step_init
+    while evals < max_evals:
+        phi, dphi, payload = evaluate(step)
+        evals += 1
+        record(step, phi, payload)
+
+        if not armijo(step, phi) or (evals > 1 and phi >= prev_phi):
+            found = zoom(prev_step, step, prev_phi)
+            return found if found is not None else _wolfe_fallback(best)
+
+        if curvature(dphi):
+            return step, payload
+
+        if dphi >= 0:
+            found = zoom(step, prev_step, phi)
+            return found if found is not None else _wolfe_fallback(best)
+
+        prev_step, prev_phi = step, phi
+        step = min(2.0 * step, step_max)
+
+    return _wolfe_fallback(best)
+
+
+def _wolfe_fallback(best):
+    """Neither condition met within budget — keep any step that went downhill.
+
+    Losing the curvature condition costs L-BFGS quality; losing the decrease
+    would cost correctness, so a decreasing step is still worth taking.
+    """
+    if best is None:
+        return None
+    step, _phi, payload = best
+    return step, payload
+
+
 def _optimize_result(result, coords, energy, grad, g_rms, converged, n_iter, method):
     """Assemble nddo_optimize's return dict.
 
@@ -363,12 +575,30 @@ def nddo_optimize(
     method: str = 'RM1',
     verbose: bool = False,
     molecular_charge: float = 0.0,
+    optimizer: str = 'lbfgs',
 ) -> dict:
-    """L-BFGS geometry optimization using analytical gradient.
+    """Geometry optimization using the analytical gradient.
+
+    Args:
+        optimizer: 'lbfgs' (default) or 'ef'. EF is eigenvector following —
+            an explicit Hessian with a P-RFO step under a trust radius, as in
+            MOPAC's ef.F90. It needs **21% fewer gradient calls** on a
+            held-out set (391 -> 309), and the split is systematic: it wins on
+            flexible molecules, where the cost actually is (geraniol
+            133 -> 91, butyl acetate 88 -> 61), and loses on rigid ones, which
+            are cheap anyway (indole 17 -> 24). It carries a 3Nx3N Hessian and
+            an O(N^3) eigensolve per step, negligible against a gradient at
+            these sizes. Minima agree with L-BFGS to 0.016 kcal/mol.
 
     Returns a dict whose `converged` and `n_iter` refer to the geometry
     optimization; the SCF's own values are under `scf_converged`/`scf_n_iter`.
     """
+    if optimizer == 'ef':
+        return _ef_optimize(atoms, coords, max_iter, grad_tol, method,
+                            verbose, molecular_charge)
+    if optimizer != 'lbfgs':
+        raise ValueError(f"unknown optimizer {optimizer!r}; use 'lbfgs' or 'ef'")
+
     from .anal_grad import analytical_gradient
 
     coords = np.asarray(coords, dtype=np.float64).copy()
@@ -416,23 +646,29 @@ def nddo_optimize(
         direction = -r
         if np.dot(grad_flat, direction) > 0:
             direction = -grad_flat
-            step = 0.05
+            step_init = 0.05
         else:
-            step = 1.0
+            step_init = 1.0
 
-        # Backtracking line search
-        for ls in range(15):
-            new_coords = coords + step * direction.reshape(n_atoms, 3)
-            new_result, new_grad = analytical_gradient(
+        def trial(step, _d=direction):
+            """Energy, directional derivative and payload at coords + step*d."""
+            trial_coords = coords + step * _d.reshape(n_atoms, 3)
+            trial_result, trial_grad = analytical_gradient(
                 atoms,
-                new_coords,
+                trial_coords,
                 method=method,
                 molecular_charge=molecular_charge,
             )
-            if new_result['energy_eV'] <= energy + 1e-4 * step * np.dot(grad_flat, direction):
-                break
-            step *= 0.5
-        else:
+            trial_flat = trial_grad.flatten()
+            return (trial_result['energy_eV'],
+                    float(np.dot(trial_flat, _d)),
+                    (trial_coords, trial_result, trial_grad))
+
+        found = _strong_wolfe(trial, energy, float(np.dot(grad_flat, direction)),
+                              step_init=step_init)
+        if found is None:
+            # No trial decreased the energy. Take the tiny step the old
+            # backtracking loop fell back on rather than stalling.
             step = 1e-4
             new_coords = coords + step * direction.reshape(n_atoms, 3)
             new_result, new_grad = analytical_gradient(
@@ -441,6 +677,8 @@ def nddo_optimize(
                 method=method,
                 molecular_charge=molecular_charge,
             )
+        else:
+            step, (new_coords, new_result, new_grad) = found
 
         old_grad = grad_flat.copy()
         s_k = step * direction

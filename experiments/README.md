@@ -177,6 +177,85 @@ at the existing sync points) made `max_iters` a cap rather than a cost there —
 relative to the iteration work — then straggler-matching becomes the dominant
 term and the ranking above should flip.
 
+## 6. A strong-Wolfe line search is *not* what separates us from MOPAC
+
+`mlxmolkit/nddo/gradient.py` (`_strong_wolfe`), landed anyway — see below.
+
+MOPAC's L-BFGS uses a Wolfe line search (`lnsrlb` → `dcsrch`, `ftol=1e-3`,
+`gtol=0.9`), verified against the source; ours enforced Armijo only. On menthol
+MOPAC's L-BFGS converges in 80 cycles where ours took 94, so the missing
+curvature condition looked like the obvious explanation for the 18% gap.
+
+It isn't. Total gradient calls, same molecules, same start:
+
+| molecule | Armijo | strong Wolfe |
+|---|---|---|
+| ethanol | 52 | 52 |
+| benzaldehyde | 26 | 26 |
+| chlorobenzene | 19 | 18 |
+| thioanisole | 51 | 51 |
+| menthol | 97 | 94 |
+| **total** | **245** | **241** (−1.6%) |
+
+Instrumenting the search says why: **the unit step already satisfies both
+Wolfe conditions in ~94% of line searches** (44/47 on ethanol, 84/88 on
+menthol), and the `sy <= 0` count that a curvature condition exists to prevent
+was already **zero**. There was no violation to fix.
+
+It was landed regardless, because it costs nothing (−1.6% gradients), it
+replaces a `step = 1e-4` stall-fallback with the best decreasing step found,
+and it makes the `sy > 0` guard structural rather than lucky. But it is
+insurance, not a speedup, and **the gap to MOPAC is elsewhere** — most likely
+EF's explicit Hessian (`gethes` + Powell/BFGS updates + P-RFO) against our
+limited-memory approximation. That is the next thing to try, and unlike here
+the cycle counts justify it: MOPAC EF takes 75 cycles on menthol against its
+own L-BFGS's 80 and our 94.
+
+**Reconsider if:** a molecule class shows up where `sy <= 0` is common — the
+guard then starts earning its keep.
+
+## 7. Our `grad_tol` and MOPAC's `GNORM` are different criteria — do not compare cycle counts across them
+
+`experiments/ef_vs_lbfgs.py` compares our optimizers against **each other**, which
+is safe. Comparing our cycle counts against MOPAC's is not, and doing it wrong
+sent this repo down a whole optimisation path on a premise that was not true.
+
+- ours: `grad_tol` on **RMS** of the gradient, eV/Å
+- MOPAC: `GNORM` on the **2-norm**, kcal/mol/Å, default 1.0
+
+So MOPAC's default corresponds to an RMS of `(1.0/23.0605)/sqrt(3N)` — which is
+**0.0083 for ethanol, 0.0067 for benzaldehyde, 0.0045 for menthol**. Our flat
+0.005 is *tighter* than MOPAC on small molecules and slightly looser on large
+ones. At matched tolerance:
+
+| molecule | MOPAC EF | our L-BFGS |
+|---|---|---|
+| ethanol | 39 | 41 |
+| benzaldehyde | 20 | 20 |
+| thioanisole | 34 | 42 |
+| menthol | 75 | 75 |
+
+**Our L-BFGS already matches MOPAC's EF.** The "we take 94 cycles where MOPAC
+takes 75–80" claim that motivated porting EF was measuring the tolerance
+mismatch, not the optimizer.
+
+A faithful port of MOPAC's EF was written from `ef.F90` — `gethes` (flat 200
+kcal/mol/Å² diagonal in Cartesians, *not* a Lindh model), `updhes` BFGS, `formd`
+λ-bisection to the trust radius, and MOPAC's own constants (`dmax=0.2`,
+`ddmax=0.5`, `ddmin=1e-4`, `rmin=0`, `rmax=1e3`, growth ×√2 with no shrink on a
+poor ratio for minimisations). It reaches **409 gradient calls** on the held-out
+set against our L-BFGS's 391, and does not reproduce MOPAC's own cycle counts
+(42/36/45/95 against 39/20/34/75), so it is still missing something —
+`ireclc`, MOPAC's periodic exact-Hessian recalculation, is the leading suspect.
+It was not landed.
+
+What *was* landed (`optimizer='ef'`) is measured against our own L-BFGS at our
+own tolerance, which is self-consistent, and stands at 0.79× on the held-out
+set.
+
+**Reconsider if:** anyone quotes a cycle count against MOPAC again — convert the
+criterion first.
+
 ---
 
 ## Method note
