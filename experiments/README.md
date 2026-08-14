@@ -177,6 +177,43 @@ at the existing sync points) made `max_iters` a cap rather than a cost there —
 relative to the iteration work — then straggler-matching becomes the dominant
 term and the ranking above should flip.
 
+## 6. A strong-Wolfe line search is *not* what separates us from MOPAC
+
+`mlxmolkit/nddo/gradient.py` (`_strong_wolfe`), landed anyway — see below.
+
+MOPAC's L-BFGS uses a Wolfe line search (`lnsrlb` → `dcsrch`, `ftol=1e-3`,
+`gtol=0.9`), verified against the source; ours enforced Armijo only. On menthol
+MOPAC's L-BFGS converges in 80 cycles where ours took 94, so the missing
+curvature condition looked like the obvious explanation for the 18% gap.
+
+It isn't. Total gradient calls, same molecules, same start:
+
+| molecule | Armijo | strong Wolfe |
+|---|---|---|
+| ethanol | 52 | 52 |
+| benzaldehyde | 26 | 26 |
+| chlorobenzene | 19 | 18 |
+| thioanisole | 51 | 51 |
+| menthol | 97 | 94 |
+| **total** | **245** | **241** (−1.6%) |
+
+Instrumenting the search says why: **the unit step already satisfies both
+Wolfe conditions in ~94% of line searches** (44/47 on ethanol, 84/88 on
+menthol), and the `sy <= 0` count that a curvature condition exists to prevent
+was already **zero**. There was no violation to fix.
+
+It was landed regardless, because it costs nothing (−1.6% gradients), it
+replaces a `step = 1e-4` stall-fallback with the best decreasing step found,
+and it makes the `sy > 0` guard structural rather than lucky. But it is
+insurance, not a speedup, and **the gap to MOPAC is elsewhere** — most likely
+EF's explicit Hessian (`gethes` + Powell/BFGS updates + P-RFO) against our
+limited-memory approximation. That is the next thing to try, and unlike here
+the cycle counts justify it: MOPAC EF takes 75 cycles on menthol against its
+own L-BFGS's 80 and our 94.
+
+**Reconsider if:** a molecule class shows up where `sy <= 0` is common — the
+guard then starts earning its keep.
+
 ---
 
 ## Method note

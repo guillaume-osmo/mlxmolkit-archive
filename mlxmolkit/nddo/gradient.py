@@ -316,6 +316,107 @@ def nddo_optimize_batch(
     return results
 
 
+def _strong_wolfe(evaluate, phi0, dphi0, c1=1e-4, c2=0.9, max_evals=12,
+                  step_init=1.0, step_max=16.0):
+    """Strong-Wolfe line search: Nocedal & Wright Alg. 3.5 with 3.6 'zoom'.
+
+    Backtracking-Armijo alone only guarantees *decrease*. It can accept a step
+    so short that y_k = g_new - g_old barely moves, which makes the curvature
+    pair (s_k, y_k) nearly singular and degrades the L-BFGS Hessian
+    approximation. The curvature condition |phi'(a)| <= c2 |phi'(0)| is what
+    rules that out, and it is why MOPAC's own L-BFGS uses a Wolfe search
+    (`lnsrlb` -> `dcsrch`, ftol=1e-3, gtol=0.9) rather than backtracking.
+
+    Normally the curvature test costs an extra gradient per trial. Here it is
+    free: `analytical_gradient` returns the energy and the gradient together,
+    so every trial point already has both.
+
+    Args:
+        evaluate: step -> (phi, dphi, payload); phi is the energy, dphi the
+            directional derivative g(x + step*d) . d, payload whatever the
+            caller needs to reuse the accepted point.
+        phi0, dphi0: energy and directional derivative at step 0. dphi0 must
+            be negative (a descent direction).
+        c1, c2: Armijo and curvature constants, 0 < c1 < c2 < 1.
+        max_evals: cap on trial points, since each is a full gradient.
+
+    Returns:
+        (step, payload) for a step satisfying both conditions, or the best
+        point that at least decreased the energy, or None if nothing did.
+    """
+    if dphi0 >= 0:
+        return None
+
+    def armijo(step, phi):
+        return phi <= phi0 + c1 * step * dphi0
+
+    def curvature(dphi):
+        return abs(dphi) <= c2 * abs(dphi0)
+
+    evals = 0
+    best = None                      # fallback: any step that decreased phi
+
+    def record(step, phi, payload):
+        nonlocal best
+        if phi < phi0 and (best is None or phi < best[1]):
+            best = (step, phi, payload)
+
+    def zoom(lo, hi, phi_lo):
+        """Shrink a bracket known to contain an acceptable step."""
+        nonlocal evals
+        while evals < max_evals:
+            step = 0.5 * (lo + hi)          # bisection: robust, no extra evals
+            if step <= 1e-12:
+                return None
+            phi, dphi, payload = evaluate(step)
+            evals += 1
+            record(step, phi, payload)
+            if not armijo(step, phi) or phi >= phi_lo:
+                hi = step
+            else:
+                if curvature(dphi):
+                    return step, payload
+                if dphi * (hi - lo) >= 0:
+                    hi = lo
+                lo, phi_lo = step, phi
+        return None
+
+    prev_step, prev_phi = 0.0, phi0
+    step = step_init
+    while evals < max_evals:
+        phi, dphi, payload = evaluate(step)
+        evals += 1
+        record(step, phi, payload)
+
+        if not armijo(step, phi) or (evals > 1 and phi >= prev_phi):
+            found = zoom(prev_step, step, prev_phi)
+            return found if found is not None else _wolfe_fallback(best)
+
+        if curvature(dphi):
+            return step, payload
+
+        if dphi >= 0:
+            found = zoom(step, prev_step, phi)
+            return found if found is not None else _wolfe_fallback(best)
+
+        prev_step, prev_phi = step, phi
+        step = min(2.0 * step, step_max)
+
+    return _wolfe_fallback(best)
+
+
+def _wolfe_fallback(best):
+    """Neither condition met within budget — keep any step that went downhill.
+
+    Losing the curvature condition costs L-BFGS quality; losing the decrease
+    would cost correctness, so a decreasing step is still worth taking.
+    """
+    if best is None:
+        return None
+    step, _phi, payload = best
+    return step, payload
+
+
 def _optimize_result(result, coords, energy, grad, g_rms, converged, n_iter, method):
     """Assemble nddo_optimize's return dict.
 
@@ -416,23 +517,29 @@ def nddo_optimize(
         direction = -r
         if np.dot(grad_flat, direction) > 0:
             direction = -grad_flat
-            step = 0.05
+            step_init = 0.05
         else:
-            step = 1.0
+            step_init = 1.0
 
-        # Backtracking line search
-        for ls in range(15):
-            new_coords = coords + step * direction.reshape(n_atoms, 3)
-            new_result, new_grad = analytical_gradient(
+        def trial(step, _d=direction):
+            """Energy, directional derivative and payload at coords + step*d."""
+            trial_coords = coords + step * _d.reshape(n_atoms, 3)
+            trial_result, trial_grad = analytical_gradient(
                 atoms,
-                new_coords,
+                trial_coords,
                 method=method,
                 molecular_charge=molecular_charge,
             )
-            if new_result['energy_eV'] <= energy + 1e-4 * step * np.dot(grad_flat, direction):
-                break
-            step *= 0.5
-        else:
+            trial_flat = trial_grad.flatten()
+            return (trial_result['energy_eV'],
+                    float(np.dot(trial_flat, _d)),
+                    (trial_coords, trial_result, trial_grad))
+
+        found = _strong_wolfe(trial, energy, float(np.dot(grad_flat, direction)),
+                              step_init=step_init)
+        if found is None:
+            # No trial decreased the energy. Take the tiny step the old
+            # backtracking loop fell back on rather than stalling.
             step = 1e-4
             new_coords = coords + step * direction.reshape(n_atoms, 3)
             new_result, new_grad = analytical_gradient(
@@ -441,6 +548,8 @@ def nddo_optimize(
                 method=method,
                 molecular_charge=molecular_charge,
             )
+        else:
+            step, (new_coords, new_result, new_grad) = found
 
         old_grad = grad_flat.copy()
         s_k = step * direction
