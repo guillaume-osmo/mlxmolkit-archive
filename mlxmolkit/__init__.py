@@ -21,6 +21,12 @@ from mlxmolkit.butina import (
     butina_tanimoto_mlx,
 )
 from mlxmolkit.morgan_cpu import morgan_fp_bytes_from_mols, morgan_fp_bytes_from_smiles
+from mlxmolkit.dipole_features import (
+    ATOM_FEATURE_NAMES,
+    DipoleFeatureTensors,
+    dipole_atom_feature_tensors,
+    export_dipole_atom_feature_dataset,
+)
 
 # --- Shape/electrostatic descriptors (CHEESE) ---
 # Re-exported so `mlxmolkit.cheese_batch` and `opencheese.cheese_batch` are the
@@ -71,4 +77,8 @@ __all__ = [
     "cosine_matrix_dense",
     "l2_normalize_rows",
     "max_cosine_to_set",
+    "ATOM_FEATURE_NAMES",
+    "DipoleFeatureTensors",
+    "dipole_atom_feature_tensors",
+    "export_dipole_atom_feature_dataset",
 ]
