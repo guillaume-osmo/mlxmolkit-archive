@@ -65,7 +65,20 @@ Issues = "https://github.com/guillaume-osmo/mlxmolkit/issues"
 include = ["mlxmolkit", "mlxmolkit.*", "opencheese", "opencheese.*"]
 
 [tool.setuptools.package-data]
-mlxmolkit = ["*.metal", "data/bcc/*.json", "rm1/data/*.csv", "rm1/data/*.npz", "rm1/*.json"]
+# These globs are relative to mlxmolkit/. They pointed at rm1/, which was
+# renamed to nddo/ in 6980e77 — so every glob but *.metal matched nothing and
+# the built wheel shipped 45 nddo modules with zero parameter files. Nothing
+# caught it because the tests run from the source tree, where the data is
+# present regardless of packaging.
+mlxmolkit = [
+    "*.metal",
+    "nddo/data/*.csv",
+    "nddo/data/*.npz",
+    # riYY_table.json sits at nddo/ level, not under nddo/data/ — the old
+    # "rm1/*.json" glob was for exactly this file.
+    "nddo/*.json",
+    "data/bcc/*.json",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
