@@ -119,7 +119,10 @@ def nddo_gradient_batch(
 
 def nddo_optimize_batch(
     molecules: list[tuple[list[int], np.ndarray]],
-    max_iter: int = 50,
+    # Must match nddo_optimize's default. At 50 against the single path's 200,
+    # menthol came out 0.385 kcal/mol apart depending on which entry point you
+    # called — 9x the MOPAC agreement — because batch stopped it short. See #28.
+    max_iter: int = 200,
     grad_tol: float = 0.005,
     method: str = 'RM1',
     verbose: bool = False,
@@ -183,7 +186,11 @@ def nddo_optimize_batch(
             g_rms = np.sqrt(np.mean(grad_flats[i] ** 2))
             if g_rms < grad_tol:
                 converged[i] = True
-                n_iter_arr[i] = iteration
+                # iteration + 1, matching nddo_optimize, which returns
+                # `iteration + 1` from the same top-of-loop check. Recording
+                # `iteration` made batch report one fewer for an identical
+                # optimization.
+                n_iter_arr[i] = iteration + 1
 
         if verbose and (iteration % 5 == 0 or np.all(converged)):
             n_conv = np.sum(converged)
@@ -227,6 +234,7 @@ def nddo_optimize_batch(
 
         # Line search: try step=1.0 for all active molecules (batch)
         step = 1.0
+        steps_taken: dict[int, float] = {}
         trial_mols = []
         trial_indices = []
         for i in range(N):
@@ -245,15 +253,17 @@ def nddo_optimize_batch(
                 molecular_charges=[charge_values[i] for i in trial_indices],
             )
 
-            # Accept or reduce step per molecule
+            # Accept or reduce step per molecule, remembering which was used:
+            # the L-BFGS update below needs the displacement that actually
+            # happened, and a fallback step recorded as a full one poisons the
+            # curvature pair.
             for k, i in enumerate(trial_indices):
                 new_E = trial_results[k]['energy_eV']
                 n_at = len(atoms_list[i])
-                if np.isfinite(new_E) and new_E < energies[i]:
-                    coords_list[i] = coords_list[i] + step * directions[i].reshape(n_at, 3)
-                else:
-                    # Tiny step as fallback
-                    coords_list[i] = coords_list[i] + 0.01 * directions[i].reshape(n_at, 3)
+                accepted = np.isfinite(new_E) and new_E < energies[i]
+                steps_taken[i] = step if accepted else 0.01
+                coords_list[i] = (coords_list[i]
+                                  + steps_taken[i] * directions[i].reshape(n_at, 3))
 
         # New gradients (batch)
         old_grad_flats = [g.copy() for g in grad_flats]
@@ -270,8 +280,12 @@ def nddo_optimize_batch(
             if converged[i]:
                 continue
             n_at = len(atoms_list[i])
-            # s_k = actual displacement
-            s_k = step * directions[i] if energies[i] < energies[i] + 1 else 0.01 * directions[i]
+            # s_k must be the displacement actually applied above. This read
+            # `step * d if energies[i] < energies[i] + 1 else 0.01 * d`, whose
+            # condition is x < x + 1 — always true — so a molecule that fell
+            # back to the 0.01 step still recorded a full one, 100x too large,
+            # and every curvature pair after a rejected step was wrong.
+            s_k = steps_taken.get(i, 0.0) * directions[i]
             y_k = grad_flats[i] - old_grad_flats[i]
             sy = np.dot(s_k, y_k)
             if sy > 1e-10:
@@ -302,16 +316,59 @@ def nddo_optimize_batch(
     return results
 
 
+def _optimize_result(result, coords, energy, grad, g_rms, converged, n_iter, method):
+    """Assemble nddo_optimize's return dict.
+
+    The SCF `result` is merged **first** so the optimizer's own keys win. It
+    used to be splatted last, which let the SCF's `converged`, `n_iter` and
+    `method` overwrite the optimizer's — so a geometry optimization that ran
+    out of iterations still reported `converged=True`, because that was the
+    SCF's flag for the final single-point. The SCF's values are kept under
+    `scf_*` rather than dropped.
+
+    `converged`/`n_iter` describe the **optimization**, which is what a caller
+    of a function named `optimize` means by them. `opt_converged`/`opt_n_iter`
+    are retained as explicit aliases.
+    """
+    out = {k: v for k, v in result.items() if k != 'coords'}
+    if 'converged' in out:
+        out['scf_converged'] = out['converged']
+    if 'n_iter' in out:
+        out['scf_n_iter'] = out['n_iter']
+    out.update(
+        coords=coords,
+        energy_eV=energy,
+        heat_of_formation_kcal=result['heat_of_formation_kcal'],
+        gradient=grad,
+        grad_rms=g_rms,
+        converged=converged,
+        opt_converged=converged,
+        n_iter=n_iter,
+        opt_n_iter=n_iter,
+        method=method,
+    )
+    return out
+
+
 def nddo_optimize(
     atoms: list[int],
     coords: np.ndarray,
-    max_iter: int = 50,
+    # 200, not 50. The loop returns as soon as g_rms < grad_tol, so this is a
+    # bound on the work rather than a cost: chlorobenzene still exits at 16.
+    # At 50, menthol ran out of iterations at g_rms=0.014 — 3x the tolerance —
+    # while its energy was still falling, and then reported success because of
+    # the key collision above. It converges at 94. See #28.
+    max_iter: int = 200,
     grad_tol: float = 0.005,
     method: str = 'RM1',
     verbose: bool = False,
     molecular_charge: float = 0.0,
 ) -> dict:
-    """L-BFGS geometry optimization using analytical gradient."""
+    """L-BFGS geometry optimization using analytical gradient.
+
+    Returns a dict whose `converged` and `n_iter` refer to the geometry
+    optimization; the SCF's own values are under `scf_converged`/`scf_n_iter`.
+    """
     from .anal_grad import analytical_gradient
 
     coords = np.asarray(coords, dtype=np.float64).copy()
@@ -336,13 +393,9 @@ def nddo_optimize(
             print(f"  opt {iteration:3d}: E={energy:.6f}, Hf={result['heat_of_formation_kcal']:.2f}, |g|={g_rms:.5f}")
 
         if g_rms < grad_tol:
-            return {
-                'coords': coords, 'energy_eV': energy,
-                'heat_of_formation_kcal': result['heat_of_formation_kcal'],
-                'gradient': grad, 'grad_rms': g_rms,
-                'opt_converged': True, 'opt_n_iter': iteration + 1, 'converged': True,
-                'method': method, **{k: v for k, v in result.items() if k not in ('coords',)},
-            }
+            return _optimize_result(result, coords, energy, grad, g_rms,
+                                    converged=True, n_iter=iteration + 1,
+                                    method=method)
 
         # L-BFGS direction
         q = grad_flat.copy()
@@ -406,19 +459,28 @@ def nddo_optimize(
             if len(s_hist) > m:
                 s_hist.pop(0); y_hist.pop(0); rho_hist.pop(0)
 
-    return {
-        'coords': coords, 'energy_eV': energy,
-        'heat_of_formation_kcal': result['heat_of_formation_kcal'],
-        'gradient': grad, 'grad_rms': np.sqrt(np.mean(grad_flat ** 2)),
-        'opt_converged': False, 'opt_n_iter': max_iter, 'converged': True,
-        'method': method, **{k: v for k, v in result.items() if k not in ('coords',)},
-    }
+    # Ran out of iterations. This used to hardcode 'converged': True.
+    return _optimize_result(result, coords, energy, grad,
+                            np.sqrt(np.mean(grad_flat ** 2)),
+                            converged=False, n_iter=max_iter, method=method)
 
 
 # Backward-compatible aliases
 def rm1_gradient(atoms, coords, step=0.001):
     return nddo_gradient(atoms, coords, step=step, method='RM1')
 
-def rm1_optimize(atoms, coords, max_iter=100, grad_tol=0.01, step_size=0.1, verbose=False):
-    return nddo_optimize(atoms, coords, max_iter=max_iter, grad_tol=grad_tol,
-                        method='RM1', verbose=verbose)
+def rm1_optimize(atoms, coords, max_iter=None, grad_tol=None, step_size=0.1,
+                 verbose=False):
+    """Deprecated alias for :func:`nddo_optimize` with method='RM1'.
+
+    Used to hardcode max_iter=100 and grad_tol=0.01 — a third set of defaults
+    alongside the single and batch paths, and a tolerance 2x looser than
+    either. Defaults now delegate, so all three agree. `step_size` is accepted
+    and ignored, as it always was.
+    """
+    kwargs = {}
+    if max_iter is not None:
+        kwargs['max_iter'] = max_iter
+    if grad_tol is not None:
+        kwargs['grad_tol'] = grad_tol
+    return nddo_optimize(atoms, coords, method='RM1', verbose=verbose, **kwargs)

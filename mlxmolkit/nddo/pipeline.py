@@ -65,7 +65,10 @@ def rm1_from_smiles(
     seed: int = 42,
     method: str = 'RM1',
     optimize: bool = False,
-    opt_max_iter: int = 50,
+    # 200, matching nddo_optimize's own default — the optimizer returns as
+    # soon as grad_tol is met, so this bounds the work rather than causing it.
+    # See #28.
+    opt_max_iter: int = 200,
     opt_grad_tol: float = 0.005,
 ) -> Optional[dict]:
     """Compute NDDO energy from SMILES string.
@@ -117,8 +120,11 @@ def rm1_from_smiles(
             method=method,
             molecular_charge=formal_charge,
         )
-        result['opt_converged'] = opt_result['converged']
-        result['opt_n_iter'] = opt_result['n_iter']
+        # opt_converged/opt_n_iter, not converged/n_iter: those two keys used
+        # to be the *SCF*'s, so this reported the single-point's convergence
+        # and iteration count as though they were the geometry optimization's.
+        result['opt_converged'] = opt_result['opt_converged']
+        result['opt_n_iter'] = opt_result['opt_n_iter']
         result['opt_grad_rms'] = opt_result['grad_rms']
     else:
         result = nddo_energy(
