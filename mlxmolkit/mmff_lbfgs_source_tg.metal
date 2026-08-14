@@ -109,16 +109,26 @@
         }
 
     // ---- Initial energy + gradient ----
-    float energy = 0.0f;
-    SEQ_COMPUTE_EG(energy);
+    float seq_e_init = 0.0f;
+    SEQ_COMPUTE_EG(seq_e_init);
     if (tid == 0) {
         float grad_scale = 1.0f;
         scale_grad_serial(my_grad, n_terms, grad_scale, true);
         tg_grad_scale_shared = grad_scale;
-        tg_reduce[0] = energy;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    energy = tg_reduce[0];
+    // Fences both spaces: scale_grad_serial writes my_grad (device) and
+    // tg_grad_scale_shared (threadgroup), and all threads read both below.
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    float energy = 0.0f;
+    // Re-sum with the tree reduction the line search uses, discarding the serial
+    // sum above. The Armijo test differences this value against trial_e, so both
+    // sides must come from the same summation order. Measured in-kernel at
+    // identical geometries, a serial sum and a 32-way tree sum of the same energy
+    // disagree by up to 4.6e-5 kcal/mol (median 2.3e-5) over 12-74 atom
+    // molecules. That is an absolute energy, while the sufficient-decrease
+    // threshold |FUNCTOL * lam * slope| shrinks with every backtrack, so the
+    // comparison eventually resolves summation noise rather than real descent.
+    PAR_COMPUTE_E(energy);
 
     parallel_neg_copy(my_dir, my_grad, n_terms, tid, tg_size);
 
@@ -205,16 +215,21 @@
         // Save old grad, recompute energy+gradient
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_old_grad[i] = my_grad[i];
         threadgroup_barrier(mem_flags::mem_device);
-        float new_e = 0.0f;
-        SEQ_COMPUTE_EG(new_e);
+        // Only the gradient is wanted here; the serial energy sum is discarded.
+        // `energy` already holds the line search's tree-reduced value at this
+        // same geometry (unchanged since, on every path — accept, lambda_min
+        // bail-out, or restore), and keeping it is what lets the next Armijo
+        // test compare like with like.
+        float seq_e = 0.0f;
+        SEQ_COMPUTE_EG(seq_e);
         if (tid == 0) {
             float grad_scale = tg_grad_scale_shared;
             scale_grad_serial(my_grad, n_terms, grad_scale, false);
             tg_grad_scale_shared = grad_scale;
-            tg_reduce[0] = new_e;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        energy = tg_reduce[0];
+        // Fences both spaces: scale_grad_serial writes my_grad (device) and
+        // tg_grad_scale_shared (threadgroup), and all threads read both below.
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
         // Grad convergence check
         float local_grad_test = 0.0f;
