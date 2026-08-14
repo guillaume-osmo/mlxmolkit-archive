@@ -28,13 +28,33 @@ classifiers = [
 ]
 dependencies = [
     "mlx>=0.10.0",
-    "numpy>=1.24.0",
+    # numpy 2 floor: the compiled extensions in the scientific stack are built
+    # against a specific numpy ABI, and mixing a numpy-1-era wheel with a
+    # numpy-2 runtime fails at import with "numpy.dtype size changed", which
+    # aborts pytest at collection rather than failing one test.
+    "numpy>=2.0",
 ]
 
 [project.optional-dependencies]
 rdkit = ["rdkit"]
-test = ["pytest", "rdkit"]
-all = ["rdkit"]
+# scikit-image supplies marching cubes for connolly.py and surface.py. 0.25 is
+# the first release built against numpy 2; 0.22 imports fine under numpy 1 and
+# raises a binary-incompatibility ValueError under numpy 2.
+surface = ["scikit-image>=0.25"]
+test = [
+    "pytest",
+    "rdkit",
+    "scikit-image>=0.25",
+    # numba is optional at runtime (guarded by try/except with a no-op njit
+    # fallback), but if it IS installed it imports coverage itself: numba
+    # 0.65 does `class NumbaTracer(coverage.types.Tracer)`, and
+    # coverage.types.Tracer only exists from coverage 7.6. With coverage 7.4
+    # that is a collection-time crash for the whole suite — 128 failures on a
+    # clean clone — and `-p no:cov` does not help because pytest-cov is not
+    # what pulls coverage in.
+    "coverage>=7.6",
+]
+all = ["rdkit", "scikit-image>=0.25"]
 
 [project.urls]
 Homepage = "https://github.com/guillaume-osmo/mlxmolkit"

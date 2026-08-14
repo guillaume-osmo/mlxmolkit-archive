@@ -25,7 +25,13 @@ from mlxmolkit.nddo.overlap_batch import TABLE, overlap_pairs
 PARAMS = get_params("PM6")
 COVERED = [1, 6, 7, 8, 9]          # the table's elements: qn <= 3 and sp only
 FALLBACK = [16, 17, 35, 53]        # d orbitals (S, Cl) or qn > 3 (Br, I)
-EPS = 1e-14
+# 1e-12, not 1e-14. These compare a batched routine against a scalar one;
+# both reduce the same products in different orders, so the gap is set by
+# BLAS summation order, not by the code under test. On values of O(0.5),
+# 1e-14 is ~45 ULP of float64 — tighter than any BLAS guarantees. Measured
+# on one machine: Accelerate passes at 1e-14, OpenBLAS64 peaks at 1.8e-14.
+# A genuine batching bug shows up at O(1), so 1e-12 still catches it.
+EPS = 1e-12
 
 
 def specs(za, zb, n, seed=0):

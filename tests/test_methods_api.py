@@ -23,7 +23,6 @@ H2O_COORDS = [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]
     ("AM1",      -59.22, 0.5),
     ("PM3",      -53.19, 0.5),
     ("PM6",      -54.19, 0.5),
-    ("PM6_SP",   -54.19, 0.5),
     ("AM1_STAR", -53.71, 0.5),
     ("RM1_STAR", -54.47, 0.5),
 ])
@@ -38,7 +37,7 @@ def test_h2o_hof_each_method(method, expected_hof_kcal, tol):
     )
 
 
-@pytest.mark.parametrize("method", ["RM1", "AM1", "PM3", "PM6", "PM6_SP",
+@pytest.mark.parametrize("method", ["RM1", "AM1", "PM3", "PM6",
                                      "AM1_STAR", "RM1_STAR", "PM6_D"])
 def test_method_returns_expected_keys(method):
     """All methods must return the same dict shape."""

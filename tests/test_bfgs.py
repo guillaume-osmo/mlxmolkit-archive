@@ -549,7 +549,14 @@ class TestBatchMMFFOptimizer:
             mols.append(mol)
 
         results = mmff_optimize_molecules_batch(
-            mols, method="lbfgs", max_iters=200, n_threads=4,
+            # 1000, not 200. Measured on these three molecules with a fresh
+            # embedding each run: 200 converges 0/9 conformers, 500 gets 6/9,
+            # 1000 gets 9/9. The assertion below was therefore measuring the
+            # iteration budget, not the optimizer. L-BFGS is the slower of the
+            # two methods to converge and still improves from 500 to 1000 on a
+            # drug-like set (tools/sweep_mmff_iters.py), so 1000 is the honest
+            # budget for it here rather than a loosened assertion.
+            mols, method="lbfgs", max_iters=1000, n_threads=4,
         )
         assert len(results) == 3
         for r in results:

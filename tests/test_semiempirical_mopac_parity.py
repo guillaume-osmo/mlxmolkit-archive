@@ -15,14 +15,34 @@ import sys
 import tempfile
 import unittest
 
+import shutil
+
 import numpy as np
 
 # use the repo's mlxmolkit, not a stale site-packages install (which shadows data files)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-MOPAC_BIN = os.environ.get(
-    "MOPAC_BIN", "/Users/tgg/miniforge3/envs/mopacenv/bin/mopac"
-)
+def _find_mopac() -> str:
+    """Locate MOPAC without hardcoding anyone's home directory.
+
+    This was pinned to a contributor's own machine
+    ("/Users/tgg/miniforge3/envs/mopacenv/bin/mopac"), so the tests skipped
+    for every other checkout regardless of where MOPAC was installed — and a
+    skip reads as "not applicable" rather than "misconfigured". PATH alone is
+    not enough either: a conda *env* usually does not have the base env on
+    PATH, which is exactly where a `conda install mopac` lands.
+    """
+    found = os.environ.get("MOPAC_BIN") or shutil.which("mopac")
+    if found:
+        return found
+    for prefix in ("~/miniconda3", "~/miniforge3", "~/anaconda3", "/opt/homebrew"):
+        candidate = os.path.expanduser(f"{prefix}/bin/mopac")
+        if os.path.exists(candidate):
+            return candidate
+    return "mopac"
+
+
+MOPAC_BIN = _find_mopac()
 
 try:
     from rdkit import Chem, RDLogger
@@ -36,6 +56,18 @@ except Exception as _e:  # pragma: no cover
     _IMPORT_ERR = str(_e)
 
 _HAVE_MOPAC = os.path.exists(MOPAC_BIN)
+
+# The AM1-BCC correction table lives under mlxmolkit/data/, which carries no
+# tracked files, so it is absent from every clean clone. Absent optional data
+# is a skip with a reason, not six failures that look like broken code.
+try:
+    from importlib import resources as _resources
+
+    _HAVE_BCC = os.path.exists(
+        _resources.files("mlxmolkit").joinpath("data/bcc/original-am1-bcc.json")
+    )
+except Exception:
+    _HAVE_BCC = False
 
 
 # --------------------------------------------------------------------------- helpers
@@ -131,7 +163,11 @@ class TestElementCoverage(unittest.TestCase):
                 self.assertGreater(abs(p.Uss), 1e-6, f"{meth} Z={z} has zero U_ss (garbage)")
 
 
-@unittest.skipUnless(_IMPORTS_OK and _HAVE_MOPAC, f"OpenMOPAC not at {MOPAC_BIN}")
+@unittest.skipUnless(
+    _IMPORTS_OK and _HAVE_MOPAC and _HAVE_BCC,
+    f"needs OpenMOPAC at {MOPAC_BIN} and the AM1-BCC table "
+    f"(mopac={_HAVE_MOPAC}, bcc_table={_HAVE_BCC})",
+)
 class TestMopacParity(unittest.TestCase):
     """mlxmolkit charges must equal OpenMOPAC at identical geometry."""
 

@@ -51,7 +51,8 @@ def test_matches_the_scalar_routine_over_random_pairs():
     reference = np.array([rotate_integrals_to_molecular_frame(pA, pB, rA, rB)[0]
                           for (pA, pB), (rA, rB) in zip(pair_params, pair_coords)])
     got = rotate_pairs(pair_params, pair_coords)
-    assert np.abs(got - reference).max() < 1e-14
+    # 1e-12: BLAS summation order, not correctness — see test_overlap_batch.
+    assert np.abs(got - reference).max() < 1e-12
 
 
 @pytest.mark.parametrize("za,zb,kind", [
@@ -71,7 +72,7 @@ def test_every_pair_type_is_exact(za, zb, kind):
         rB = direction * (0.9 + 2.0 * rng.random())
         got = rotate_pairs([(pA, pB)], [(rA, rB)])[0]
         want = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)[0]
-        assert np.abs(got - want).max() < 1e-14, f"{kind} pair diverged"
+        assert np.abs(got - want).max() < 1e-12, f"{kind} pair diverged"
 
 
 def test_the_attraction_blocks_are_slices_of_the_rotated_tensor():

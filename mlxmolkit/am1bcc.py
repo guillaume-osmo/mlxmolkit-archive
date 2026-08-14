@@ -5,6 +5,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Sequence
 import json
+import os
 
 import numpy as np
 
@@ -40,6 +41,17 @@ def load_original_am1_bcc_parameters(path: str | Path | None = None) -> list[BCC
 
     if path is None:
         path = resources.files("mlxmolkit").joinpath("data/bcc/original-am1-bcc.json")
+
+    # mlxmolkit/data/ carries no tracked files, so this table is absent from
+    # every clean clone and the bare open() failed with a path the caller
+    # never chose. Say what is missing and what it is.
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"AM1-BCC parameter table not found at {path}. This is the "
+            "original AM1-BCC correction table as ported by OpenFF Recharge; "
+            "it is not currently tracked in this repository. Pass an explicit "
+            "`path=` to a copy of original-am1-bcc.json to use AM1-BCC."
+        )
 
     with open(path) as file:
         raw_parameters = json.load(file)
