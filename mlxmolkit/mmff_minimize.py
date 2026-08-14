@@ -233,7 +233,7 @@ def mmff_minimize_nk(
     conf_counts: List[int],
     positions_3d: np.ndarray,
     *,
-    max_iters: int = 200,
+    max_iters: int = 500,
     grad_tol: float = 1e-4,
     use_lbfgs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -247,6 +247,14 @@ def mmff_minimize_nk(
         k_i conformers per molecule.
     positions_3d : np.ndarray
         Flat (total_coords,) float32.
+    max_iters : int
+        Iteration cap per conformer. This is a cap, not a cost: each conformer
+        owns a threadgroup and leaves the loop on its own status flag, so a
+        molecule that converges at iteration 80 does not pay for the rest. On
+        20 drug-like molecules the BFGS batch takes the same 263 ms at 500,
+        1000 and 2000 because nothing needs more than ~500 — while at 200 it
+        finishes in 137 ms but leaves a 0.057 kcal/mol mean gap to RDKit and
+        2 of 20 unconverged. See tools/sweep_mmff_iters.py.
     use_lbfgs : bool
         If True, use L-BFGS (O(mn) memory, no dense Hessian).
         If False (default), use full BFGS (O(n²) Hessian, faster for
