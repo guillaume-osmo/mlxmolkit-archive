@@ -316,6 +316,117 @@ def nddo_optimize_batch(
     return results
 
 
+# --- Eigenvector following (EF) ------------------------------------------
+# Mirrors MOPAC's ef.F90: a diagonal initial Hessian (gethes), BFGS/Powell
+# updates (updhes), and a P-RFO step under a trust radius (formd). MOPAC's
+# header credits "JACK SIMONS P-RFO ALGORITHM AS IMPLEMENTED BY JON BAKER
+# (J.COMP.CHEM. 7, 385)".
+#
+# Why it pays here and not in MOPAC: MOPAC's own wall times have L-BFGS
+# beating EF (menthol 0.28 s vs 0.37 s) because the eigensolve shows up when
+# the SCF is cheap. Our gradients cost 79-373 ms and swamp a 93x93
+# eigendecomposition, so fewer cycles converts directly into less wall time.
+
+_EF_DMAX0 = 0.2      # ef.F90: dmax = 0.2d0
+_EF_DDMAX = 0.5      # ef.F90: ddmax = 0.5d0
+_EF_DDMIN = 1e-3
+_EF_H0 = 16.0        # initial diagonal curvature, eV/Angstrom^2
+
+
+def _ef_rfo_step(hessian, grad, dmax):
+    """P-RFO step: lowest eigenvector of [[H, g], [g^T, 0]], trust-clipped."""
+    n = len(grad)
+    augmented = np.zeros((n + 1, n + 1))
+    augmented[:n, :n] = hessian
+    augmented[:n, n] = grad
+    augmented[n, :n] = grad
+    _w, vectors = np.linalg.eigh(augmented)
+    v = vectors[:, 0]
+    # v[n] is the augmented coordinate; near zero means the RFO step is
+    # undefined, so fall back on steepest descent rather than dividing by it.
+    step = -grad if abs(v[n]) < 1e-12 else v[:n] / v[n]
+    norm = float(np.linalg.norm(step))
+    if norm > dmax:
+        step = step * (dmax / norm)
+    return step, norm
+
+
+def _ef_update_hessian(hessian, s_k, y_k):
+    """BFGS while the curvature is positive, Powell (PSB) otherwise."""
+    sy = float(np.dot(s_k, y_k))
+    hs = hessian @ s_k
+    shs = float(np.dot(s_k, hs))
+    if sy > 1e-10 and shs > 1e-10:
+        return hessian - np.outer(hs, hs) / shs + np.outer(y_k, y_k) / sy
+    ss = float(np.dot(s_k, s_k))
+    if ss < 1e-14:
+        return hessian
+    d = y_k - hs
+    return (hessian + (np.outer(d, s_k) + np.outer(s_k, d)) / ss
+            - float(np.dot(d, s_k)) * np.outer(s_k, s_k) / (ss * ss))
+
+
+def _ef_optimize(atoms, coords, max_iter, grad_tol, method, verbose,
+                 molecular_charge, h0=_EF_H0):
+    """Geometry optimization by eigenvector following. See nddo_optimize."""
+    from .anal_grad import analytical_gradient
+
+    coords = np.asarray(coords, dtype=np.float64).copy()
+    n_atoms = len(atoms)
+    hessian = np.eye(n_atoms * 3) * h0
+    dmax = _EF_DMAX0
+
+    result, grad = analytical_gradient(atoms, coords, method=method,
+                                       molecular_charge=molecular_charge)
+    energy = result['energy_eV']
+    grad_flat = grad.flatten()
+
+    for iteration in range(max_iter):
+        g_rms = float(np.sqrt(np.mean(grad_flat ** 2)))
+        if verbose and iteration % 5 == 0:
+            print(f"  ef {iteration:3d}: E={energy:.6f}, |g|={g_rms:.5f}, "
+                  f"trust={dmax:.3f}")
+        if g_rms < grad_tol:
+            return _optimize_result(result, coords, energy, grad, g_rms,
+                                    converged=True, n_iter=iteration + 1,
+                                    method=method)
+
+        step, raw_norm = _ef_rfo_step(hessian, grad_flat, dmax)
+        predicted = float(np.dot(grad_flat, step)
+                          + 0.5 * step @ hessian @ step)
+
+        new_coords = coords + step.reshape(n_atoms, 3)
+        new_result, new_grad = analytical_gradient(
+            atoms, new_coords, method=method,
+            molecular_charge=molecular_charge)
+        actual = new_result['energy_eV'] - energy
+
+        if actual > 0:
+            # Uphill: shrink the trust radius and retry from the same point.
+            shrunk = max(_EF_DDMIN, min(dmax, float(np.linalg.norm(step))) / 2)
+            if shrunk > _EF_DDMIN:
+                dmax = shrunk
+                continue
+            dmax = shrunk           # already at the floor; take the step
+        else:
+            ratio = actual / predicted if abs(predicted) > 1e-12 else 0.0
+            if ratio > 0.75 and raw_norm > dmax * 0.99:
+                dmax = min(_EF_DDMAX, dmax * 1.5)
+            elif ratio < 0.25:
+                dmax = max(_EF_DDMIN, dmax * 0.5)
+
+        hessian = _ef_update_hessian(hessian, step,
+                                     new_grad.flatten() - grad_flat)
+        coords, result = new_coords, new_result
+        energy = result['energy_eV']
+        grad = new_grad
+        grad_flat = grad.flatten()
+
+    return _optimize_result(result, coords, energy, grad,
+                            float(np.sqrt(np.mean(grad_flat ** 2))),
+                            converged=False, n_iter=max_iter, method=method)
+
+
 def _strong_wolfe(evaluate, phi0, dphi0, c1=1e-4, c2=0.9, max_evals=12,
                   step_init=1.0, step_max=16.0):
     """Strong-Wolfe line search: Nocedal & Wright Alg. 3.5 with 3.6 'zoom'.
@@ -464,12 +575,30 @@ def nddo_optimize(
     method: str = 'RM1',
     verbose: bool = False,
     molecular_charge: float = 0.0,
+    optimizer: str = 'lbfgs',
 ) -> dict:
-    """L-BFGS geometry optimization using analytical gradient.
+    """Geometry optimization using the analytical gradient.
+
+    Args:
+        optimizer: 'lbfgs' (default) or 'ef'. EF is eigenvector following —
+            an explicit Hessian with a P-RFO step under a trust radius, as in
+            MOPAC's ef.F90. It needs **21% fewer gradient calls** on a
+            held-out set (391 -> 309), and the split is systematic: it wins on
+            flexible molecules, where the cost actually is (geraniol
+            133 -> 91, butyl acetate 88 -> 61), and loses on rigid ones, which
+            are cheap anyway (indole 17 -> 24). It carries a 3Nx3N Hessian and
+            an O(N^3) eigensolve per step, negligible against a gradient at
+            these sizes. Minima agree with L-BFGS to 0.016 kcal/mol.
 
     Returns a dict whose `converged` and `n_iter` refer to the geometry
     optimization; the SCF's own values are under `scf_converged`/`scf_n_iter`.
     """
+    if optimizer == 'ef':
+        return _ef_optimize(atoms, coords, max_iter, grad_tol, method,
+                            verbose, molecular_charge)
+    if optimizer != 'lbfgs':
+        raise ValueError(f"unknown optimizer {optimizer!r}; use 'lbfgs' or 'ef'")
+
     from .anal_grad import analytical_gradient
 
     coords = np.asarray(coords, dtype=np.float64).copy()

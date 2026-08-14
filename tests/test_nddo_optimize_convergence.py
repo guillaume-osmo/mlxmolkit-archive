@@ -178,3 +178,70 @@ def test_deprecated_alias_delegates_its_defaults():
     params = inspect.signature(rm1_optimize).parameters
     assert params["max_iter"].default is None
     assert params["grad_tol"].default is None
+
+
+# --- eigenvector following ------------------------------------------------
+
+def test_ef_reaches_the_same_minimum_as_lbfgs():
+    """EF is an optimization strategy, not a different model.
+
+    Both must land on the same stationary point; the MOPAC agreement #28
+    requires be preserved is 0.042 kcal/mol, so the two paths have to agree
+    at least that well or one of them is finding a different minimum.
+    """
+    atoms, coords = geometry("CCO")
+    lbfgs = nddo_optimize(atoms, coords.copy(), method="PM6")
+    ef = nddo_optimize(atoms, coords.copy(), method="PM6", optimizer="ef")
+
+    assert ef["converged"] is True
+    assert abs(ef["heat_of_formation_kcal"]
+               - lbfgs["heat_of_formation_kcal"]) < 0.042
+
+
+def test_ef_reports_convergence_the_same_way():
+    """EF goes through _optimize_result too, so the SCF keys cannot leak."""
+    atoms, coords = geometry(FLEXIBLE)
+    res = nddo_optimize(atoms, coords, max_iter=2, grad_tol=1e-8,
+                        optimizer="ef")
+
+    assert res["converged"] is False
+    assert res["opt_converged"] is False
+    assert res["n_iter"] == 2
+    assert res["scf_converged"] is True
+
+
+def test_ef_needs_fewer_gradients_on_a_flexible_molecule():
+    """Where EF earns its keep. Geraniol: 133 gradient calls under L-BFGS,
+    91 under EF on the held-out measurement.
+
+    Rigid molecules go the other way (indole 17 -> 24), which is why EF is
+    opt-in rather than the default.
+    """
+    import mlxmolkit.nddo.anal_grad as anal_grad
+
+    original = anal_grad.analytical_gradient
+    calls = {"n": 0}
+
+    def counted(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    atoms, coords = geometry("CC(C)=CCC/C(C)=C/CO")
+    anal_grad.analytical_gradient = counted
+    try:
+        calls["n"] = 0
+        nddo_optimize(atoms, coords.copy(), method="PM6")
+        n_lbfgs = calls["n"]
+        calls["n"] = 0
+        nddo_optimize(atoms, coords.copy(), method="PM6", optimizer="ef")
+        n_ef = calls["n"]
+    finally:
+        anal_grad.analytical_gradient = original
+
+    assert n_ef < n_lbfgs, f"EF used {n_ef} gradients, L-BFGS {n_lbfgs}"
+
+
+def test_unknown_optimizer_is_rejected():
+    atoms, coords = geometry("CCO")
+    with pytest.raises(ValueError, match="unknown optimizer"):
+        nddo_optimize(atoms, coords, optimizer="newton")
