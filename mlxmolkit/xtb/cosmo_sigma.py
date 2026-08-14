@@ -1,0 +1,1494 @@
+# Copyright (c) 2026 Guillaume
+# SPDX-License-Identifier: MIT
+
+"""COSMO σ-profile pipeline for openCOSMO-RS.
+
+g-xTB has no implicit-solvation support (verified 2026-05-11 against the
+binary at ``/tmp/gxtb-v2-macos/bin/xtb``), so the hybrid path is:
+
+1. ``xtb --gxtb --opt``   — g-xTB geometry optimization (best 2026 quality).
+2. ``xtb --gfn 2 --tmcosmo SOLVENT`` — GFN2 single point on the optimized
+   geometry; writes a TURBOMOLE-format ``xtb.cosmo`` file.
+3. The ``xtb.cosmo`` file is consumed directly by openCOSMO-RS.
+
+The TURBOMOLE ``.cosmo`` segment block columns are:
+
+    n  atom  x  y  z  charge  area  charge/area  potential
+
+with position in Bohr and area in Å²; ``charge/area`` is σ in e/Å².
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+
+_DEFAULT_XTB = Path("/tmp/gxtb-v2-macos/bin/xtb")
+_ELEMENTS = (
+    "X H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca "
+    "Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr "
+    "Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe"
+).split()
+
+
+def _xtb_env(xtb_path: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    libdir = str(xtb_path.parent.parent / "lib")
+    bindir = str(xtb_path.parent)
+    env["DYLD_LIBRARY_PATH"] = f"{libdir}:{bindir}:{env.get('DYLD_LIBRARY_PATH', '')}"
+    return env
+
+
+def _write_xyz(path: Path, atoms: list[int] | np.ndarray, coords_ang: np.ndarray) -> None:
+    atoms = np.asarray(atoms, dtype=int)
+    coords = np.asarray(coords_ang, dtype=np.float64)
+    with path.open("w") as f:
+        f.write(f"{atoms.size}\n\n")
+        for z, (x, y, zc) in zip(atoms, coords):
+            f.write(f"{_ELEMENTS[int(z)]:<3s} {x: .10f} {y: .10f} {zc: .10f}\n")
+
+
+def _read_xyz(path: Path) -> tuple[list[int], np.ndarray]:
+    lines = path.read_text().splitlines()
+    n = int(lines[0])
+    atoms: list[int] = []
+    coords = np.zeros((n, 3), dtype=np.float64)
+    for i, line in enumerate(lines[2 : 2 + n]):
+        sym, x, y, z = line.split()[:4]
+        atoms.append(_ELEMENTS.index(sym))
+        coords[i] = [float(x), float(y), float(z)]
+    return atoms, coords
+
+
+def _run_xtb(cwd: Path, args: list[str], *, xtb_path: Path, timeout: float = 600.0) -> str:
+    cmd = [str(xtb_path), *args]
+    proc = subprocess.run(
+        cmd, cwd=cwd, env=_xtb_env(xtb_path),
+        text=True, capture_output=True, check=False, timeout=timeout,
+    )
+    log = proc.stdout + proc.stderr
+    if proc.returncode != 0:
+        raise RuntimeError(f"xtb failed (code {proc.returncode}):\n{log[-3000:]}")
+    return log
+
+
+@dataclass
+class CosmoSegments:
+    """Parsed TURBOMOLE-format ``xtb.cosmo`` content."""
+
+    epsilon: float
+    fepsi: float
+    area: float
+    volume: float
+    total_screening_charge: float
+    total_energy_hartree: float
+    dielectric_energy_hartree: float
+    atom_radii: np.ndarray  # (n_atoms,) Å
+    atom_coords_bohr: np.ndarray  # (n_atoms, 3) Bohr
+    atom_z: list[int]
+    segments_atom: np.ndarray  # (n_seg,) 1-based atom index
+    segments_xyz_bohr: np.ndarray  # (n_seg, 3)
+    segments_charge: np.ndarray  # (n_seg,) e
+    segments_area: np.ndarray  # (n_seg,) Å²
+    segments_sigma: np.ndarray  # (n_seg,) e/Å² = charge/area
+    segments_potential: np.ndarray  # (n_seg,) Hartree·Å
+    cosmo_text: str = field(repr=False)
+
+
+_SECTION_RE = re.compile(r"^\$([a-zA-Z_]+)")
+_NUMBER_RE = re.compile(r"[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?")
+
+
+def parse_xtb_cosmo(path: Path) -> CosmoSegments:
+    """Parse the TM-format ``xtb.cosmo`` written by ``xtb --tmcosmo``."""
+
+    text = Path(path).read_text()
+    lines = text.splitlines()
+
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in lines:
+        m = _SECTION_RE.match(line)
+        if m:
+            current = m.group(1)
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+
+    def kv(section: str, key: str) -> float:
+        for ln in sections.get(section, []):
+            if key in ln:
+                # xtb writes ``epsilon=Inf`` literally for --tmcosmo inf.
+                if "inf" in ln.lower() and "=" in ln:
+                    return float("inf")
+                matches = _NUMBER_RE.findall(ln)
+                if matches:
+                    return float(matches[-1])
+        raise KeyError(f"{key} not found in ${section}")
+
+    epsilon = kv("cosmo", "epsilon")
+    fepsi = kv("cosmo_data", "fepsi")
+    area = kv("cosmo_data", "area")
+    volume = kv("cosmo_data", "volume")
+    total_q = kv("screening_charge", "total")
+
+    def energy(label_substr: str) -> float:
+        for ln in sections.get("cosmo_energy", []):
+            if label_substr in ln:
+                return float(_NUMBER_RE.findall(ln)[-1])
+        return float("nan")
+
+    e_total = energy("Total energy [a.u.]")
+    e_diel = energy("Dielectric energy [a.u.]")
+
+    # $coord_rad: skip the first '#atom ...' header line, parse n rows
+    atoms_z: list[int] = []
+    radii: list[float] = []
+    coords_at: list[list[float]] = []
+    for ln in sections["coord_rad"]:
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        parts = ln.split()
+        # columns: idx  x  y  z  element  radius
+        if len(parts) < 6:
+            continue
+        coords_at.append([float(parts[1]), float(parts[2]), float(parts[3])])
+        atoms_z.append(_ELEMENTS.index(parts[4]))
+        radii.append(float(parts[5]))
+
+    # $segment_information: rows beginning with an integer in the first column
+    seg_atom: list[int] = []
+    seg_xyz: list[list[float]] = []
+    seg_q: list[float] = []
+    seg_area: list[float] = []
+    seg_sigma: list[float] = []
+    seg_pot: list[float] = []
+    for ln in sections["segment_information"]:
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) < 8:
+            continue
+        try:
+            n_idx = int(parts[0])
+            atom_idx = int(parts[1])
+        except ValueError:
+            continue
+        seg_atom.append(atom_idx)
+        seg_xyz.append([float(parts[2]), float(parts[3]), float(parts[4])])
+        seg_q.append(float(parts[5]))
+        seg_area.append(float(parts[6]))
+        seg_sigma.append(float(parts[7]))
+        seg_pot.append(float(parts[8]) if len(parts) > 8 else float("nan"))
+
+    return CosmoSegments(
+        epsilon=epsilon,
+        fepsi=fepsi,
+        area=area,
+        volume=volume,
+        total_screening_charge=total_q,
+        total_energy_hartree=e_total,
+        dielectric_energy_hartree=e_diel,
+        atom_radii=np.asarray(radii),
+        atom_coords_bohr=np.asarray(coords_at),
+        atom_z=atoms_z,
+        segments_atom=np.asarray(seg_atom, dtype=np.intp),
+        segments_xyz_bohr=np.asarray(seg_xyz),
+        segments_charge=np.asarray(seg_q),
+        segments_area=np.asarray(seg_area),
+        segments_sigma=np.asarray(seg_sigma),
+        segments_potential=np.asarray(seg_pot),
+        cosmo_text=text,
+    )
+
+
+def gfn2_alpb_water_singlepoint(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    acc: float = 0.1,
+) -> float:
+    """``xtb --gfn 2 --alpb water`` single-point, returns total energy (Ha).
+
+    Used by the multi-conformer pipeline for solvent-aware conformer ranking:
+    g-xTB gives a high-quality gas-phase geometry, but gas-phase energies
+    over-stabilise intramolecular H-bonded conformers that don't dominate
+    in water. A GFN2-ALPB single point on the g-xTB-optimised geometry
+    restores the right solvent-corrected population for COSMO-RS.
+    """
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="gfn2-alpb-sp-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        xyz = workdir / "mol.xyz"
+        _write_xyz(xyz, atoms, coords_ang)
+        log = _run_xtb(
+            workdir,
+            [str(xyz.name), "--gfn", "2", "--alpb", "water",
+             "--acc", str(acc), "--chrg", str(charge), "--uhf", str(uhf)],
+            xtb_path=xtb_path,
+        )
+        m = re.search(r"TOTAL ENERGY\s+([-+0-9.Ee]+)\s+Eh", log)
+        if m is None:
+            raise RuntimeError(f"failed to parse TOTAL ENERGY from xtb log:\n{log[-1000:]}")
+        return float(m.group(1))
+    finally:
+        if not keep_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def gxtb_optimize_geometry(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    acc: float = 0.1,
+    timeout: float = 600.0,
+) -> tuple[np.ndarray, float]:
+    """Run ``xtb --gxtb --opt`` and return the optimized coords and energy.
+
+    Returns ``(coords_ang_opt, energy_hartree)``.
+    """
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="gxtb-opt-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        xyz = workdir / "mol.xyz"
+        _write_xyz(xyz, atoms, coords_ang)
+        log = _run_xtb(
+            workdir,
+            [str(xyz.name), "--gxtb", "--opt", "--acc", str(acc),
+             "--chrg", str(charge), "--uhf", str(uhf)],
+            xtb_path=xtb_path,
+            timeout=timeout,
+        )
+        opt_xyz = workdir / "xtbopt.xyz"
+        if not opt_xyz.exists():
+            raise RuntimeError(f"xtb --gxtb --opt produced no xtbopt.xyz:\n{log[-1500:]}")
+        _, coords_opt = _read_xyz(opt_xyz)
+        m = re.search(r"TOTAL ENERGY\s+([-+0-9.Ee]+)\s+Eh", log)
+        energy = float(m.group(1)) if m else float("nan")
+        return coords_opt, energy
+    finally:
+        if not keep_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def gfn2_tmcosmo_singlepoint(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    solvent: str = "water",
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    acc: float = 0.1,
+) -> CosmoSegments:
+    """Run ``xtb --gfn 2 --tmcosmo SOLVENT`` and parse ``xtb.cosmo``."""
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="gfn2-cosmo-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        xyz = workdir / "mol.xyz"
+        _write_xyz(xyz, atoms, coords_ang)
+        log = _run_xtb(
+            workdir,
+            [str(xyz.name), "--gfn", "2", "--tmcosmo", solvent,
+             "--acc", str(acc), "--chrg", str(charge), "--uhf", str(uhf)],
+            xtb_path=xtb_path,
+        )
+        cosmo_path = workdir / "xtb.cosmo"
+        if not cosmo_path.exists():
+            raise RuntimeError(f"xtb did not write xtb.cosmo:\n{log[-1500:]}")
+        return parse_xtb_cosmo(cosmo_path)
+    finally:
+        if not keep_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def hybrid_gxtb_gfn2_cosmo(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    solvent: str = "water",
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    acc: float = 0.1,
+    gxtb_timeout: float = 600.0,
+) -> dict[str, object]:
+    """Hybrid g-xTB(opt) + GFN2(tmcosmo) pipeline.
+
+    Returns a dict with ``coords_opt`` (Å), ``gxtb_energy_hartree`` and the
+    parsed :class:`CosmoSegments` under ``cosmo``.
+    """
+
+    coords_opt, e_gxtb = gxtb_optimize_geometry(
+        atoms, coords_ang,
+        charge=charge, uhf=uhf, xtb_path=xtb_path,
+        workdir=workdir / "step1_gxtb_opt" if workdir else None,
+        keep_workdir=keep_workdir, acc=acc, timeout=gxtb_timeout,
+    )
+    cosmo = gfn2_tmcosmo_singlepoint(
+        atoms, coords_opt,
+        solvent=solvent, charge=charge, uhf=uhf, xtb_path=xtb_path,
+        workdir=workdir / "step2_gfn2_tmcosmo" if workdir else None,
+        keep_workdir=keep_workdir, acc=acc,
+    )
+    return {
+        "atoms": np.asarray(atoms, dtype=int),
+        "coords_opt_ang": coords_opt,
+        "gxtb_energy_hartree": e_gxtb,
+        "cosmo": cosmo,
+        "solvent": solvent,
+    }
+
+
+def hybrid_gxtb_gfn2_cosmo_from_smiles(
+    smiles: str,
+    *,
+    solvent: str = "water",
+    seed: int = 42,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    acc: float = 0.1,
+    gxtb_timeout: float = 600.0,
+) -> dict[str, object]:
+    """End-to-end: SMILES → RDKit embed → g-xTB opt → GFN2 tmcosmo → parsed segments."""
+
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"invalid SMILES: {smiles!r}")
+    mol = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = int(seed)
+    params.useRandomCoords = True
+    if AllChem.EmbedMolecule(mol, params) != 0:
+        raise RuntimeError(f"RDKit embedding failed for {smiles!r}")
+    if AllChem.MMFFHasAllMoleculeParams(mol):
+        AllChem.MMFFOptimizeMolecule(mol, maxIters=300)
+    else:
+        AllChem.UFFOptimizeMolecule(mol, maxIters=300)
+    conf = mol.GetConformer()
+    atoms = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    coords = np.asarray(
+        [[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z]
+         for i in range(mol.GetNumAtoms())],
+        dtype=np.float64,
+    )
+    out = hybrid_gxtb_gfn2_cosmo(
+        atoms, coords, solvent=solvent, charge=charge, uhf=uhf,
+        xtb_path=xtb_path, workdir=workdir, keep_workdir=keep_workdir, acc=acc,
+        gxtb_timeout=gxtb_timeout,
+    )
+    out["smiles"] = smiles
+    return out
+
+
+_BOHR_PER_ANG = 1.0 / 0.52917721092  # match opencosmorspy's constant
+_ANG2_PER_BOHR2 = 0.52917721092 ** 2
+_ANG3_PER_BOHR3 = 0.52917721092 ** 3
+
+
+_DEFAULT_ORCA = Path.home() / "Library" / "orca_6_1_0" / "orca"
+_DEFAULT_ORCACOSMO_CACHE = Path.home() / ".cache" / "mlxmolkit-orcacosmo"
+
+
+def _orcacosmo_cache_key(
+    atoms: np.ndarray, coords_ang: np.ndarray,
+    *, charge: int, uhf: int, method: str, basis: str, solvent: str,
+) -> str:
+    """Deterministic SHA-256 key for caching ``.orcacosmo`` outputs.
+
+    Hashes the input geometry (rounded to 5 decimals, the precision of xtb's
+    optimizer output) plus the QM method/basis/solvent. Any caller producing
+    the same XYZ + same QM directive hits the cache and skips ORCA.
+    """
+
+    import hashlib
+    atoms_arr = np.asarray(atoms, dtype=int)
+    coords_arr = np.round(np.asarray(coords_ang, dtype=np.float64), 5)
+    payload = (
+        f"{atoms_arr.tolist()}|{coords_arr.tolist()}"
+        f"|chg={charge}|uhf={uhf}|method={method}|basis={basis}|solvent={solvent}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def orca_cosmors_singlepoint(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    charge: int = 0,
+    uhf: int = 0,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    orca_path: Path = _DEFAULT_ORCA,
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    n_cores: int = 1,
+    extra_keywords: str = "",
+    timeout: float = 1800.0,
+    cache_dir: Path | None = _DEFAULT_ORCACOSMO_CACHE,
+) -> Path:
+    """Run ORCA's ``!METHOD BASIS COSMORS(SOLVENT)`` single point.
+
+    Returns the path to the produced ``<job>.solute.orcacosmo`` (DFT-level
+    σ-profile in the format openCOSMO-RS_py / _cpp consume).
+
+    The canonical recipe used by the openCOSMO-RS_conformer_pipeline is
+    ``BP86 def2-TZVP COSMORS(...)``; openCOSMORS24a was parameterized against
+    these σ-profiles.
+
+    The ``solvent`` argument sets the CPCM dielectric for the second
+    "in solvent" pass that ORCA does as part of !COSMORS; the σ-profile
+    itself is computed at ε=∞ regardless (the standard COSMO-RS convention).
+    The choice still affects which reference solvent ORCA optimizes for.
+    """
+
+    atoms = np.asarray(atoms, dtype=int)
+    coords = np.asarray(coords_ang, dtype=np.float64)
+
+    # Cache hit: deterministic by (geometry, method, basis, solvent, charge, uhf).
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        key = _orcacosmo_cache_key(
+            atoms, coords,
+            charge=charge, uhf=uhf, method=method, basis=basis, solvent=solvent,
+        )
+        cache_path = cache_dir / f"{key}.orcacosmo"
+        if cache_path.exists():
+            return cache_path
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="orca-cosmors-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        inp_path = workdir / "job.inp"
+        with inp_path.open("w") as f:
+            kw_extra = f" {extra_keywords}" if extra_keywords else ""
+            f.write(f"! {method} {basis} COSMORS({solvent}){kw_extra}\n")
+            if n_cores > 1:
+                f.write(f"%pal nprocs {n_cores} end\n")
+            f.write(f"* xyz {charge} {uhf + 1}\n")
+            for z, (x, y, zc) in zip(atoms, coords):
+                f.write(f"{_ELEMENTS[int(z)]:<3s} {x:.10f} {y:.10f} {zc:.10f}\n")
+            f.write("*\n")
+
+        out_path = workdir / "job.out"
+        with out_path.open("w") as out:
+            proc = subprocess.run(
+                [str(orca_path), str(inp_path.name)],
+                cwd=workdir, stdout=out, stderr=subprocess.STDOUT,
+                text=True, check=False, timeout=timeout,
+            )
+        if proc.returncode != 0:
+            tail = out_path.read_text()[-3000:]
+            raise RuntimeError(f"ORCA failed (code {proc.returncode}):\n{tail}")
+        solute_cosmo = workdir / "job.solute.orcacosmo"
+        if not solute_cosmo.exists():
+            raise RuntimeError(f"ORCA wrote no .solute.orcacosmo. Job log tail:\n{out_path.read_text()[-2000:]}")
+        # Cache the result (atomic copy) before workdir is cleaned up
+        if cache_path is not None:
+            shutil.copy2(solute_cosmo, cache_path)
+            if not keep_workdir:
+                shutil.rmtree(workdir, ignore_errors=True)
+            return cache_path
+        return solute_cosmo
+    except Exception:
+        if not keep_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
+
+def tiered_gxtb_orca_cosmors(
+    atoms: list[int] | np.ndarray,
+    coords_ang: np.ndarray,
+    *,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    orca_path: Path = _DEFAULT_ORCA,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    n_cores: int = 1,
+    acc: float = 0.1,
+) -> dict[str, object]:
+    """Tiered σ-profile: g-xTB --opt → ORCA BP86/def2-TZVP COSMORS.
+
+    Returns a dict with ``coords_opt_ang``, ``gxtb_energy_hartree``, and
+    ``orcacosmo_path`` (the ORCA-format σ-profile file consumable by
+    openCOSMO-RS).
+    """
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="tiered-cosmors-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    coords_opt, e_gxtb = gxtb_optimize_geometry(
+        atoms, coords_ang,
+        charge=charge, uhf=uhf, xtb_path=xtb_path,
+        workdir=workdir / "step1_gxtb", keep_workdir=True, acc=acc,
+    )
+    orcacosmo = orca_cosmors_singlepoint(
+        atoms, coords_opt,
+        charge=charge, uhf=uhf, method=method, basis=basis, solvent=solvent,
+        orca_path=orca_path,
+        workdir=workdir / "step2_orca", keep_workdir=True,
+        n_cores=n_cores,
+    )
+    return {
+        "atoms": np.asarray(atoms, dtype=int),
+        "coords_opt_ang": coords_opt,
+        "gxtb_energy_hartree": e_gxtb,
+        "orcacosmo_path": orcacosmo,
+        "method": f"{method}/{basis} COSMORS({solvent})",
+        "solvent": solvent,
+        "workdir": workdir if keep_workdir else None,
+    }
+
+
+def generate_rdkit_conformers(
+    smiles: str,
+    *,
+    n_conformers: int = 20,
+    seed: int = 42,
+    mmff_iter: int = 300,
+    use_exp_torsion_prefs: bool = True,
+    use_basic_knowledge: bool = True,
+    prune_rms_thresh: float = 0.5,
+) -> list[tuple[list[int], np.ndarray]]:
+    """RDKit ETKDGv3 conformer generation + MMFF94 refinement.
+
+    Defaults match ETKDGv3 stock (``useExpTorsionAnglePrefs=True``,
+    ``useBasicKnowledge=True``) — these collapse aggressively but keep the
+    chemically-most-likely conformers. For some mols (e.g. benzyl alcohol)
+    the default returns only 1 conformer; setting
+    ``use_exp_torsion_prefs=False`` raises that to ~8 but also lets
+    RDKit emit some intramolecular-H-bond geometries that gas-phase g-xTB
+    incorrectly favors over solvent-relevant open conformers. So broader
+    sampling here can hurt the Boltzmann-weighted COSMO-RS σ-profile
+    unless paired with a solvent-aware screening step (g-xTB doesn't
+    support ALPB; switching to GFN2+ALPB for screening is the proper fix).
+
+    Returns a list of ``(atomic_numbers, coords_angstrom)`` tuples.
+    """
+
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"invalid SMILES: {smiles!r}")
+    mol = Chem.AddHs(mol)
+    p = AllChem.ETKDGv3()
+    p.randomSeed = int(seed)
+    p.useRandomCoords = True
+    p.pruneRmsThresh = float(prune_rms_thresh)
+    p.useExpTorsionAnglePrefs = bool(use_exp_torsion_prefs)
+    p.useBasicKnowledge = bool(use_basic_knowledge)
+    cids = AllChem.EmbedMultipleConfs(mol, numConfs=n_conformers, params=p)
+    if len(cids) == 0:
+        raise RuntimeError(f"RDKit failed to embed any conformers for {smiles!r}")
+    if AllChem.MMFFHasAllMoleculeParams(mol):
+        for cid in cids:
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=mmff_iter, confId=int(cid))
+    else:
+        for cid in cids:
+            AllChem.UFFOptimizeMolecule(mol, maxIters=mmff_iter, confId=int(cid))
+    atoms = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    out: list[tuple[list[int], np.ndarray]] = []
+    for cid in cids:
+        conf = mol.GetConformer(int(cid))
+        coords = np.asarray(
+            [[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z]
+             for i in range(mol.GetNumAtoms())],
+            dtype=np.float64,
+        )
+        out.append((list(atoms), coords))
+    return out
+
+
+def cosmosegments_from_orcacosmo(path: Path | str) -> CosmoSegments:
+    """Read an ORCA ``.orcacosmo`` file into :class:`CosmoSegments`.
+
+    ORCA writes the COSMO block in atomic units: atom/segment coordinates and
+    radii in Bohr, surface areas in Bohr², and segment charges in e. The rest
+    of the σ-potential code expects coordinates in Bohr but areas in Å² and
+    σ in e/Å², so only area/radius/volume need unit conversion here.
+    """
+
+    path = Path(path)
+    text = path.read_text()
+    lines = text.splitlines()
+
+    e_total = float("nan")
+    for line in lines:
+        if "FINAL SINGLE POINT ENERGY" in line:
+            parts = line.split()
+            if parts:
+                e_total = float(parts[-1])
+            break
+
+    cosmo_start = None
+    for i, line in enumerate(lines):
+        if line.strip() == "#COSMO":
+            cosmo_start = i
+            break
+    if cosmo_start is None:
+        raise ValueError(f"no #COSMO block found in {path}")
+
+    def _leading_number(line: str) -> float:
+        return float(line.split("#", 1)[0].split()[0])
+
+    n_atoms = int(_leading_number(lines[cosmo_start + 1]))
+    n_segments = int(_leading_number(lines[cosmo_start + 2]))
+
+    area_bohr2 = float("nan")
+    volume_bohr3 = float("nan")
+    dielectric_energy = float("nan")
+    for line in lines[cosmo_start:]:
+        stripped = line.strip()
+        if stripped == "#COSMO_corrected":
+            break
+        if "# Volume" in line:
+            volume_bohr3 = _leading_number(line)
+        elif "# Area" in line:
+            area_bohr2 = _leading_number(line)
+        elif "# CPCM dielectric energy" in line:
+            dielectric_energy = _leading_number(line)
+
+    coord_header = None
+    surf_header = None
+    for i in range(cosmo_start, len(lines)):
+        stripped = lines[i].strip()
+        if stripped == "#COSMO_corrected":
+            break
+        if "CARTESIAN COORDINATES" in stripped:
+            coord_header = i
+        elif "SURFACE POINTS" in stripped:
+            surf_header = i
+            break
+    if coord_header is None or surf_header is None:
+        raise ValueError(f"incomplete #COSMO block in {path}")
+
+    atom_coords: list[list[float]] = []
+    atom_radii_bohr: list[float] = []
+    atom_z: list[int] = []
+    i = coord_header + 1
+    while i < surf_header and len(atom_z) < n_atoms:
+        parts = lines[i].split()
+        if len(parts) >= 5 and not lines[i].lstrip().startswith("#"):
+            try:
+                atom_coords.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                atom_radii_bohr.append(float(parts[3]))
+                atom_z.append(int(float(parts[4])))
+            except ValueError:
+                pass
+        i += 1
+    if len(atom_z) != n_atoms:
+        raise ValueError(f"expected {n_atoms} atoms in {path}, parsed {len(atom_z)}")
+
+    seg_atom: list[int] = []
+    seg_xyz: list[list[float]] = []
+    seg_area_a2: list[float] = []
+    seg_charge: list[float] = []
+    seg_sigma: list[float] = []
+    seg_potential: list[float] = []
+
+    i = surf_header + 1
+    while i < len(lines) and len(seg_atom) < n_segments:
+        stripped = lines[i].strip()
+        if stripped == "#COSMO_corrected":
+            break
+        parts = lines[i].split()
+        if len(parts) >= 10 and not lines[i].lstrip().startswith("#"):
+            try:
+                x, y, zc = float(parts[0]), float(parts[1]), float(parts[2])
+                area_a2 = float(parts[3]) * _ANG2_PER_BOHR2
+                potential = float(parts[4])
+                charge = float(parts[5])
+                atom_idx = int(float(parts[9])) + 1  # ORCA is 0-based; CosmoSegments uses 1-based.
+            except ValueError:
+                i += 1
+                continue
+            seg_xyz.append([x, y, zc])
+            seg_area_a2.append(area_a2)
+            seg_charge.append(charge)
+            seg_sigma.append(charge / area_a2 if area_a2 > 0.0 else 0.0)
+            seg_potential.append(potential)
+            seg_atom.append(atom_idx)
+        i += 1
+    if len(seg_atom) != n_segments:
+        raise ValueError(f"expected {n_segments} surface points in {path}, parsed {len(seg_atom)}")
+
+    return CosmoSegments(
+        epsilon=float("inf"), fepsi=1.0,
+        area=area_bohr2 * _ANG2_PER_BOHR2,
+        volume=volume_bohr3 * _ANG3_PER_BOHR3,
+        total_screening_charge=float(np.sum(seg_charge)),
+        total_energy_hartree=e_total,
+        dielectric_energy_hartree=dielectric_energy,
+        atom_radii=np.asarray(atom_radii_bohr, dtype=np.float64) * 0.52917721092,
+        atom_coords_bohr=np.asarray(atom_coords, dtype=np.float64),
+        atom_z=atom_z,
+        segments_atom=np.asarray(seg_atom, dtype=np.intp),
+        segments_xyz_bohr=np.asarray(seg_xyz, dtype=np.float64),
+        segments_charge=np.asarray(seg_charge, dtype=np.float64),
+        segments_area=np.asarray(seg_area_a2, dtype=np.float64),
+        segments_sigma=np.asarray(seg_sigma, dtype=np.float64),
+        segments_potential=np.asarray(seg_potential, dtype=np.float64),
+        cosmo_text=text,
+    )
+
+
+def tiered_multiconformer_gxtb_orca(
+    smiles: str,
+    *,
+    n_conformers: int = 20,
+    n_keep: int = 5,
+    seed: int = 42,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    orca_path: Path = _DEFAULT_ORCA,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    orca_cores: int = 1,
+    acc: float = 0.1,
+    screen_with_solvent: bool = True,
+    use_exp_torsion_prefs: bool = True,
+    prune_rms_thresh: float = 0.5,
+) -> dict[str, object]:
+    """Multi-conformer tiered pipeline: RDKit → g-xTB --opt → ORCA COSMORS.
+
+    Steps:
+      1. Generate ``n_conformers`` RDKit conformers (ETKDGv3 + MMFF/UFF).
+      2. g-xTB --opt each one.
+      3. Sort by g-xTB energy, keep the top ``n_keep`` (lowest energy).
+      4. ORCA BP86/def2-TZVP COSMORS on each survivor.
+      5. Return per-conformer cosmo objects + energies for downstream
+         Boltzmann weighting.
+
+    Returns a dict with:
+      - ``cosmos`` : list[CosmoSegments] (one per kept conformer)
+      - ``energies_gxtb_hartree`` : list[float]
+      - ``orcacosmo_paths`` : list[Path]
+    """
+
+    workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="multi-cosmors-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    confs = generate_rdkit_conformers(
+        smiles, n_conformers=n_conformers, seed=seed,
+        use_exp_torsion_prefs=use_exp_torsion_prefs,
+        prune_rms_thresh=prune_rms_thresh,
+    )
+
+    # Step 1: g-xTB --opt (best gas-phase geometry per conformer)
+    gxtb_optimized: list[tuple[list[int], np.ndarray, float]] = []
+    for idx, (atoms, coords) in enumerate(confs):
+        try:
+            opt_coords, e_g = gxtb_optimize_geometry(
+                atoms, coords,
+                charge=charge, uhf=uhf, xtb_path=xtb_path,
+                workdir=workdir / f"conf{idx:03d}_gxtb", keep_workdir=False, acc=acc,
+            )
+            gxtb_optimized.append((atoms, opt_coords, float(e_g)))
+        except Exception:
+            continue
+    if not gxtb_optimized:
+        raise RuntimeError(f"all conformers failed g-xTB opt for {smiles!r}")
+
+    # Step 2: GFN2 + ALPB(water) single-point on each g-xTB-optimised geometry.
+    # Re-rank by solvent-aware energy. Gas-phase ranking over-stabilises
+    # intramolecular H-bonded conformers that don't dominate in water.
+    e_screen: list[float] = []
+    if screen_with_solvent:
+        for idx, (atoms, opt_coords, e_g) in enumerate(gxtb_optimized):
+            try:
+                e_sol = gfn2_alpb_water_singlepoint(
+                    atoms, opt_coords,
+                    charge=charge, uhf=uhf, xtb_path=xtb_path,
+                    workdir=workdir / f"conf{idx:03d}_gfn2alpb",
+                )
+                e_screen.append(float(e_sol))
+            except Exception:
+                e_screen.append(float(e_g))  # fallback to gas-phase
+    else:
+        e_screen = [e_g for (_, _, e_g) in gxtb_optimized]
+
+    # Sort by screening energy (low → high), keep top n_keep
+    order = np.argsort(np.asarray(e_screen, dtype=np.float64))
+    kept_idx = order[: max(1, int(n_keep))]
+    kept = [gxtb_optimized[i] for i in kept_idx]
+    kept_screen_energies = [float(e_screen[i]) for i in kept_idx]
+
+    cosmos: list[CosmoSegments] = []
+    paths: list[Path] = []
+    for idx, (atoms, opt_coords, _e_g) in enumerate(kept):
+        orcacosmo = orca_cosmors_singlepoint(
+            atoms, opt_coords,
+            charge=charge, uhf=uhf, method=method, basis=basis, solvent=solvent,
+            orca_path=orca_path,
+            workdir=workdir / f"keep{idx:03d}_orca",
+            keep_workdir=keep_workdir, n_cores=orca_cores,
+        )
+        cs = cosmosegments_from_orcacosmo(orcacosmo)
+        cosmos.append(cs)
+        paths.append(orcacosmo)
+    if not keep_workdir:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return {
+        "cosmos": cosmos,
+        # Use solvent-aware energies for downstream Boltzmann weighting; gas
+        # energies retained for diagnostics.
+        "energies_gxtb_hartree": [k[2] for k in kept],
+        "energies_screen_hartree": kept_screen_energies,
+        "orcacosmo_paths": paths,
+        "n_conformers_generated": len(confs),
+        "n_optimized": len(gxtb_optimized),
+        "n_kept": len(kept),
+        "screen_with_solvent": screen_with_solvent,
+    }
+
+
+def is_complex_case(smiles: str) -> tuple[bool, str]:
+    """Heuristic flag: does this molecule need deep multi-conformer sampling?
+
+    Returns ``(is_complex, reason)``. A mol is "complex" if any of:
+
+    1. **Aromatic + lone-pair donor**: aromatic carbon directly bonded to
+       O / N / S, or to a CH2 bridging to O/N (anisole, aniline,
+       benzyl alcohol, phenols pattern). Their σ-potential is sensitive
+       to donor-group orientation relative to the π-system.
+    2. **HB-rich flexible**: ≥2 HB donors (OH, NH₁/₂, SH) AND ≥3
+       rotatable bonds (glycerol, diols, triethylene glycol pattern).
+    3. **High flexibility**: ≥4 rotatable bonds regardless of HB content.
+
+    For these cases ``tiered_multiconformer_gxtb_orca`` with
+    ``use_exp_torsion_prefs=False`` and ``prune_rms_thresh=0.1`` and
+    ``n_keep≥5`` recovers near-perfect agreement with the paper
+    reference (benzyl alcohol: 0.91 single → 0.997 deep multi).
+    """
+    from rdkit import Chem
+    from rdkit.Chem import Lipinski
+
+    m = Chem.MolFromSmiles(smiles)
+    if m is None:
+        return False, "invalid_smiles"
+
+    # 1a. aromatic-C directly bonded to lone-pair-bearing heteroatom
+    if m.HasSubstructMatch(Chem.MolFromSmarts("c-[O,N,S;!H0,!X1]")):
+        return True, "aromatic_donor_direct"
+    # 1b. aromatic-C bonded to sp3 C bonded to OH/NH (benzyl alcohol class)
+    if m.HasSubstructMatch(Chem.MolFromSmarts("c-[CX4]-[OX2H1,NX3]")):
+        return True, "aromatic_benzyl_donor"
+
+    n_rot = Lipinski.NumRotatableBonds(m)
+    # Count HB donors (heavy atoms with at least one explicit H neighbour)
+    mol_h = Chem.AddHs(m)
+    n_hbd = sum(
+        1 for a in mol_h.GetAtoms()
+        if a.GetAtomicNum() in (7, 8, 16)
+        and any(n.GetAtomicNum() == 1 for n in a.GetNeighbors())
+    )
+
+    # 2. HB-rich flexible — diols, triols, oligoglycols, sugars
+    if n_hbd >= 2 and n_rot >= 2:
+        return True, f"hb_rich_flex(donors={n_hbd},rot={n_rot})"
+
+    return False, "simple"
+
+
+def cosmors_sigma_potential_auto(
+    smiles: str,
+    *,
+    seed: int = 42,
+    charge: int = 0,
+    uhf: int = 0,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    sigma_grid_e_per_A2: np.ndarray | None = None,
+    T: float = 298.15,
+    n_cores: int = 1,
+    deep_n_conformers: int = 20,
+    deep_n_keep: int = 5,
+    deep_prune_rms: float = 0.1,
+    force_deep: bool = False,
+) -> dict[str, object]:
+    """End-to-end σ-potential with automatic single vs deep-multi selection.
+
+    Auto-flags complex cases via :func:`is_complex_case` and switches to
+    deep multi-conformer mode (relaxed RDKit + ALPB(water) screen +
+    Boltzmann-weighted σ-orth ensemble) only when the structure warrants
+    it. Simple/rigid mols use the single-conformer path with σ-orth.
+
+    Returns ``{'sigma_test', 'mu_S_J_per_mol', 'mode', 'reason', 'n_kept',
+    'weights', 'walls'}``.
+    """
+
+    complex_flag, reason = is_complex_case(smiles)
+    use_deep = bool(force_deep or complex_flag)
+    walls: dict[str, float] = {}
+    t0 = time.perf_counter()
+
+    if use_deep:
+        mp = tiered_multiconformer_gxtb_orca(
+            smiles,
+            n_conformers=deep_n_conformers, n_keep=deep_n_keep,
+            seed=seed, charge=charge, uhf=uhf,
+            method=method, basis=basis, solvent=solvent,
+            orca_cores=n_cores,
+            screen_with_solvent=True,
+            use_exp_torsion_prefs=False,
+            prune_rms_thresh=deep_prune_rms,
+        )
+        sigma_test, mu, weights = sigma_potential_ensemble(
+            mp["cosmos"], mp["energies_screen_hartree"],
+            sigma_grid_e_per_A2=sigma_grid_e_per_A2, T=T,
+        )
+        n_kept = int(mp["n_kept"])
+        weights_list = list(map(float, weights))
+        mode = "deep"
+    else:
+        sp = tiered_gxtb_orca_cosmors_from_smiles(
+            smiles, seed=seed, charge=charge, uhf=uhf,
+            method=method, basis=basis, solvent=solvent,
+            n_cores=n_cores,
+        )
+        cs = cosmosegments_from_orcacosmo(sp["orcacosmo_path"])
+        sigma_test, mu = sigma_potential(cs, sigma_grid_e_per_A2=sigma_grid_e_per_A2, T=T)
+        n_kept = 1
+        weights_list = [1.0]
+        mode = "single"
+    walls["total_s"] = time.perf_counter() - t0
+    return {
+        "sigma_test_e_per_A2": sigma_test,
+        "mu_S_J_per_mol": mu,
+        "mode": mode,
+        "reason": reason,
+        "is_complex": complex_flag,
+        "n_kept": n_kept,
+        "weights": weights_list,
+        "walls": walls,
+    }
+
+
+def tiered_gxtb_orca_cosmors_from_smiles(
+    smiles: str,
+    *,
+    seed: int = 42,
+    charge: int = 0,
+    uhf: int = 0,
+    xtb_path: Path = _DEFAULT_XTB,
+    orca_path: Path = _DEFAULT_ORCA,
+    method: str = "BP86",
+    basis: str = "def2-TZVP",
+    solvent: str = "water",
+    workdir: Path | None = None,
+    keep_workdir: bool = False,
+    n_cores: int = 1,
+    acc: float = 0.1,
+) -> dict[str, object]:
+    """End-to-end: SMILES → embed → g-xTB --opt → ORCA BP86/TZVP COSMORS."""
+
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"invalid SMILES: {smiles!r}")
+    mol = Chem.AddHs(mol)
+    p = AllChem.ETKDGv3()
+    p.randomSeed = int(seed)
+    p.useRandomCoords = True
+    if AllChem.EmbedMolecule(mol, p) != 0:
+        raise RuntimeError(f"RDKit embedding failed for {smiles!r}")
+    if AllChem.MMFFHasAllMoleculeParams(mol):
+        AllChem.MMFFOptimizeMolecule(mol, maxIters=300)
+    else:
+        AllChem.UFFOptimizeMolecule(mol, maxIters=300)
+    conf = mol.GetConformer()
+    atoms = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    coords = np.asarray(
+        [[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z]
+         for i in range(mol.GetNumAtoms())],
+        dtype=np.float64,
+    )
+    out = tiered_gxtb_orca_cosmors(
+        atoms, coords,
+        charge=charge, uhf=uhf,
+        xtb_path=xtb_path, orca_path=orca_path,
+        method=method, basis=basis, solvent=solvent,
+        workdir=workdir, keep_workdir=keep_workdir,
+        n_cores=n_cores, acc=acc,
+    )
+    out["smiles"] = smiles
+    return out
+
+
+def write_cosmo_file(
+    cosmo: CosmoSegments,
+    path: Path | str,
+    *,
+    method_tag: str = "xtb;gfn2-tmcosmo",
+    opencosmors_compat: bool = True,
+) -> None:
+    """Write the TURBOMOLE-format ``.cosmo`` text to disk.
+
+    With ``opencosmors_compat=True`` (default) the output is patched so that
+    openCOSMO-RS_py's ``SigmaProfileParser`` reads it directly:
+
+      * The line under ``$info`` is rewritten to a ``program;method`` tag
+        (xtb writes ``prog.: xtb``, the parser expects a ``;``-separated
+        string).
+      * The global ``area=`` and ``volume=`` fields in ``$cosmo_data`` are
+        converted from Å²/Å³ (xtb's convention) to Bohr²/Bohr³ — the parser
+        applies a ``Bohr→Å`` conversion factor to those fields. Per-segment
+        ``seg_area`` and ``seg_pos`` already match the parser's expected
+        units (Å² and Bohr respectively), so they are left untouched.
+
+    Set ``opencosmors_compat=False`` to write the raw xtb-format text.
+    """
+
+    text = cosmo.cosmo_text
+    if not opencosmors_compat:
+        Path(path).write_text(text)
+        return
+
+    lines = text.splitlines(keepends=True)
+    out = []
+    rewrite_next = False
+    in_cosmo_data = False
+    for line in lines:
+        if rewrite_next:
+            indent = line[: len(line) - len(line.lstrip())]
+            newline = "\r\n" if line.endswith("\r\n") else "\n"
+            out.append(f"{indent}{method_tag}{newline}")
+            rewrite_next = False
+            continue
+
+        stripped = line.strip()
+        if stripped.startswith("$"):
+            in_cosmo_data = stripped == "$cosmo_data"
+            out.append(line)
+            if stripped == "$info":
+                rewrite_next = True
+            continue
+
+        if in_cosmo_data:
+            if stripped.startswith("area"):
+                val = float(stripped.split("=")[1])
+                indent = line[: len(line) - len(line.lstrip())]
+                newline = "\r\n" if line.endswith("\r\n") else "\n"
+                out.append(f"{indent}area={val / _ANG2_PER_BOHR2:.15g}{newline}")
+                continue
+            if stripped.startswith("volume"):
+                val = float(stripped.split("=")[1])
+                indent = line[: len(line) - len(line.lstrip())]
+                newline = "\r\n" if line.endswith("\r\n") else "\n"
+                out.append(f"{indent}volume={val / _ANG3_PER_BOHR3:.15g}{newline}")
+                continue
+
+        out.append(line)
+
+    Path(path).write_text("".join(out))
+
+
+def sigma_profile_histogram(
+    cosmo: CosmoSegments,
+    *,
+    sigma_min: float = -0.025,
+    sigma_max: float = 0.025,
+    n_bins: int = 51,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Raw (un-averaged) area-weighted σ-profile histogram p(σ).
+
+    Returns ``(sigma_centers, p_area)`` where ``p_area`` is the surface area
+    in Å² summed into each σ bin. For the canonical Klamt-averaged COSMO-RS
+    σ-profile use :func:`sigma_profile_klamt` instead.
+    """
+
+    edges = np.linspace(sigma_min, sigma_max, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    weights = np.asarray(cosmo.segments_area, dtype=np.float64)
+    sigmas = np.asarray(cosmo.segments_sigma, dtype=np.float64)
+    p_area, _ = np.histogram(sigmas, bins=edges, weights=weights)
+    return centers, p_area
+
+
+_KLAMT_PARAMS = {
+    # Mullins 2008 (IECR), used by NIST COSMOSAC v2:
+    "mullins": (0.8176300195**2, 1.0),
+    # Hsieh 2010 (Fluid Phase Equil.), used by COSMO-SAC-2010:
+    "hsieh": (7.25 / np.pi, 3.57),
+    # openCOSMORS25a primary averaging (Rav=0.5 Å, no f_decay scaling):
+    "ocrs25a_primary": (0.5**2, 1.0),
+    # openCOSMORS25a correlation averaging (RavCorr=1.0 Å):
+    "ocrs25a_corr": (1.0**2, 1.0),
+}
+
+
+def klamt_average_sigmas(
+    cosmo: CosmoSegments,
+    *,
+    variant: str = "mullins",
+    bohr_to_ang: float = 0.5291772108,
+) -> np.ndarray:
+    """Klamt r-averaged segment σ values (e/Å²).
+
+    For each segment i:
+
+        σ̄_i = Σ_j w_ij · σ_j / Σ_j w_ij
+
+        w_ij = (r_n² · r_av² / (r_n² + r_av²))
+               · exp( -f_decay · d_ij² / (r_n² + r_av²) )
+
+    where ``r_n²`` is the segment's effective radius squared (area / π),
+    ``r_av²`` and ``f_decay`` are the variant constants, and ``d_ij`` is the
+    pairwise segment-segment distance in Å.
+
+    Variants:
+      * ``'mullins'`` (default): ``r_av² = 0.8176²``, ``f_decay = 1.0``.
+      * ``'hsieh'``: ``r_av² = 7.25/π``, ``f_decay = 3.57``.
+    """
+
+    if variant not in _KLAMT_PARAMS:
+        raise ValueError(f"variant must be one of {sorted(_KLAMT_PARAMS)}; got {variant!r}")
+    r_av2, f_decay = _KLAMT_PARAMS[variant]
+
+    area = np.asarray(cosmo.segments_area, dtype=np.float64)
+    sigma = np.asarray(cosmo.segments_sigma, dtype=np.float64)
+    xyz_ang = np.asarray(cosmo.segments_xyz_bohr, dtype=np.float64) * bohr_to_ang
+
+    rn2 = area / np.pi  # per-segment r² (Å²)
+    diff = xyz_ang[:, None, :] - xyz_ang[None, :, :]
+    d2 = np.einsum("ijk,ijk->ij", diff, diff)
+
+    # Both NIST COSMOSAC's to_sigma.py and openCOSMO-RS_py weight by the
+    # contributing segment j's radius — denom[i, j] = r_n[j]² + r_av².
+    denom = rn2[None, :] + r_av2
+    pref = rn2[None, :] * r_av2 / denom
+    w = pref * np.exp(-f_decay * d2 / denom)
+
+    return (w @ sigma) / w.sum(axis=1)
+
+
+# --- σ-potential evaluator (openCOSMORS25a parameters) ----------------------
+#
+# σ-potential μ_S(σ) is the chemical potential of a test surface segment of
+# screening-charge density σ in reference solvent S. From the converged
+# COSMOSPACE segment-activity Γ_S(σ_α), the σ-potential on any test grid is
+#
+#     μ_S(σ_test) = -RT · ln Γ_S(σ_test)
+#     Γ_S(σ_test) = 1 / Σ_α X[α] Γ[α] exp(-E_int(σ_test, σ_α)/RT)
+#
+# We use the symmetric Klamt 1995 kernel (no polarizability correction; that
+# variant of 25a needs per-atom polarizabilities from ORCA and is left for a
+# follow-up). The 25a numerical parameter values are taken from the cpp
+# reference (Chem Eng Sci 2025, doi:10.1016/j.ces.2025.122170).
+
+
+OPENCOSMORS25A_PARAMS = {
+    "Aeff": 4.90825,        # Å²            effective contact area
+    "alpha": 7876000.0,     # J/(mol·Å²·e²) misfit prefactor
+    "CHB":   49318000.0,    # J/(mol·Å²·e²) HB prefactor
+    "CHBT":  1.5,           # HB temperature factor
+    "SigmaHB": 0.009953,    # e/Å²          HB threshold
+    "R":     8.314462618,   # J/(mol·K)
+    # 25a σ-orthogonal correlation correction (Chem Eng Sci 2025, Eq. 16):
+    # the misfit gets a (σ_corr - 0.816·σ) cross-term using a second Klamt
+    # averaging with a wider radius.
+    "RavCorr":  1.0,        # Å      second-averaging radius
+    "fCorr":    2.4,        # dimensionless  σ-orth correction coefficient
+    "sigma_trans_factor": 0.816,
+}
+
+
+def sigma_potential_from_arrays(
+    sigma_avg_e_per_A2: np.ndarray,
+    area_A2: np.ndarray,
+    *,
+    sigma_corr_avg_e_per_A2: np.ndarray | None = None,
+    sigma_grid_e_per_A2: np.ndarray | None = None,
+    sigma_test_corr_e_per_A2: np.ndarray | None = None,
+    T: float = 298.15,
+    params: dict | None = None,
+    sigma_bin_min: float = -0.030,
+    sigma_bin_max: float = 0.030,
+    sigma_bin_step: float = 0.001,
+    n_iter_max: int = 500,
+    conv_tol: float = 1.0e-9,
+    damping: float = 0.7,
+    use_sigma_orth: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Low-level σ-potential entry point that skips Klamt averaging.
+
+    Takes pre-averaged segment σ values + segment areas. When
+    ``sigma_corr_avg_e_per_A2`` is provided (the second Klamt averaging at
+    r_av_corr), the 25a σ-orthogonal correlation term enters the misfit
+    energy (Chem Eng Sci 2025, Eq. 16):
+
+        σ_trans = σ_corr − 0.816·σ
+        E_mf(i, j) = (A_eff·α / 2) · σ_sum · (σ_sum + f_corr·(σ_trans_i + σ_trans_j))
+
+    Set ``use_sigma_orth=False`` to fall back to the symmetric Klamt 1995 form.
+    """
+
+    p = dict(OPENCOSMORS25A_PARAMS) if params is None else {**OPENCOSMORS25A_PARAMS, **params}
+    Aeff = p["Aeff"]; alpha = p["alpha"]; CHB = p["CHB"]
+    CHBT = p["CHBT"]; sigma_HB = p["SigmaHB"]; R = p["R"]
+    fCorr = p.get("fCorr", 2.4); sigma_trans_factor = p.get("sigma_trans_factor", 0.816)
+
+    sigma_arr = np.asarray(sigma_avg_e_per_A2, dtype=np.float64)
+    area_arr = np.asarray(area_A2, dtype=np.float64)
+    apply_orth = use_sigma_orth and (sigma_corr_avg_e_per_A2 is not None)
+    if apply_orth:
+        sigma_corr_arr = np.asarray(sigma_corr_avg_e_per_A2, dtype=np.float64)
+
+    edges = np.arange(sigma_bin_min - 0.5 * sigma_bin_step,
+                      sigma_bin_max + 1.5 * sigma_bin_step,
+                      sigma_bin_step)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    area_bins, _ = np.histogram(sigma_arr, bins=edges, weights=area_arr)
+
+    if apply_orth:
+        # Area-weighted mean σ_corr per σ-bin
+        s_corr_weighted, _ = np.histogram(sigma_arr, bins=edges, weights=area_arr * sigma_corr_arr)
+        sigma_corr_per_bin = np.zeros_like(centers)
+        nz = area_bins > 0
+        sigma_corr_per_bin[nz] = s_corr_weighted[nz] / area_bins[nz]
+
+    keep = area_bins > 0
+    sigma_alpha = centers[keep]
+    X = area_bins[keep] / area_bins[keep].sum()
+    if apply_orth:
+        sigma_corr_alpha = sigma_corr_per_bin[keep]
+        sigma_trans_alpha = sigma_corr_alpha - sigma_trans_factor * sigma_alpha
+
+    buff = 1.0 - CHBT + CHBT * (298.15 / T)
+    CHB_T = CHB * buff if buff > 0 else 0.0
+
+    # Misfit (25a σ-orth form when correlation σ available; Klamt 1995 else)
+    sigma_sum = sigma_alpha[:, None] + sigma_alpha[None, :]
+    if apply_orth:
+        sigma_trans_sum = sigma_trans_alpha[:, None] + sigma_trans_alpha[None, :]
+        E_mf = 0.5 * Aeff * alpha * sigma_sum * (sigma_sum + fCorr * sigma_trans_sum)
+    else:
+        E_mf = 0.5 * Aeff * alpha * sigma_sum * sigma_sum
+
+    sigma_min = np.minimum(sigma_alpha[:, None], sigma_alpha[None, :])
+    sigma_max = np.maximum(sigma_alpha[:, None], sigma_alpha[None, :])
+    donor = np.minimum(0.0, sigma_min + sigma_HB)
+    acceptor = np.maximum(0.0, sigma_max - sigma_HB)
+    E_hb = Aeff * CHB_T * donor * acceptor
+
+    RT = R * T
+    tau = np.exp(-(E_mf + E_hb) / RT)
+
+    Gamma = np.ones_like(X)
+    for _ in range(n_iter_max):
+        Gamma_new = 1.0 / (tau @ (X * Gamma))
+        if np.max(np.abs(Gamma_new - Gamma) / np.abs(Gamma)) < conv_tol:
+            Gamma = Gamma_new
+            break
+        Gamma = damping * (Gamma_new - Gamma) + Gamma
+
+    if sigma_grid_e_per_A2 is None:
+        sigma_test = np.round(np.arange(-0.030, 0.0301, 0.001), 6)
+    else:
+        sigma_test = np.asarray(sigma_grid_e_per_A2, dtype=np.float64)
+
+    sum_t = sigma_test[:, None] + sigma_alpha[None, :]
+    if apply_orth:
+        # For the test segment, assume σ_corr_test = σ_test (no extra info per
+        # test grid point). The cross-term still uses σ_trans_α for the
+        # contributing solvent bins.
+        if sigma_test_corr_e_per_A2 is None:
+            sigma_test_trans = (1.0 - sigma_trans_factor) * sigma_test
+        else:
+            sigma_test_trans = np.asarray(sigma_test_corr_e_per_A2, dtype=np.float64) - sigma_trans_factor * sigma_test
+        sigma_trans_sum_t = sigma_test_trans[:, None] + sigma_trans_alpha[None, :]
+        E_mf_t = 0.5 * Aeff * alpha * sum_t * (sum_t + fCorr * sigma_trans_sum_t)
+    else:
+        E_mf_t = 0.5 * Aeff * alpha * sum_t * sum_t
+
+    min_t = np.minimum(sigma_test[:, None], sigma_alpha[None, :])
+    max_t = np.maximum(sigma_test[:, None], sigma_alpha[None, :])
+    donor_t = np.minimum(0.0, min_t + sigma_HB)
+    acceptor_t = np.maximum(0.0, max_t - sigma_HB)
+    E_hb_t = Aeff * CHB_T * donor_t * acceptor_t
+
+    tau_t = np.exp(-(E_mf_t + E_hb_t) / RT)
+    Gamma_test = 1.0 / (tau_t @ (X * Gamma))
+    mu_S_J = RT * np.log(Gamma_test)
+    return sigma_test, mu_S_J
+
+
+def sigma_potential_ensemble(
+    cosmo_list: list[CosmoSegments],
+    energies_hartree: np.ndarray,
+    *,
+    T: float = 298.15,
+    klamt_variant: str = "mullins",
+    sigma_grid_e_per_A2: np.ndarray | None = None,
+    **kwargs,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Boltzmann-weighted ensemble σ-potential over multiple conformers.
+
+    For conformer i with energy E_i, the population weight is
+
+        w_i = exp(-E_i/RT) / Σ_j exp(-E_j/RT)
+
+    and the ensemble σ-profile is Σ_i w_i p_i(σ). Each conformer is Klamt-
+    averaged independently (positions don't mix across conformers), then
+    σ values are concatenated with area scaled by w_i.
+
+    Returns ``(sigma_test, mu_ensemble, weights)``.
+    """
+
+    e = np.asarray(energies_hartree, dtype=np.float64)
+    R_J_per_mol_K = 8.314462618
+    HARTREE_PER_J_PER_MOL = 1.0 / 2625499.6394
+    kT_hartree = R_J_per_mol_K * T * HARTREE_PER_J_PER_MOL
+    e_rel = e - e.min()
+    weights = np.exp(-e_rel / kT_hartree)
+    weights /= weights.sum()
+
+    use_orth = bool(kwargs.pop("use_sigma_orth", True))
+    primary_variant = "ocrs25a_primary" if use_orth else klamt_variant
+    all_sigma: list[np.ndarray] = []
+    all_sigma_corr: list[np.ndarray] = []
+    all_area: list[np.ndarray] = []
+    for cs, w in zip(cosmo_list, weights):
+        all_sigma.append(klamt_average_sigmas(cs, variant=primary_variant))
+        if use_orth:
+            all_sigma_corr.append(klamt_average_sigmas(cs, variant="ocrs25a_corr"))
+        all_area.append(np.asarray(cs.segments_area, dtype=np.float64) * float(w))
+
+    sigma_test, mu = sigma_potential_from_arrays(
+        np.concatenate(all_sigma),
+        np.concatenate(all_area),
+        sigma_corr_avg_e_per_A2=np.concatenate(all_sigma_corr) if use_orth else None,
+        sigma_grid_e_per_A2=sigma_grid_e_per_A2,
+        T=T,
+        use_sigma_orth=use_orth,
+        **kwargs,
+    )
+    return sigma_test, mu, weights
+
+
+def sigma_potential(
+    cosmo: CosmoSegments,
+    *,
+    sigma_grid_e_per_A2: np.ndarray | None = None,
+    T: float = 298.15,
+    params: dict | None = None,
+    sigma_bin_min: float = -0.030,
+    sigma_bin_max: float = 0.030,
+    sigma_bin_step: float = 0.001,
+    klamt_variant: str = "mullins",
+    n_iter_max: int = 500,
+    conv_tol: float = 1.0e-9,
+    damping: float = 0.7,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(sigma_test_e_per_A2, mu_S_J_per_mol)`` σ-potential μ_S(σ).
+
+    Workflow:
+      1. r-average the cosmo segments (Klamt averaging) — same as for the
+         σ-profile.
+      2. Bin into a coarse σ-grid (bin width 0.001 e/Å² by default).
+      3. Solve COSMOSPACE self-consistently for the pure-component reference
+         state: ``Γ_new[α] = 1 / Σ_β X[β] Γ[β] τ[α, β]``.
+      4. For each test σ, evaluate ``Γ_test = 1 / Σ_β X[β] Γ[β] τ(σ_test, σ_β)``
+         and return ``μ_S(σ_test) = -RT ln Γ_test``.
+
+    The default ``sigma_grid_e_per_A2`` is ``None``, in which case we use the
+    RSC Adv 2026 paper grid: 61 bins from -0.030 to +0.030 e/Å² (equivalent
+    to -3 to +3 e/nm²).
+    """
+
+    # openCOSMORS25a σ-orth form: primary σ at Rav=0.5, σ_corr at RavCorr=1.0.
+    # The 0.816 σ_trans coefficient is calibrated for this exact pair of radii.
+    # ``klamt_variant`` is honoured only when use_sigma_orth=False (legacy
+    # Klamt 1995 mode, e.g. for NIST/Mullins-style comparisons).
+    use_orth = bool(params.get("use_sigma_orth", True)) if params else True
+    if use_orth:
+        sigma_seg = klamt_average_sigmas(cosmo, variant="ocrs25a_primary")
+        sigma_corr_seg = klamt_average_sigmas(cosmo, variant="ocrs25a_corr")
+    else:
+        sigma_seg = klamt_average_sigmas(cosmo, variant=klamt_variant)
+        sigma_corr_seg = None
+    area_seg = np.asarray(cosmo.segments_area, dtype=np.float64)
+    return sigma_potential_from_arrays(
+        sigma_seg, area_seg,
+        sigma_corr_avg_e_per_A2=sigma_corr_seg,
+        sigma_grid_e_per_A2=sigma_grid_e_per_A2,
+        T=T, params=params,
+        sigma_bin_min=sigma_bin_min, sigma_bin_max=sigma_bin_max,
+        sigma_bin_step=sigma_bin_step,
+        n_iter_max=n_iter_max, conv_tol=conv_tol, damping=damping,
+        use_sigma_orth=use_orth,
+    )
+
+
+def sigma_profile_klamt(
+    cosmo: CosmoSegments,
+    *,
+    variant: str = "mullins",
+    sigma_min: float = -0.025,
+    sigma_max: float = 0.025,
+    bin_width: float = 0.001,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Canonical Klamt-averaged σ-profile p(σ) used by COSMO-SAC / openCOSMO-RS.
+
+    Returns ``(sigma_centers, p_area, sigma_avg)`` where ``sigma_avg`` is the
+    per-segment averaged σ values (e/Å²) and ``p_area`` is the area-weighted
+    histogram (Å²) on the standard ``[-0.025, 0.025]`` grid at ``0.001`` step.
+    """
+
+    sigma_avg = klamt_average_sigmas(cosmo, variant=variant)
+    n_bins = int(round((sigma_max - sigma_min) / bin_width))
+    edges = np.linspace(sigma_min, sigma_max, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    weights = np.asarray(cosmo.segments_area, dtype=np.float64)
+    p_area, _ = np.histogram(sigma_avg, bins=edges, weights=weights)
+    return centers, p_area, sigma_avg

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=64", "wheel", "numpy>=1.24.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -78,6 +78,9 @@ mlxmolkit = [
     # "rm1/*.json" glob was for exactly this file.
     "nddo/*.json",
     "data/bcc/*.json",
+    # g-xtb / GFN parameter tables, added with mlxmolkit/xtb/.
+    "xtb/params/*.npz",
+    "xtb/params/gfn0/*.txt",
 ]
 
 [tool.pytest.ini_options]
