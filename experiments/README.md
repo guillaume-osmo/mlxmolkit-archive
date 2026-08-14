@@ -127,9 +127,66 @@ padding + assembly         26 ms   1.6%
 per-orbital precompute    2.6 ms   0.2%
 ```
 
+## 5. Iteration count *is* predictable from 2D descriptors — and sorting on it still loses
+
+`experiments/iteration_count_vs_flexibility.py`
+
+MMFF L-BFGS iteration counts span **65×** over 40 drug-like molecules (20 for
+benzene, 1300 for hexadecane), and the spread is not noise — it tracks
+**flexibility**, not size:
+
+| descriptor | Pearson r |
+|---|---|
+| rotatable bonds | **0.807** |
+| atoms (with H) | 0.791 |
+| MW | 0.682 |
+| **rings** | **−0.327** |
+| TPSA | 0.079 |
+
+Rings correlate *negatively*: rigid aromatics are the cheapest things in the set
+(benzene 20, chlorobenzene 24, naphthalene 36), floppy chains the most expensive.
+Physically sensible — soft torsional modes condition the Hessian badly.
+
+So difficulty is predictable a priori, which suggests sorting molecules into
+difficulty-matched batches so one straggler cannot hold up a dispatch. **It does
+not work.** On `mmff_optimize_metal_multi_mol`, 40 molecules:
+
+| | ms | vs one dispatch |
+|---|---|---|
+| **one dispatch of 40** | **2535** | **1.00×** |
+| 4 buckets, by atom count | 5669 | 0.45× |
+| 4 buckets, by difficulty | 7023 | 0.36× |
+| 4 buckets, random | 7310 | 0.35× |
+
+Kernel-launch overhead dwarfs any straggler saving, so splitting a batch costs
+2–3× no matter how it is split. Atom-count sorting being the least-bad split
+(0.45× vs 0.35×) does confirm padding-to-`max_dim` is real — just an order of
+magnitude smaller than a launch. **The lever points the other way: make batches
+bigger.**
+
+On `mmff_optimize_molecules_batch` sorting cannot help even in principle — it is
+a Python `for` loop over molecules (10 benzenes cost 10.8× one benzene), so cost
+is additive and there is no straggler to eliminate.
+
+What the flexibility finding *did* buy: it exposed that the Metal multi-mol path
+ran all `max_iters` unconditionally. Fixing that (per-conformer `grad_tol` check
+at the existing sync points) made `max_iters` a cap rather than a cost there —
+2.65× at `max_iters=2000`, energies unchanged to 6.7e-06 kcal/mol.
+
+**Reconsider if:** dispatch overhead falls far enough that a launch is cheap
+relative to the iteration work — then straggler-matching becomes the dominant
+term and the ranking above should flip.
+
 ---
 
 ## Method note
+
+**Rebuild the inputs inside every timed run.** The MMFF optimizers mutate their
+RDKit molecules in place, so a parameter sweep that builds the molecules once
+and reuses them feeds each run the previous run's optimised geometry. The tell
+is an impossible result — iteration counts that *fall* as the budget rises
+(103/277/401 at `max_iters=500`, then 3/3/63 at 2000). Treat non-monotonicity in
+a monotonic-by-construction sweep as harness contamination before believing it.
 
 **Do not size an optimisation target with cProfile in this codebase.** Its
 per-call overhead inflates anything doing many small Python statements: it put

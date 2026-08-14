@@ -40,6 +40,8 @@ class MetalBatchResult:
     grad_norms: np.ndarray
     n_iters: int
     n_conformers: int
+    per_conf_iters: Optional[np.ndarray] = None
+    converged: Optional[np.ndarray] = None
 
 
 def _lbfgs_direction_batch(
@@ -219,6 +221,7 @@ def mmff_optimize_metal_multi_mol(
     max_step_per_atom: float = 0.3,
     lbfgs_m: int = 10,
     grad_scale: float = 0.1,
+    grad_tol: float = 1e-4,
 ) -> MultiMolResult:
     """
     Optimise many molecules simultaneously in a **single Metal kernel launch**
@@ -237,9 +240,24 @@ def mmff_optimize_metal_multi_mol(
                    every embedded conformer is optimised.
         max_iters, eval_freq, max_step_per_atom, lbfgs_m, grad_scale:
             same semantics as mmff_optimize_metal_batch().
+        grad_tol: convergence tolerance on the largest per-atom gradient
+            norm.  Applied to the same scaled gradient the result reports as
+            ``grad_norms``, so the two always agree; note that means
+            ``grad_scale`` shifts it.  Checked at the existing eval_freq
+            sync points, so it costs no extra GPU->CPU round trips; the
+            loop exits as soon as every conformer is under it.
 
     Returns:
         MultiMolResult containing per-molecule MetalBatchResult objects.
+        Each carries ``per_conf_iters`` — the iteration at which that
+        conformer first met ``grad_tol`` — and ``converged``.
+
+    Note:
+        Because the batch advances in lockstep, the loop can only stop when
+        the *slowest* conformer converges.  Iteration counts vary ~65x over
+        drug-like molecules and track flexibility (rotatable bonds r=0.81,
+        rings *negatively*), so one floppy chain sets the cost for the whole
+        batch.  ``per_conf_iters`` is what lets a caller see that happening.
     """
     gs_val = grad_scale
 
@@ -307,6 +325,39 @@ def mmff_optimize_metal_multi_mol(
     y_hist: list[mx.array] = []
     rho_hist: list[mx.array] = []
 
+    # Iteration at which each conformer first met grad_tol; max_iters means
+    # "never did".  Filled in at the sync points below.
+    per_conf_iters = np.full(total_confs, max_iters, dtype=np.int32)
+    conv_mask = np.zeros(total_confs, dtype=bool)
+    iters_used = max_iters
+
+    def _max_grad_norm(g_scaled: mx.array) -> np.ndarray:
+        """Largest per-atom gradient norm per conformer.
+
+        Takes the *scaled* gradient, so this is the same quantity the result
+        reports as ``grad_norms`` — otherwise a conformer could come back
+        with grad_norms below grad_tol and converged=False.  Padded atoms
+        carry zero gradient and so never set the maximum.
+        """
+        gn = mx.max(
+            mx.sqrt(
+                mx.sum(
+                    mx.reshape(g_scaled, (total_confs, max_atoms, 3)) ** 2,
+                    axis=-1,
+                )
+            ),
+            axis=1,
+        )
+        mx.eval(gn)
+        return np.array(gn)
+
+    def _record_converged(g_scaled: mx.array, iteration: int) -> bool:
+        """Mark conformers under grad_tol; return True once all are."""
+        newly = (~conv_mask) & (_max_grad_norm(g_scaled) <= grad_tol)
+        per_conf_iters[newly] = iteration
+        conv_mask[newly] = True
+        return bool(conv_mask.all())
+
     # ---- 4. Optimisation loop with energy guard ------------------------
     for it in range(max_iters):
         d = _lbfgs_direction_batch(g_sc, s_hist, y_hist, rho_hist)
@@ -359,6 +410,10 @@ def mmff_optimize_metal_multi_mol(
             best_x = mx.where(improved, x, best_x)
             best_e = mx.minimum(e_new, best_e)
             mx.eval(best_x, best_e)
+
+            if _record_converged(g_sc, it + 1):
+                iters_used = it + 1
+                break
 
     # At the end, revert ALL conformers to their best-seen positions
     # and recompute energy + gradient at those positions
@@ -419,6 +474,12 @@ def mmff_optimize_metal_multi_mol(
             best_e = mx.minimum(e_new, best_e)
             mx.eval(best_x, best_e)
 
+            # The polish pass restarts L-BFGS from best_x, so a conformer
+            # that already met grad_tol can drift back out; re-test all of
+            # them rather than trusting the main loop's verdict.
+            if bool((_max_grad_norm(g_sc) <= grad_tol).all()):
+                break
+
     # Final: use absolute best positions
     x = best_x
 
@@ -457,13 +518,16 @@ def mmff_optimize_metal_multi_mol(
                     a, mol_pos[k, a].astype(float).tolist()
                 )
 
+        sl = slice(conf_cursor, conf_cursor + C)
         results.append(
             MetalBatchResult(
                 energies=mol_e,
                 positions=mol_pos,
                 grad_norms=mol_gn_max,
-                n_iters=max_iters,
+                n_iters=iters_used,
                 n_conformers=C,
+                per_conf_iters=per_conf_iters[sl].copy(),
+                converged=conv_mask[sl].copy(),
             )
         )
         conf_cursor += C
