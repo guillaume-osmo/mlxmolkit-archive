@@ -605,12 +605,67 @@ def _build_fock(H, P, info, atoms, coords, pair_w=None):
                     F[pl, pk] += P[pl, pk] * pp_fac_off
 
     # === Two-center contribution (full 10x10 w tensor) ===
+    # sp pairs are contracted in groups of one orbital shape and scattered in
+    # a single accumulation; d pairs keep the scalar routine. On cholesterol
+    # this loop ran 2701 times per SCF iteration and 20 iterations per energy,
+    # 54k calls each doing three 4x4x4x4 einsums on arrays far too small to
+    # cover numpy's per-call overhead.
+    sp_by_shape: dict[tuple[int, int], list[tuple[int, int]]] = {}
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
-            F = _pair_fock_twocentre(
-                F, P, params[i], params[j], starts[i], starts[j],
-                coords[i], coords[j],
-                w=None if pair_w is None else pair_w.get((i, j)))
+            pA, pB = params[i], params[j]
+            if pA.n_basis == 9 or pB.n_basis == 9 or (
+                    pair_w is not None and pair_w.get((i, j)) is None):
+                F = _pair_fock_twocentre(
+                    F, P, pA, pB, starts[i], starts[j], coords[i], coords[j],
+                    w=None if pair_w is None else pair_w.get((i, j)))
+            else:
+                sp_by_shape.setdefault((pA.n_basis, pB.n_basis),
+                                       []).append((i, j))
+
+    if sp_by_shape:
+        from .rotation_batch import rotate_pairs
+
+        flat_idx: list[np.ndarray] = []
+        flat_val: list[np.ndarray] = []
+        for (nA, nB), pairs in sp_by_shape.items():
+            if pair_w is not None:
+                W = np.stack([pair_w[(i, j)] for i, j in pairs])
+            else:
+                W = np.stack(rotate_pairs(
+                    [(params[i], params[j]) for i, j in pairs],
+                    [(coords[i], coords[j]) for i, j in pairs]))
+            W = W[:, :nA, :nA, :nB, :nB]
+
+            ia = np.asarray([starts[i] for i, _ in pairs])
+            ib = np.asarray([starts[j] for _, j in pairs])
+            rows_a = ia[:, None] + np.arange(nA)
+            rows_b = ib[:, None] + np.arange(nB)
+
+            P_AA = P[rows_a[:, :, None], rows_a[:, None, :]]
+            P_BB = P[rows_b[:, :, None], rows_b[:, None, :]]
+            P_AB = P[rows_a[:, :, None], rows_b[:, None, :]]
+
+            t_aa = np.einsum('gabcd,gcd->gab', W, P_BB)
+            t_bb = np.einsum('gabcd,gab->gcd', W, P_AA)
+            t_ab = -0.5 * np.einsum('gabcd,gbd->gac', W, P_AB)
+
+            for rows, cols, vals in (
+                (rows_a, rows_a, t_aa),
+                (rows_b, rows_b, t_bb),
+                (rows_a, rows_b, t_ab),
+                (rows_b, rows_a, np.swapaxes(t_ab, 1, 2)),
+            ):
+                flat_idx.append(
+                    (rows[:, :, None] * n_basis + cols[:, None, :]).ravel())
+                flat_val.append(vals.ravel())
+
+        # One accumulation rather than per-pair `+=`: several pairs land on the
+        # same atom's diagonal block, so the scatter has to add rather than
+        # assign, and bincount does that in a single pass.
+        F += np.bincount(np.concatenate(flat_idx),
+                         weights=np.concatenate(flat_val),
+                         minlength=n_basis * n_basis).reshape(n_basis, n_basis)
 
     return F
 
