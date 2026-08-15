@@ -19,9 +19,11 @@ Two SCF entry points:
 """
 from __future__ import annotations
 
+import os
+import warnings
+
 import mlx.core as mx
 import numpy as np
-import os
 from .params import RM1_PARAMS, ElementParams, EV_TO_KCAL, ANG_TO_BOHR
 from .methods import get_params, METHOD_PARAMS
 from .integrals import (
@@ -1050,6 +1052,7 @@ def nddo_energy(
     method: str = 'RM1',
     native: bool = False,
     molecular_charge: float = 0.0,
+    P_init: np.ndarray | None = None,
 ) -> dict:
     """Compute NDDO semi-empirical single-point energy.
 
@@ -1093,7 +1096,7 @@ def nddo_energy(
         return _nddo_energy_at_geometry(
             atoms, coords, max_iter=max_iter, conv_tol=conv_tol, verbose=verbose,
             use_metal=use_metal, method=method, native=native,
-            molecular_charge=molecular_charge)
+            molecular_charge=molecular_charge, P_init=P_init)
     PARAMS_ = get_params(method)
     params_ = [PARAMS_[z] for z in atoms]
     # sp-only molecules gain nothing — precompute_pair_w already hoists their
@@ -1103,7 +1106,7 @@ def nddo_energy(
         return _nddo_energy_at_geometry(
             atoms, coords, max_iter=max_iter, conv_tol=conv_tol, verbose=verbose,
             use_metal=use_metal, method=method, native=native,
-            molecular_charge=molecular_charge)
+            molecular_charge=molecular_charge, P_init=P_init)
     coords_ = np.asarray(coords, dtype=np.float64)
     specs_ = [(params_[i], params_[j], coords_[i], coords_[j])
               for i in range(len(atoms)) for j in range(i + 1, len(atoms))]
@@ -1111,7 +1114,7 @@ def nddo_energy(
         return _nddo_energy_at_geometry(
             atoms, coords, max_iter=max_iter, conv_tol=conv_tol, verbose=verbose,
             use_metal=use_metal, method=method, native=native,
-            molecular_charge=molecular_charge)
+            molecular_charge=molecular_charge, P_init=P_init)
 
 
 def _nddo_energy_at_geometry(
@@ -1125,6 +1128,7 @@ def _nddo_energy_at_geometry(
     method: str = 'RM1',
     native: bool = False,
     molecular_charge: float = 0.0,
+    P_init: np.ndarray | None = None,
 ) -> dict:
     """Compute NDDO semi-empirical single-point energy.
 
@@ -1199,24 +1203,49 @@ def _nddo_energy_at_geometry(
         for k in range(n_sp):
             P[sA + k, sA + k] = p.n_valence / n_sp
 
-    # Prepare Metal Fock kernel inputs (precompute once)
+    # A caller stepping along a reaction path or a geometry optimisation has
+    # a converged density from the previous step, and consecutive geometries
+    # differ by far less than the neutral-atom guess does from either. The
+    # shape check is the whole safety condition: same basis size means same
+    # atoms in the same order, and a mismatch falls back to the neutral guess
+    # rather than reinterpreting somebody else's density.
+    #
+    # The neutral guess is deliberate and is not replaced lightly — every atom
+    # starts neutral so the SCF cannot begin inside a charge-transfer basin,
+    # which an H_core-diagonalisation guess did for EtBr (q(Br) = +0.22 against
+    # MOPAC's -0.16). A previous geometry's *converged* density is safe in a
+    # way an H_core guess is not: it is already the right root.
+    if P_init is not None:
+        P_init = np.asarray(P_init, dtype=np.float64)
+        if P_init.shape == P.shape:
+            P = P_init.copy()
+        elif verbose:
+            print(f"  ignoring P_init of shape {P_init.shape}, "
+                  f"expected {P.shape}")
+
+    # There is no single-molecule Metal Fock kernel. `fock_metal` provides
+    # `build_fock_batch_metal`, which is a batch kernel — one dispatch across
+    # many molecules — and `nddo_energy_batch` is the entry point for it. The
+    # branch here called a `build_fock_metal` that has never existed in this
+    # repository's history, so `nddo_energy(..., use_metal=True)` raised
+    # ImportError rather than doing anything on the GPU. No test covered it;
+    # every test either passes `use_metal=False` or goes through the batch API.
+    #
+    # Falling back is the honest behaviour: a crash helps nobody, and silently
+    # claiming the GPU would be worse than either. One molecule would not gain
+    # from the GPU anyway — a cholesterol Fock build is ~1 ms of CPU against a
+    # per-dispatch latency of the same order, which is the reason the kernel is
+    # written across a batch axis in the first place.
     if use_metal:
-        from .fock_metal import build_fock_metal
-        atom_params_metal = np.zeros((n_atoms, 5), dtype=np.float32)
-        for i, p in enumerate(params):
-            atom_params_metal[i] = [p.gss, p.gsp, p.gpp, p.gp2, p.hsp]
-        atom_starts_metal = np.zeros(n_atoms + 1, dtype=np.int32)
-        for i, p in enumerate(params):
-            atom_starts_metal[i + 1] = atom_starts_metal[i] + p.n_basis
+        warnings.warn(
+            "use_metal=True is not supported for a single molecule: the Metal "
+            "Fock kernel is a batch kernel. Falling back to the CPU build. Use "
+            "nddo_energy_batch(..., use_metal=True) to reach the GPU.",
+            RuntimeWarning, stacklevel=3,
+        )
+        use_metal = False
 
     def _fock(H, P):
-        if use_metal:
-            return build_fock_metal(
-                H, P, atom_params_metal,
-                info['basis_to_atom'], info['basis_type'],
-                atom_starts_metal, ssss.astype(np.float32),
-                n_basis, n_atoms,
-            )
         return _build_fock(H, P, info, atoms, coords, pair_w=_pair_w,
                            plan=_fock_plan_)
 

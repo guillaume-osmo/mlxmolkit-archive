@@ -14,7 +14,8 @@ from __future__ import annotations
 import numpy as np
 import mlx.core as mx
 
-from .packing import packed_size, unpack
+from .fock_d import fock_d_one_center
+from .packing import index_matrix, packed_size, unpack
 
 
 _FOCK_BATCH_SOURCE = """
@@ -354,10 +355,17 @@ def build_fock_batch_metal(batch) -> np.ndarray:
     return ctx.build_fock(batch.P)
 
 
-def build_fock_batch_cpu(batch) -> np.ndarray:
-    """Build Fock matrices for all molecules on CPU (reference).
+def build_fock_batch_cpu_reference(batch) -> np.ndarray:
+    """Build Fock matrices for all molecules on CPU, one scalar element at a time.
 
-    Uses the same data structures as Metal for verification.
+    The obvious implementation, kept as the oracle
+    :func:`build_fock_batch_cpu` is checked against. It is deliberately dumb —
+    five nested Python loops over (molecule, pair, mu, nu, lam, sig) — so that
+    reading it is enough to believe it.
+
+    Do not call this in anger. It runs 256 scalar iterations per sp pair per
+    molecule per SCF iteration: 57 s for a 200-molecule PM6 batch, against
+    2.5 s for simply looping `nddo_energy` over the same molecules.
     """
     N = batch.n_mols
     MB = batch.max_basis
@@ -455,5 +463,161 @@ def build_fock_batch_cpu(batch) -> np.ndarray:
                                 F[lam, mu] -= 0.5 * P[sig, nu] * wval
 
         F_all[mol, :n_bas, :n_bas] = F
+
+    return F_all
+
+
+def _fock_batch_plan(batch):
+    """Everything a batched CPU Fock build needs that does not depend on P.
+
+    The pair list, the orbital shapes, the unpacked w tensors and the flat
+    scatter indices are all fixed for a batch's geometry, yet the reference
+    path rederived them inside its innermost loop on every SCF iteration.
+
+    Groups are keyed on (nA, nB) across the *whole batch*, not per molecule:
+    a 200-molecule batch of ordinary organics has three or four distinct
+    orbital shapes and tens of thousands of pairs, so one contraction per
+    shape replaces one per pair.
+
+    Returns:
+        (one_centre, groups) where `groups` is a list of
+        (w, rows_a, rows_b, flat) with `w` of shape (G, nA, nA, nB, nB) and
+        `flat` the concatenated scatter indices into a flattened (N, MB, MB).
+    """
+    N, MB = batch.n_mols, batch.max_basis
+    stride = MB * MB
+
+    shapes: dict[tuple[int, int], list] = {}
+    one_centre = []
+    for mol in range(N):
+        n_at = batch.n_atoms_arr[mol]
+        starts = batch.atom_starts[mol]
+        for a in range(n_at):
+            if starts[a + 1] - starts[a] == 9:
+                one_centre.append((mol, a, int(starts[a])))
+            for b in range(a + 1, n_at):
+                off = int(batch.pair_offset[mol, a, b])
+                if off < 0:          # no block stored for this pair
+                    continue
+                nA = int(starts[a + 1] - starts[a])
+                nB = int(starts[b + 1] - starts[b])
+                shapes.setdefault((nA, nB), []).append(
+                    (mol, int(starts[a]), int(starts[b]), off))
+
+    groups = []
+    for (nA, nB), entries in shapes.items():
+        mols = np.fromiter((e[0] for e in entries), int, len(entries))
+        sA = np.fromiter((e[1] for e in entries), int, len(entries))
+        sB = np.fromiter((e[2] for e in entries), int, len(entries))
+        offs = np.fromiter((e[3] for e in entries), int, len(entries))
+
+        pa, pb = packed_size(nA), packed_size(nB)
+        block = pa * pb
+        # One gather of every packed block in the group, then one unpack.
+        flat_w = batch.w[mols[:, None], offs[:, None] + np.arange(block)]
+        ia = index_matrix(nA).ravel()
+        ib = index_matrix(nB).ravel()
+        w = flat_w.reshape(-1, pa, pb)[:, ia[:, None], ib[None, :]]
+        w = w.reshape(-1, nA, nA, nB, nB)
+
+        rows_a = sA[:, None] + np.arange(nA)
+        rows_b = sB[:, None] + np.arange(nB)
+        base = mols * stride
+        flat = np.concatenate([
+            (base[:, None, None] + r[:, :, None] * MB + c[:, None, :]).ravel()
+            for r, c in ((rows_a, rows_a), (rows_b, rows_b),
+                         (rows_a, rows_b), (rows_b, rows_a))])
+        groups.append((w, mols, rows_a, rows_b, flat))
+
+    return one_centre, groups
+
+
+def build_fock_batch_cpu(batch) -> np.ndarray:
+    """Build Fock matrices for all molecules on CPU, batched by orbital shape.
+
+    Same arithmetic as :func:`build_fock_batch_cpu_reference`, which pins it,
+    but the two-centre contraction runs once per distinct orbital shape over
+    the whole batch instead of once per (molecule, pair) with a 256-iteration
+    Python loop inside.
+
+    The plan is cached on the batch: it depends on the geometry, and an SCF
+    holds the geometry fixed for ~20 iterations.
+    """
+    N, MB = batch.n_mols, batch.max_basis
+    F_all = np.zeros((N, MB, MB), dtype=np.float64)
+
+    plan = getattr(batch, '_fock_cpu_plan', None)
+    if plan is None:
+        plan = _fock_batch_plan(batch)
+        batch._fock_cpu_plan = plan
+    one_centre, groups = plan
+
+    # One-centre: still per molecule, and cheap — n_atoms terms against
+    # n_atoms**2 / 2 pairs, with no inner loop over orbital quartets.
+    for mol in range(N):
+        n_bas = batch.n_basis_arr[mol]
+        n_at = batch.n_atoms_arr[mol]
+        P = batch.P[mol, :n_bas, :n_bas]
+        F = batch.H_core[mol, :n_bas, :n_bas].copy()
+        starts = batch.atom_starts[mol]
+
+        for a in range(n_at):
+            s = int(starts[a])
+            n_orb = int(starts[a + 1] - s)
+            gss, gsp, gpp, gp2, hsp = batch.atom_params[mol, a]
+            if n_orb == 1:
+                F[s, s] += P[s, s] * gss * 0.5
+                continue
+
+            Pss = P[s, s]
+            pk = slice(s + 1, s + 4)
+            # The p-block diagonal, not the p-block: F[pk, pk] with pk a slice
+            # would write all nine entries of the 3x3.
+            pdiag = np.arange(s + 1, s + 4)
+            diag = P[pdiag, pdiag]
+            Ppp = float(diag.sum())
+            sp_fac_1 = gsp - 0.5 * hsp
+            sp_fac_2 = 1.5 * hsp - 0.5 * gsp
+            pp_fac_d = 1.25 * gp2 - 0.25 * gpp
+            pp_fac_off = 0.75 * gpp - 1.25 * gp2
+
+            F[s, s] += Pss * gss * 0.5 + Ppp * sp_fac_1
+            F[pdiag, pdiag] += (Pss * sp_fac_1 + diag * gpp * 0.5
+                                + (Ppp - diag) * pp_fac_d)
+            F[s, pk] += P[s, pk] * sp_fac_2
+            F[pk, s] += P[pk, s] * sp_fac_2
+            for k in range(1, 4):
+                for l in range(k + 1, 4):
+                    F[s + k, s + l] += P[s + k, s + l] * pp_fac_off
+                    F[s + l, s + k] += P[s + l, s + k] * pp_fac_off
+
+        F_all[mol, :n_bas, :n_bas] = F
+
+    for mol, a, s in one_centre:
+        n_bas = batch.n_basis_arr[mol]
+        F_all[mol, :n_bas, :n_bas] = fock_d_one_center(
+            F_all[mol, :n_bas, :n_bas], batch.P[mol, :n_bas, :n_bas],
+            batch.atom_w[mol, a], s)
+
+    # Two-centre, one contraction per orbital shape across the whole batch.
+    if groups:
+        flat_idx, flat_val = [], []
+        for w, mols, rows_a, rows_b, flat in groups:
+            P_AA = batch.P[mols[:, None, None], rows_a[:, :, None], rows_a[:, None, :]]
+            P_BB = batch.P[mols[:, None, None], rows_b[:, :, None], rows_b[:, None, :]]
+            P_AB = batch.P[mols[:, None, None], rows_a[:, :, None], rows_b[:, None, :]]
+
+            t_aa = np.einsum('gabcd,gcd->gab', w, P_BB)
+            t_bb = np.einsum('gabcd,gab->gcd', w, P_AA)
+            t_ab = -0.5 * np.einsum('gabcd,gbd->gac', w, P_AB)
+
+            flat_idx.append(flat)
+            flat_val.append(np.concatenate([
+                t_aa.ravel(), t_bb.ravel(), t_ab.ravel(),
+                np.swapaxes(t_ab, 1, 2).ravel()]))
+
+        F_all += np.bincount(
+            np.concatenate(flat_idx), weights=np.concatenate(flat_val),
+            minlength=N * MB * MB).reshape(N, MB, MB)
 
     return F_all
