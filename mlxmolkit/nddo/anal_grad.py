@@ -19,6 +19,8 @@ from .scf import nddo_energy
 from .methods import get_params
 from .integrals import (compute_nuclear_repulsion, nuclear_repulsion_for_method,
                         pair_repulsion_for_method)
+from .integrals import PM6_CORE_CORE_METHODS
+from .pwcct import normalize_method
 
 
 def _pair_terms(params, coords, i, j, starts, P, n_basis, w=None):
@@ -110,7 +112,7 @@ def _pair_terms_many(params, coords, pairs, starts, P, n_basis):
     return out
 
 
-def _pair_energy_many(params, coords, pairs, starts, P, n_basis):
+def _pair_energy_many(params, coords, pairs, starts, P, n_basis, shift=None):
     """Each pair's scalar contribution to `sum(P * (2H + T))`.
 
     A pair's dH and dT are exactly zero outside its four blocks — [sA,sA],
@@ -123,11 +125,22 @@ def _pair_energy_many(params, coords, pairs, starts, P, n_basis):
     The sp path builds the blocks directly and never allocates a full matrix.
     d pairs go through :func:`_pair_terms` and are reduced afterwards; they are
     rare, and the point here is to stop paying n_basis**2 for every sp pair.
+
+    `shift` displaces every pair's *second* atom by the same vector. A pair's
+    energy depends only on the relative vector between its two atoms, so one
+    global shift gives the displaced energy of every pair at once — which is
+    what lets the gradient take six batched passes over all pairs instead of
+    6N passes over the N-1 pairs touching each atom in turn.
     """
     from .scf import (_pair_resonance_block, _pair_fock_twocentre,
                       _pair_core_attraction)
     from .rotation_batch import rotate_pairs
     from .d_two_center import _ROT_CACHE, _pair_key
+
+    if shift is None:
+        coords_b = coords
+    else:
+        coords_b = coords + np.asarray(shift, dtype=np.float64)
 
     sp, dd = [], []
     for i, j in pairs:
@@ -138,14 +151,14 @@ def _pair_energy_many(params, coords, pairs, starts, P, n_basis):
 
     if sp:
         ws = None
-        if _ROT_CACHE is not None:
+        if _ROT_CACHE is not None and shift is None:
             ws = [_ROT_CACHE.get(_pair_key(params[i], params[j],
                                            coords[i], coords[j])) for i, j in sp]
             if any(w is None for w in ws):
                 ws = None
         if ws is None:
             ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
-                              [(coords[i], coords[j]) for i, j in sp])
+                              [(coords[i], coords_b[j]) for i, j in sp])
 
         # Grouped by orbital shape so the contractions run once per shape
         # rather than once per pair. A displaced geometry touches N-1 pairs
@@ -172,7 +185,7 @@ def _pair_energy_many(params, coords, pairs, starts, P, n_basis):
 
             h_ab = np.stack([
                 _pair_resonance_block(params[sp[k][0]], params[sp[k][1]],
-                                      coords[sp[k][0]], coords[sp[k][1]])
+                                      coords[sp[k][0]], coords_b[sp[k][1]])
                 for k in ks])
             val_b = np.asarray([float(params[sp[k][1]].n_valence) for k in ks])
             val_a = np.asarray([float(params[sp[k][0]].n_valence) for k in ks])
@@ -194,7 +207,12 @@ def _pair_energy_many(params, coords, pairs, starts, P, n_basis):
                 out[sp[k]] = float(totals[pos])
 
     for i, j in dd:
-        dH, dT = _pair_terms(params, coords, i, j, starts, P, n_basis)
+        if shift is None:
+            dH, dT = _pair_terms(params, coords, i, j, starts, P, n_basis)
+        else:
+            shifted = coords.copy()
+            shifted[j] = coords_b[j]
+            dH, dT = _pair_terms(params, shifted, i, j, starts, P, n_basis)
         sA, nA = starts[i], params[i].n_basis
         sB, nB = starts[j], params[j].n_basis
         total = 0.0
@@ -243,13 +261,18 @@ def analytical_gradient(
     # `coords.copy(); c[a, d] += step` need not come out bit-identical, so the
     # arrays a displacement is evaluated at must be the same objects the cache
     # was keyed on.
-    displaced = []
-    for a in range(n_atoms):
-        for d in range(3):
-            for sign in (1.0, -1.0):
-                shifted = coords.copy()
-                shifted[a, d] += sign * step
-                displaced.append((a, d, sign, shifted))
+    # Six rigid shifts, not 6N displaced geometries. The total energy is a
+    # constant plus a sum of per-pair terms (the one-centre part of H and
+    # G_one do not move), and each pair term depends only on the vector
+    # between its two atoms — so shifting every pair's second atom by the same
+    # delta gives every pair's displaced energy in one pass. MOPAC's dcart is
+    # organised the same way, per pair rather than per atom.
+    shifts = []
+    for d in range(3):
+        for sign in (1.0, -1.0):
+            delta = np.zeros(3)
+            delta[d] = sign * step
+            shifts.append((d, sign, delta))
 
     # Every pair this gradient will ask for, at every geometry it will ask at:
     # the reference geometry — which the SCF, H_ref, F_ref and pair_ref all
@@ -259,21 +282,20 @@ def analytical_gradient(
     # against 23.6. Batching across all 6N geometries is the whole win.
     pair_specs = [(params[i], params[j], coords[i], coords[j])
                   for i in range(n_atoms) for j in range(i + 1, n_atoms)]
-    for a, _d, _sign, shifted in displaced:
-        for j in range(n_atoms):
-            if j == a:
-                continue
-            i_, j_ = (a, j) if a < j else (j, a)
-            pair_specs.append((params[i_], params[j_], shifted[i_], shifted[j_]))
+    for _d, _sign, delta in shifts:
+        for i in range(n_atoms):
+            for j in range(i + 1, n_atoms):
+                pair_specs.append((params[i], params[j],
+                                   coords[i], coords[j] + delta))
 
     with pair_cache(pair_specs):
         return _gradient_body(atoms, coords, method, step, molecular_charge,
                               scf_result, PARAMS, info, params, starts,
-                              n_atoms, displaced)
+                              n_atoms, shifts)
 
 
 def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
-                   PARAMS, info, params, starts, n_atoms, displaced):
+                   PARAMS, info, params, starts, n_atoms, shifts):
     """The gradient itself, run inside the TETCI cache installed above."""
     from .scf import _build_core_hamiltonian, _build_fock
 
@@ -316,28 +338,62 @@ def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
     pair_energy_ref = _pair_energy_many(params, coords, all_pairs, starts, P,
                                         n_basis)
 
-    def energy_with_atom_moved(a: int, shifted: np.ndarray) -> float:
-        dirty = [((a, j) if a < j else (j, a)) for j in range(n_atoms) if j != a]
-        fresh = _pair_energy_many(params, shifted, dirty, starts, P, n_basis)
+    # Six batched passes over every pair, rather than 6N passes over the N-1
+    # pairs touching one atom. Each pass shifts every pair's second atom by
+    # the same delta, which is legitimate because a pair's energy depends only
+    # on the vector between its two atoms. 6 * N(N-1)/2 = 3N^2 pair
+    # evaluations against the 6N * (N-1) = 6N^2 the per-atom scheme needed,
+    # and each pass is one shape-grouped contraction over all 2701 pairs
+    # instead of 444 contractions over 73.
+    pair_index = {key: k for k, key in enumerate(all_pairs)}
+    ia = np.fromiter((i for i, _ in all_pairs), dtype=int, count=len(all_pairs))
+    ib = np.fromiter((j for _, j in all_pairs), dtype=int, count=len(all_pairs))
 
-        E_elec = E_elec_ref + 0.5 * sum(fresh[key] - pair_energy_ref[key]
-                                        for key in dirty)
+    # Core-core repulsion for every pair in one call rather than one per pair.
+    # The scalar dispatcher takes a coords array and two indices, so feeding it
+    # a shifted second atom meant copying the whole geometry per pair — 6 *
+    # N(N-1)/2 copies. The batch form takes coordinate arrays directly.
+    zi = np.asarray([atoms[i] for i, _ in all_pairs])
+    zj = np.asarray([atoms[j] for _, j in all_pairs])
+    _pm6_core_core = normalize_method(method) in PM6_CORE_CORE_METHODS
+    if _pm6_core_core:
+        from .pwcct import pm6_pair_repulsion_batch
 
-        E_nuc = E_nuc_ref
-        for j in range(n_atoms):
-            if j == a:
-                continue
-            key = (a, j) if a < j else (j, a)
-            E_nuc += (pair_repulsion_for_method(atoms, shifted, *key, PARAMS, method)
-                      - nuc_ref[key])
-        return E_elec + E_nuc
+    def pair_repulsions(coords_i, coords_j):
+        if _pm6_core_core:
+            return np.asarray(pm6_pair_repulsion_batch(
+                zi, zj, None, coords_i, coords_j, param_dict=PARAMS))
+        # The two-element atom list matters: passing the full `atoms` with
+        # indices 0 and 1 silently gives every pair the parameters of the
+        # first two atoms, which leaves the gradient wrong for every method
+        # that is not on the PM6 core-core path.
+        return np.asarray([
+            pair_repulsion_for_method(
+                [atoms[i], atoms[j]],
+                np.stack([coords_i[k], coords_j[k]]), 0, 1, PARAMS, method)
+            for k, (i, j) in enumerate(all_pairs)])
+
+    def pair_energies(delta):
+        """Every pair's total energy with its second atom shifted by delta."""
+        elec = _pair_energy_many(params, coords, all_pairs, starts, P, n_basis,
+                                 shift=delta)
+        elec_arr = np.fromiter((elec[key] for key in all_pairs), dtype=float,
+                               count=len(all_pairs))
+        return 0.5 * elec_arr + pair_repulsions(coords[ia], coords[ib] + delta)
+
+    plus = {}
+    minus = {}
+    for d, sign, delta in shifts:
+        (plus if sign > 0 else minus)[d] = pair_energies(delta)
 
     gradient = np.zeros((n_atoms, 3))
-    energies = [energy_with_atom_moved(a, shifted)
-                for a, _d, _sign, shifted in displaced]
-    for k in range(0, len(displaced), 2):
-        a, d, _s, _c = displaced[k]
-        gradient[a, d] = (energies[k] - energies[k + 1]) / (2.0 * step)
+    for d in range(3):
+        # d(E_pair)/d(r_j) by central difference; the pair's dependence on
+        # r_i is exactly the negative of it, which is why one difference
+        # feeds both atoms with opposite sign.
+        deriv = (plus[d] - minus[d]) / (2.0 * step)
+        np.add.at(gradient[:, d], ib, deriv)
+        np.add.at(gradient[:, d], ia, -deriv)
 
     return result, gradient
 
