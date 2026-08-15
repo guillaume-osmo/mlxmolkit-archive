@@ -1444,9 +1444,29 @@ def w_withquaternion(mol,tore,ni, nj, xij, riXH, ri, wHH):
     # Note: ri (and therefore w) is already XX-filtered with shape
     # (XX.sum(), 22). riXH is already XH-filtered with shape (XH.sum(), 4).
     # rot/rotXH were also pre-sliced above. So no further masking needed.
+    # DISABLED: this kernel disagrees with the python path below on d-bearing
+    # pairs. With numba importable it produces 14 test failures — the batched
+    # Fock diverging from the sequential one by 15-32 on CS/CCS/chlorobenzene/
+    # thioanisole/bromobenzene, and batch energies off by ~285 (CSC: -786.50
+    # against -501.09). Disabling it makes all 14 pass.
+    #
+    # Not a JIT artefact: NUMBA_DISABLE_JIT=1 fails identically, and clearing
+    # the numba cache changes nothing. The kernel is wrong when *interpreted*
+    # too, so it is a transcription error against the python path rather than
+    # fastmath reassociation or a stale cache.
+    #
+    # It was invisible here because numba 0.60 cannot import under numpy 2.4
+    # ("Numba needs NumPy 2.0 or less"), so the fallback always ran. On a
+    # machine with a working numba it silently returns wrong d-orbital
+    # energies rather than failing — which is how it reached a second machine
+    # as an unexplained 14-test divergence.
+    #
+    # Re-enable only with a test that pins this kernel against the python path
+    # on d pairs. See the tracking issue.
+    _W_KERNEL_ENABLED = False
     try:
         from ._jit_kernels import _w_withquaternion_kernel, is_numba_available
-        if is_numba_available() and XX.sum() > 0:
+        if _W_KERNEL_ENABLED and is_numba_available() and XX.sum() > 0:
             ri_xx = np.ascontiguousarray(ri, dtype=np.float64)
             riXH_xh = (np.ascontiguousarray(riXH, dtype=np.float64)
                        if XH.sum() > 0 else np.zeros((0, 4)))
