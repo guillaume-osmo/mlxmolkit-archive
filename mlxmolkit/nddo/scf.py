@@ -397,21 +397,36 @@ def _build_core_hamiltonian(atoms, coords, info):
     # attraction on i from j *and* on j from i, so the unordered loop below
     # does half the work the ordered one did. d pairs keep the 9x9 Wigner-D
     # path, which is not expressible through the sp rotation.
+    # The sp pairs are rotated in one batched call rather than one scalar call
+    # each. On cholesterol that is 2701 rotations per build, and the build runs
+    # twice per gradient (once for H_ref, once inside the SCF) — 5402 scalar
+    # rotations, the single largest line in a gradient profile at 0.211 s.
+    # e1b and e2a are slices of w, so the batch supplies both orderings.
+    sp_pairs = []
     for i in range(n_atoms):
-        si, nA = starts[i], params[i].n_basis
         for j in range(i + 1, n_atoms):
-            sj, nB = starts[j], params[j].n_basis
-            pA, pB = params[i], params[j]
-            if pA.n_basis == 9 or pB.n_basis == 9:
+            if params[i].n_basis == 9 or params[j].n_basis == 9:
+                si, nA = starts[i], params[i].n_basis
+                sj, nB = starts[j], params[j].n_basis
                 H[si:si + nA, si:si + nA] += _pair_core_attraction(
-                    pA, pB, coords[i], coords[j])
+                    params[i], params[j], coords[i], coords[j])
                 H[sj:sj + nB, sj:sj + nB] += _pair_core_attraction(
-                    pB, pA, coords[j], coords[i])
+                    params[j], params[i], coords[j], coords[i])
             else:
-                _, e1b, e2a = rotate_integrals_to_molecular_frame(
-                    pA, pB, coords[i], coords[j])
-                H[si:si + nA, si:si + nA] += e1b[:nA, :nA]
-                H[sj:sj + nB, sj:sj + nB] += e2a[:nB, :nB]
+                sp_pairs.append((i, j))
+
+    if sp_pairs:
+        from .rotation_batch import rotate_pairs
+        ws = rotate_pairs([(params[i], params[j]) for i, j in sp_pairs],
+                          [(coords[i], coords[j]) for i, j in sp_pairs])
+        for (i, j), w in zip(sp_pairs, ws):
+            pA, pB = params[i], params[j]
+            si, nA = starts[i], pA.n_basis
+            sj, nB = starts[j], pB.n_basis
+            H[si:si + nA, si:si + nA] += (
+                -float(pB.n_valence) * w[:nA, :nA, 0, 0])
+            H[sj:sj + nB, sj:sj + nB] += (
+                -float(pA.n_valence) * w[0, 0, :nB, :nB])
 
     return H
 
