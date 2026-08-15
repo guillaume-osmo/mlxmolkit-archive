@@ -224,8 +224,6 @@ def prepare_batch(
     H_core_all = np.zeros((N, MB, MB), dtype=np.float64)
     # Packed two-centre storage: a flat buffer per molecule plus an offset
     # table. -1 marks a pair with no block (an atom with itself, or padding).
-    w_packed_rows = [[] for _ in range(N)]
-    pair_cursor = [0] * N
     pair_offset_all = np.full((N, MA, MA), -1, dtype=np.int32)
     atom_norb_all = np.zeros((N, MA), dtype=np.int32)
     # One-centre d integrals. These depend only on the atom's own
@@ -390,16 +388,18 @@ def prepare_batch(
     # widths. pack() called per pair was 132 ms across 64640 calls on an
     # 800-molecule batch; the index map is the same for every pair of a given
     # shape, so each shape is one scatter.
+    # Kept grouped, not split back into a per-pair list: the scatter below
+    # wants the stacked form, and splitting it only to re-stack it cost more
+    # than the loop it replaced (550 -> 592 ms when measured that way).
     from .packing import pack_batch
-    pair_packed: list = [None] * sp_ids.size
+    _sp_packed_groups: list = []
     by_shape: dict[tuple, list] = {}
     for pos, (pA, pB) in enumerate(sp_params):
         by_shape.setdefault((pA.n_basis, pB.n_basis), []).append(pos)
     for (nA, nB), positions in by_shape.items():
         stack = np.stack([pair_w[pos][:nA, :nA, :nB, :nB] for pos in positions])
-        packed = pack_batch(stack, nA, nB)
-        for n, pos in enumerate(positions):
-            pair_packed[pos] = packed[n]
+        _sp_packed_groups.append(
+            (sp_ids[np.asarray(positions)], pack_batch(stack, nA, nB)))
 
     # === H_core off-diagonal and electron-nuclear attraction, in bulk ===
     #
@@ -458,6 +458,57 @@ def prepare_batch(
         _H_flat += np.bincount(np.concatenate(_acc_idx),
                                weights=np.concatenate(_acc_val),
                                minlength=_H_flat.size)
+
+    # === Packed two-centre buffer, in bulk ===
+    #
+    # The loop below appended two ravelled blocks per pair and advanced a
+    # per-molecule cursor — 240k list appends and ravels for a 200-molecule
+    # batch, then a concatenate per molecule.
+    #
+    # Both orderings of a pair occupy the same number of doubles, so a
+    # molecule's cursor is just twice the running sum of its pairs' block
+    # sizes; the offsets follow from the pair table by arithmetic and every
+    # block of one shape is scattered in a single fancy-index write.
+    _pk_a = (pair_nA.astype(np.int64) * (pair_nA + 1)) // 2
+    _pk_b = (pair_nB.astype(np.int64) * (pair_nB + 1)) // 2
+    _blk = _pk_a * _pk_b
+    _pair_start = np.zeros(n_pairs, dtype=np.int64)
+    _mol_total = np.zeros(N, dtype=np.int64)
+    for m in range(N):
+        lo, hi = mol_pair_start[m], mol_pair_start[m + 1]
+        if hi > lo:
+            run = 2 * _blk[lo:hi]
+            _pair_start[lo:hi] = np.cumsum(run) - run
+            _mol_total[m] = int(run.sum())
+    max_storage = int(_mol_total.max()) if N and n_pairs else 0
+    w_all = np.zeros((N, max_storage), dtype=np.float64)
+
+    if n_pairs:
+        pair_offset_all[pair_mol, pair_i, pair_j] = _pair_start
+        pair_offset_all[pair_mol, pair_j, pair_i] = _pair_start + _blk
+
+        # d blocks are few and ragged, so they are stacked per shape here;
+        # the sp ones arrive already stacked from `pack_batch`.
+        _groups = list(_sp_packed_groups)
+        if d_ids.size:
+            _d_shapes: dict[tuple, list] = {}
+            for pos, k in enumerate(d_ids):
+                _d_shapes.setdefault((int(_pk_a[k]), int(_pk_b[k])), []).append(pos)
+            for _shape, poss in _d_shapes.items():
+                blocks = []
+                for pos in poss:
+                    pA, pB, rA, rB = d_specs[pos]
+                    blocks.append(_two_centre_packed(
+                        pA, pB, rA, rB, dense=None, tetci=pair_tetci[pos]))
+                _groups.append((d_ids[np.asarray(poss)], np.stack(blocks)))
+
+        for sel, stack in _groups:
+            size = stack.shape[1] * stack.shape[2]
+            mols = pair_mol[sel].astype(np.int64)
+            cols = _pair_start[sel][:, None] + np.arange(size)
+            w_all[mols[:, None], cols] = stack.reshape(-1, size)
+            w_all[mols[:, None], cols + size] = np.swapaxes(
+                stack, 1, 2).reshape(-1, size)
 
     for mol_idx, (atoms, coords) in enumerate(molecules):
         coords = np.array(coords, dtype=np.float64)
@@ -558,26 +609,6 @@ def prepare_batch(
                 H[si:si + nA, si:si + nA] += blk_a
                 H[sj:sj + nB, sj:sj + nB] += blk_b
 
-            # Two-centre integrals, stored as lower-triangle packed pair blocks
-            # with a per-pair offset rather than a dense 4-index block padded to
-            # the widest atom in the batch. Padding cost a 100-molecule PM6
-            # batch containing one sulfur ~5 GB because every C-H pair was
-            # inflated to 9**4; packed per-pair it is ~24 MB.
-            if sp_pos >= 0:
-                block = pair_packed[sp_pos]
-            else:
-                block = _two_centre_packed(
-                    pA, pB, coords[i], coords[j],
-                    dense=None, tetci=pair_tetci[int(d_slot[pid])])
-            rows = w_packed_rows[mol_idx]
-            pair_offset_all[mol_idx, i, j] = pair_cursor[mol_idx]
-            rows.append(block.ravel())
-            pair_cursor[mol_idx] += block.size
-            # The (j, i) ordering is the transpose in packed space too.
-            pair_offset_all[mol_idx, j, i] = pair_cursor[mol_idx]
-            rows.append(block.T.ravel())
-            pair_cursor[mol_idx] += block.size
-
         # The AM1-style core-core form stays per molecule; PM6's is summed from
         # the batched per-pair terms after the loop.
         if not pm6_core:
@@ -601,15 +632,10 @@ def prepare_batch(
             param_dict=param_dict)
         np.add.at(E_nuc_arr, pair_mol, terms)
 
-    # Pad the ragged per-molecule buffers into one (N, max_storage) array so
-    # the GPU sees a single contiguous upload. Molecules needing less are
-    # zero-filled; the offset table means the padding is never read.
-    max_storage = max(pair_cursor) if N else 0
-    w_all = np.zeros((N, max_storage), dtype=np.float64)
-    for m in range(N):
-        if w_packed_rows[m]:
-            flat = np.concatenate(w_packed_rows[m])
-            w_all[m, :flat.size] = flat
+    # `w_all` and the offset table were built in bulk above; the buffer is one
+    # (N, max_storage) array so the GPU sees a single contiguous upload, and
+    # molecules needing less are zero-filled. The offset table means the
+    # padding is never read.
 
     return RM1Batch(
         n_mols=N,
