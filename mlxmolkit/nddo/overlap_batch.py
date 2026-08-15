@@ -249,8 +249,19 @@ def overlap_pairs(pair_specs):
     out: list[np.ndarray | None] = [None] * len(pair_specs)
     groups: dict[tuple, list[int]] = {}
 
+    # One norm over every pair rather than one per pair. The triage loop below
+    # only needs to know *whether* two centres coincide, and asking numpy that
+    # question 48k separate times cost ~7% of prepare_batch on a 300-molecule
+    # batch — the vectorised routines beside this one (rotate_pairs,
+    # pm6_pair_repulsion_batch) each call norm exactly once.
+    coincident = np.zeros(len(pair_specs), dtype=bool)
+    if pair_specs:
+        starts = np.asarray([spec[2] for spec in pair_specs], dtype=np.float64)
+        ends = np.asarray([spec[3] for spec in pair_specs], dtype=np.float64)
+        coincident = np.linalg.norm(ends - starts, axis=1) < 1e-10
+
     for k, (pA, pB, rA, rB) in enumerate(pair_specs):
-        if float(np.linalg.norm(np.asarray(rB) - np.asarray(rA))) < 1e-10:
+        if coincident[k]:
             # Coincident centres: the scalar short-circuits to an identity
             # block. Without this the rotation divides by zero and returns a
             # silent NaN, which is worse than either answer.
