@@ -122,7 +122,7 @@ def nddo_optimize_batch(
     # Must match nddo_optimize's default. At 50 against the single path's 200,
     # menthol came out 0.385 kcal/mol apart depending on which entry point you
     # called — 9x the MOPAC agreement — because batch stopped it short. See #28.
-    max_iter: int = 200,
+    max_iter: int = 500,
     grad_tol: float = 0.005,
     method: str = 'RM1',
     verbose: bool = False,
@@ -565,12 +565,22 @@ def _optimize_result(result, coords, energy, grad, g_rms, converged, n_iter, met
 def nddo_optimize(
     atoms: list[int],
     coords: np.ndarray,
-    # 200, not 50. The loop returns as soon as g_rms < grad_tol, so this is a
-    # bound on the work rather than a cost: chlorobenzene still exits at 16.
-    # At 50, menthol ran out of iterations at g_rms=0.014 — 3x the tolerance —
-    # while its energy was still falling, and then reported success because of
-    # the key collision above. It converges at 94. See #28.
-    max_iter: int = 200,
+    # 500. The loop returns as soon as g_rms < grad_tol, so this bounds the
+    # work rather than causing it — chlorobenzene still exits at 15, and a
+    # batch measured at cap 100 and cap 200 took the same 50 s.
+    #
+    # Sized from the worst case, not a formula. Iterations do not track atom
+    # count: indole and anisole are both 16 atoms and need 14 and 45. They
+    # track flexibility, as everything else in this optimizer does. So the
+    # only defensible default is one generous enough for the worst molecule
+    # anyone is likely to hand it — cholesterol (74 atoms) needs 184, which
+    # left the old cap of 200 with 8% headroom.
+    #
+    # Not larger than 500: the cap is free for a molecule that converges, but
+    # a pathological one pays it in full, and at ~3.6 s per gradient on a
+    # 74-atom system that is the difference between 30 and 60 minutes. #65
+    # made `converged` truthful, so a rare truncation now reports itself.
+    max_iter: int = 500,
     grad_tol: float = 0.005,
     method: str = 'RM1',
     verbose: bool = False,

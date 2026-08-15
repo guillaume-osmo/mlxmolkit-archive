@@ -245,3 +245,20 @@ def test_unknown_optimizer_is_rejected():
     atoms, coords = geometry("CCO")
     with pytest.raises(ValueError, match="unknown optimizer"):
         nddo_optimize(atoms, coords, optimizer="newton")
+
+
+def test_default_cap_clears_the_worst_measured_molecule():
+    """The default must cover the hardest thing we have measured.
+
+    Iterations do not track atom count — indole and anisole are both 16 atoms
+    and need 14 and 45 — so a size-based formula would be badly founded. The
+    default is instead sized from the worst case: cholesterol, 74 atoms, needs
+    184, which left the previous cap of 200 with 8% headroom.
+    """
+    import inspect
+
+    default = inspect.signature(nddo_optimize).parameters["max_iter"].default
+    assert default >= 2 * 184, (
+        f"default cap {default} leaves under 2x headroom over cholesterol's "
+        "184 iterations"
+    )

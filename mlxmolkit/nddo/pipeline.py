@@ -65,10 +65,9 @@ def rm1_from_smiles(
     seed: int = 42,
     method: str = 'RM1',
     optimize: bool = False,
-    # 200, matching nddo_optimize's own default — the optimizer returns as
-    # soon as grad_tol is met, so this bounds the work rather than causing it.
-    # See #28.
-    opt_max_iter: int = 200,
+    # Matches nddo_optimize's own default — the optimizer returns as soon as
+    # grad_tol is met, so this bounds the work rather than causing it. See #28.
+    opt_max_iter: int = 500,
     opt_grad_tol: float = 0.005,
 ) -> Optional[dict]:
     """Compute NDDO energy from SMILES string.
