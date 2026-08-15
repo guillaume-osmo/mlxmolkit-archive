@@ -341,6 +341,62 @@ def _pair_resonance_block(pA, pB, rA, rB, overlap=None):
     return block
 
 
+def _beta_vectors(plist, n_basis):
+    """Resonance parameters for every orbital of each atom, shape (g, n_basis).
+
+    Beta depends only on which shell an orbital sits in, so a group of atoms
+    that share an orbital count share the whole layout: one column read per
+    shell rather than `_beta_for_orbital` per orbital per atom.
+    """
+    out = np.empty((len(plist), n_basis))
+    out[:, 0] = [p.beta_s for p in plist]
+    if n_basis > 1:
+        out[:, 1:min(n_basis, 4)] = np.asarray([p.beta_p for p in plist])[:, None]
+    if n_basis > 4:
+        out[:, 4:] = np.asarray([p.beta_d for p in plist])[:, None]
+    return out
+
+
+def _stacked_overlaps(specs):
+    """Overlaps for a list of sp pair specs, in spec order.
+
+    Served from the pair cache when the caller declared these geometries — the
+    gradient's path, where recomputing them would undo the cache — and from one
+    batched `overlap_pairs` call otherwise. sp only: `overlap_pairs` falls back
+    to `overlap_molecular_frame` for shapes its table misses, which is not the
+    routine the d resonance block uses.
+    """
+    from .d_two_center import _OVERLAP_CACHE, _pair_key
+
+    if _OVERLAP_CACHE is not None:
+        hits = [_OVERLAP_CACHE.get(_pair_key(*spec)) for spec in specs]
+        if all(hit is not None for hit in hits):
+            return hits
+
+    from .overlap_batch import overlap_pairs
+    return overlap_pairs(specs)
+
+
+def _pair_resonance_blocks(pA_list, pB_list, S):
+    """:func:`_pair_resonance_block` for a group of pairs of one orbital shape.
+
+    H_uv = 0.5 (beta_u + beta_v) S_uv is a pure broadcast over the group, but
+    the scalar form runs an nA x nB Python loop per pair. A cholesterol
+    gradient calls it once per pair per displacement — 16k times, each doing
+    16 iterations with two function calls apiece.
+
+    Args:
+        pA_list, pB_list: the group's atom parameters, length g.
+        S: stacked overlaps, shape (g, nA, nB).
+
+    Returns:
+        Blocks of shape (g, nA, nB).
+    """
+    betaA = _beta_vectors(pA_list, S.shape[1])
+    betaB = _beta_vectors(pB_list, S.shape[2])
+    return 0.5 * (betaA[:, :, None] + betaB[:, None, :]) * S
+
+
 def _pair_core_attraction(pA, pB, rA, rB):
     """Electron-nuclear attraction on atom A from nucleus B, shape (nA, nA).
 
@@ -383,15 +439,50 @@ def _build_core_hamiltonian(atoms, coords, info):
             # d-orbital (types 4-8)
             H[mu, mu] = p.Udd
 
-    # Off-diagonal: resonance integrals using proper Slater overlap
+    # Off-diagonal: resonance integrals using proper Slater overlap.
+    #
+    # sp pairs go through the batch: one `overlap_pairs` call for all of them,
+    # then one broadcast per orbital shape, then a fancy-indexed scatter into
+    # H. The scalar loop was 2701 calls of `_pair_resonance_block` on
+    # cholesterol, each running its own nA x nB Python loop, and it is the
+    # largest line in an SCF profile after the eigendecomposition.
+    #
+    # d pairs stay scalar. `overlap_pairs` falls back to
+    # `overlap_molecular_frame` for shapes its table does not cover, but
+    # `_pair_resonance_block` uses `overlap_d_molecular_frame` for those —
+    # different routines, so batching them together would silently change the
+    # d overlap.
     n_atoms = len(atoms)
+    sp_res, d_res = [], []
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
-            block = _pair_resonance_block(params[i], params[j], coords[i], coords[j])
-            si, sj = starts[i], starts[j]
-            nA, nB = params[i].n_basis, params[j].n_basis
-            H[si:si + nA, sj:sj + nB] = block
-            H[sj:sj + nB, si:si + nA] = block.T
+            (sp_res if params[i].n_basis <= 4 and params[j].n_basis <= 4
+             else d_res).append((i, j))
+
+    for i, j in d_res:
+        block = _pair_resonance_block(params[i], params[j], coords[i], coords[j])
+        si, sj = starts[i], starts[j]
+        H[si:si + block.shape[0], sj:sj + block.shape[1]] = block
+        H[sj:sj + block.shape[1], si:si + block.shape[0]] = block.T
+
+    if sp_res:
+        S_all = _stacked_overlaps([(params[i], params[j], coords[i], coords[j])
+                                   for i, j in sp_res])
+        shapes: dict[tuple[int, int], list[int]] = {}
+        for k, (i, j) in enumerate(sp_res):
+            shapes.setdefault((params[i].n_basis, params[j].n_basis),
+                              []).append(k)
+        for (nA, nB), ks in shapes.items():
+            blocks = _pair_resonance_blocks(
+                [params[sp_res[k][0]] for k in ks],
+                [params[sp_res[k][1]] for k in ks],
+                np.stack([S_all[k] for k in ks]))
+            rows_a = (np.asarray([starts[sp_res[k][0]] for k in ks])[:, None]
+                      + np.arange(nA))
+            rows_b = (np.asarray([starts[sp_res[k][1]] for k in ks])[:, None]
+                      + np.arange(nB))
+            H[rows_a[:, :, None], rows_b[:, None, :]] = blocks
+            H[rows_b[:, :, None], rows_a[:, None, :]] = np.swapaxes(blocks, 1, 2)
 
     # Electron-nuclear attraction. One rotation of the pair (i, j) yields the
     # attraction on i from j *and* on j from i, so the unordered loop below
@@ -496,7 +587,63 @@ def precompute_pair_w(atoms, coords, info):
     return {pair: ws[k] for k, pair in enumerate(sp)}
 
 
-def _build_fock(H, P, info, atoms, coords, pair_w=None):
+def _fock_plan(info, atoms, coords, pair_w=None):
+    """The parts of a Fock build that depend on geometry but not on density.
+
+    An SCF sits at one geometry for ~18 iterations and rebuilt all of this on
+    every one of them: the sp/d triage over N(N-1)/2 pairs — 48,618 loop
+    iterations per cholesterol SCF — the stacked rotation tensors, the
+    basis-row index arrays and the flat scatter indices. Only the three
+    density contractions actually differ between iterations.
+
+    `precompute_pair_w` already hoisted the rotations themselves; this hoists
+    everything built around them.
+    """
+    params = info['params']
+    starts = info['atom_basis_start']
+    n_basis = info['n_basis']
+    n_atoms = len(atoms)
+
+    idx_by_atom = [np.where(info['basis_to_atom'] == i)[0]
+                   for i in range(n_atoms)]
+
+    d_pairs = []
+    sp_by_shape: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for i in range(n_atoms):
+        for j in range(i + 1, n_atoms):
+            pA, pB = params[i], params[j]
+            if pA.n_basis == 9 or pB.n_basis == 9 or (
+                    pair_w is not None and pair_w.get((i, j)) is None):
+                d_pairs.append((i, j))
+            else:
+                sp_by_shape.setdefault((pA.n_basis, pB.n_basis),
+                                       []).append((i, j))
+
+    groups = []
+    for (nA, nB), pairs in sp_by_shape.items():
+        if pair_w is not None:
+            W = np.stack([pair_w[(i, j)] for i, j in pairs])
+        else:
+            from .rotation_batch import rotate_pairs
+            W = np.stack(rotate_pairs(
+                [(params[i], params[j]) for i, j in pairs],
+                [(coords[i], coords[j]) for i, j in pairs]))
+        W = W[:, :nA, :nA, :nB, :nB]
+
+        ia = np.asarray([starts[i] for i, _ in pairs])
+        ib = np.asarray([starts[j] for _, j in pairs])
+        rows_a = ia[:, None] + np.arange(nA)
+        rows_b = ib[:, None] + np.arange(nB)
+        flat = np.concatenate([
+            (rows[:, :, None] * n_basis + cols[:, None, :]).ravel()
+            for rows, cols in ((rows_a, rows_a), (rows_b, rows_b),
+                               (rows_a, rows_b), (rows_b, rows_a))])
+        groups.append((W, rows_a, rows_b, flat))
+
+    return {'idx_by_atom': idx_by_atom, 'd_pairs': d_pairs, 'groups': groups}
+
+
+def _build_fock(H, P, info, atoms, coords, pair_w=None, plan=None):
     """Build Fock matrix F = H + G(P).
 
     Two contributions:
@@ -513,11 +660,12 @@ def _build_fock(H, P, info, atoms, coords, pair_w=None):
     starts = info['atom_basis_start']
 
     F = H.copy()
+    if plan is None:
+        plan = _fock_plan(info, atoms, coords, pair_w)
 
     # === One-center two-electron contributions ===
     for i, p in enumerate(params):
-        mask = (b2a == i)
-        idx = np.where(mask)[0]
+        idx = plan['idx_by_atom'][i]
         if len(idx) == 0:
             continue
 
@@ -610,38 +758,16 @@ def _build_fock(H, P, info, atoms, coords, pair_w=None):
     # this loop ran 2701 times per SCF iteration and 20 iterations per energy,
     # 54k calls each doing three 4x4x4x4 einsums on arrays far too small to
     # cover numpy's per-call overhead.
-    sp_by_shape: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            pA, pB = params[i], params[j]
-            if pA.n_basis == 9 or pB.n_basis == 9 or (
-                    pair_w is not None and pair_w.get((i, j)) is None):
-                F = _pair_fock_twocentre(
-                    F, P, pA, pB, starts[i], starts[j], coords[i], coords[j],
-                    w=None if pair_w is None else pair_w.get((i, j)))
-            else:
-                sp_by_shape.setdefault((pA.n_basis, pB.n_basis),
-                                       []).append((i, j))
+    for i, j in plan['d_pairs']:
+        F = _pair_fock_twocentre(
+            F, P, params[i], params[j], starts[i], starts[j],
+            coords[i], coords[j],
+            w=None if pair_w is None else pair_w.get((i, j)))
 
-    if sp_by_shape:
-        from .rotation_batch import rotate_pairs
-
+    if plan['groups']:
         flat_idx: list[np.ndarray] = []
         flat_val: list[np.ndarray] = []
-        for (nA, nB), pairs in sp_by_shape.items():
-            if pair_w is not None:
-                W = np.stack([pair_w[(i, j)] for i, j in pairs])
-            else:
-                W = np.stack(rotate_pairs(
-                    [(params[i], params[j]) for i, j in pairs],
-                    [(coords[i], coords[j]) for i, j in pairs]))
-            W = W[:, :nA, :nA, :nB, :nB]
-
-            ia = np.asarray([starts[i] for i, _ in pairs])
-            ib = np.asarray([starts[j] for _, j in pairs])
-            rows_a = ia[:, None] + np.arange(nA)
-            rows_b = ib[:, None] + np.arange(nB)
-
+        for W, rows_a, rows_b, flat in plan['groups']:
             P_AA = P[rows_a[:, :, None], rows_a[:, None, :]]
             P_BB = P[rows_b[:, :, None], rows_b[:, None, :]]
             P_AB = P[rows_a[:, :, None], rows_b[:, None, :]]
@@ -650,15 +776,10 @@ def _build_fock(H, P, info, atoms, coords, pair_w=None):
             t_bb = np.einsum('gabcd,gab->gcd', W, P_AA)
             t_ab = -0.5 * np.einsum('gabcd,gbd->gac', W, P_AB)
 
-            for rows, cols, vals in (
-                (rows_a, rows_a, t_aa),
-                (rows_b, rows_b, t_bb),
-                (rows_a, rows_b, t_ab),
-                (rows_b, rows_a, np.swapaxes(t_ab, 1, 2)),
-            ):
-                flat_idx.append(
-                    (rows[:, :, None] * n_basis + cols[:, None, :]).ravel())
-                flat_val.append(vals.ravel())
+            flat_idx.append(flat)
+            flat_val.append(np.concatenate([
+                t_aa.ravel(), t_bb.ravel(), t_ab.ravel(),
+                np.swapaxes(t_ab, 1, 2).ravel()]))
 
         # One accumulation rather than per-pair `+=`: several pairs land on the
         # same atom's diagonal block, so the scatter has to add rather than
@@ -1096,11 +1217,14 @@ def _nddo_energy_at_geometry(
                 atom_starts_metal, ssss.astype(np.float32),
                 n_basis, n_atoms,
             )
-        return _build_fock(H, P, info, atoms, coords, pair_w=_pair_w)
+        return _build_fock(H, P, info, atoms, coords, pair_w=_pair_w,
+                           plan=_fock_plan_)
 
     # The two-centre rotations are fixed for this geometry, so they are
-    # built once here instead of at every iteration of the loop below.
+    # built once here instead of at every iteration of the loop below — as is
+    # everything else the Fock build derives from them.
     _pair_w = precompute_pair_w(atoms, coords, info)
+    _fock_plan_ = _fock_plan(info, atoms, coords, _pair_w)
 
     # DIIS (Direct Inversion in the Iterative Subspace) storage
     diis_max = 6
@@ -1165,10 +1289,12 @@ def _nddo_energy_at_geometry(
             F_shifted = C @ np.diag(eigenvalues) @ C.T
             eigenvalues, C = np.linalg.eigh(F_shifted)
 
-        # Build new density matrix
-        P_new = np.zeros((n_basis, n_basis))
-        for k in range(n_occ):
-            P_new += 2.0 * np.outer(C[:, k], C[:, k])
+        # Build new density matrix. One GEMM, not n_occ rank-1 updates: the
+        # loop's cost was never the outer products but the n_occ full-matrix
+        # accumulations into P_new — 80 x 194^2 element-adds per iteration on
+        # cholesterol, against 194^2 x 80 multiply-adds for the matmul.
+        C_occ = C[:, :n_occ]
+        P_new = 2.0 * (C_occ @ C_occ.T)
 
         # Check convergence
         delta = np.sqrt(np.mean((P_new - P) ** 2))

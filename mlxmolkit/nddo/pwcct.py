@@ -122,14 +122,21 @@ def pm6_nuclear_repulsion(
     coords: np.ndarray,
     param_dict: dict,
 ) -> float:
-    """PM6 nuclear repulsion energy. Exact PYSEQM formula."""
+    """PM6 nuclear repulsion energy. Exact PYSEQM formula.
+
+    Summed over the batched pair routine rather than N(N-1)/2 scalar calls —
+    2701 of them per cholesterol SCF, each re-reading its two elements'
+    parameters off the ElementParams objects.
+    """
     coords = np.asarray(coords, dtype=np.float64)
     n_atoms = len(atoms)
-    return float(sum(
-        pm6_pair_repulsion(atoms[i], atoms[j],
-                           param_dict[atoms[i]], param_dict[atoms[j]],
-                           coords[i], coords[j])
-        for i in range(n_atoms) for j in range(i + 1, n_atoms)))
+    if n_atoms < 2:
+        return 0.0
+
+    iu, ju = np.triu_indices(n_atoms, k=1)
+    z = np.asarray(atoms)
+    return float(np.sum(pm6_pair_repulsion_batch(
+        z[iu], z[ju], None, coords[iu], coords[ju], param_dict=param_dict)))
 
 
 def pm6_pair_repulsion_batch(zi, zj, pair_params, coordI, coordJ, param_dict=None):

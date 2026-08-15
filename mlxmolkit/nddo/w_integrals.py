@@ -9,6 +9,8 @@ Reference: MOPAC calpar.f90, Thiel & Voityuk 1996.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
+
 import numpy as np
 
 EV = 27.21  # Hartree to eV
@@ -80,6 +82,7 @@ def slater_condon_parameter(K: int, NA: int, EA: float, NB: int, EB: float,
     return C * (S1 - S2 + S3)
 
 
+@lru_cache(maxsize=None)
 def compute_w_integrals(
     zeta_s: float, zeta_p: float, zeta_d: float,
     qn_sp: int, qn_d: int,
@@ -245,4 +248,8 @@ def compute_w_integrals(
             val -= 0.25 * intg[rf2 - 1]
         W[j] = val
 
+    # Cached on the element's own parameters, so it is shared across atoms,
+    # SCF iterations and molecules. Frozen because callers receive the same
+    # object: a mutation would corrupt every later use rather than one.
+    W.flags.writeable = False
     return W

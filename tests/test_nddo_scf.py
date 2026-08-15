@@ -66,9 +66,16 @@ def test_batch_matches_single():
     mol_list = [(list(a), c) for a, c in MOLS.values()]
     batch_results = nddo_energy_batch(mol_list, method='RM1', use_metal=False)
 
+    # 1e-8 eV, not bit-equality. The two paths reach the same energy by
+    # different float orderings: the single path's core Hamiltonian takes the
+    # batched Slater overlap, which differs from the scalar one by a single ULP
+    # (2.2e-16 measured), and an SCF amplifies that to ~7e-10 eV on a -183 eV
+    # total. The bound is still an order of magnitude under the SCF's own
+    # conv_tol, and any real divergence — a wrong parameter, a mispaired atom —
+    # lands at 1e-3 or worse.
     for i, (name, (atoms, coords)) in enumerate(MOLS.items()):
         single = nddo_energy(list(atoms), coords, method='RM1')
-        assert abs(batch_results[i]['energy_eV'] - single['energy_eV']) < 1e-10, \
+        assert abs(batch_results[i]['energy_eV'] - single['energy_eV']) < 1e-8, \
             f"Batch vs single mismatch for {name}"
 
 

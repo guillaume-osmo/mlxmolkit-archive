@@ -59,6 +59,7 @@ _TETCI_CACHE: dict | None = None
 _OVERLAP_CACHE: dict | None = None
 _E1B_CACHE: dict | None = None
 _ROT_CACHE: dict | None = None
+_YH_CACHE: dict | None = None
 
 
 def _pair_key(p1, p2, c1, c2):
@@ -101,14 +102,14 @@ def pair_cache(pair_specs):
     early exceptions cannot leave a stale geometry installed — which would be
     silently wrong rather than merely slow.
     """
-    global _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE
+    global _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE, _YH_CACHE
     from .overlap_batch import overlap_pairs
     from .overlap_d import overlap_d_batch
     from .rotation_batch import rotate_pairs
     from .tetci_yh import yh_e1b_batch
 
     specs = list(pair_specs)
-    tetci, overlaps, e1b, rot = {}, {}, {}, {}
+    tetci, overlaps, e1b, rot, yh = {}, {}, {}, {}, {}
     is_d = lambda sp: sp[0].n_basis == 9 or sp[1].n_basis == 9
     d_specs = [x for x in specs if is_d(x)]
     sp_specs = [x for x in specs if not is_d(x)]
@@ -124,6 +125,16 @@ def pair_cache(pair_specs):
         for spec, S in zip(directed, overlap_d_batch(directed)):
             if S is not None:
                 overlaps[_pair_key(*spec)] = S
+        # (mu_A nu_A | s_B s_B) for a d atom against a hydrogen. It is a pure
+        # function of the pair's geometry, but `d_two_center_fock` recomputed
+        # it at every SCF iteration — 233 calls and the largest single line in
+        # a thioanisole gradient profile, all of them the same handful of
+        # values. Both of its call sites pass the d atom first.
+        from .tetci_yh import yh_rotated_integral_matrix
+        for spec in (x for x in directed
+                     if x[0].n_basis == 9 and x[1].n_basis == 1):
+            yh[_pair_key(*spec)] = yh_rotated_integral_matrix(*spec)
+
         d_first = [x for x in directed if x[0].n_basis == 9]
         for spec, blk in zip(d_first, yh_e1b_batch(
                 [(a, b) for a, b, _c, _d in d_first],
@@ -131,21 +142,31 @@ def pair_cache(pair_specs):
             e1b[_pair_key(*spec)] = blk
 
     if sp_specs:
-        directed = sp_specs + [(b, a, d, c) for a, b, c, d in sp_specs]
-        for spec, S in zip(directed, overlap_pairs(directed)):
-            if S is not None:
-                overlaps[_pair_key(*spec)] = S
+        # S(B, A) is exactly S(A, B) transposed — <v|u> = <u|v>, and the
+        # direction-vector sign flips that worry p and d blocks cancel because
+        # both the orbital and the frame flip with it. Verified against the
+        # scalar routine for s, p and d shapes. Storing the view instead of
+        # computing the reversed ordering halves the overlap batch, which is
+        # the largest non-SCF item in a gradient.
+        for spec, S in zip(sp_specs, overlap_pairs(sp_specs)):
+            if S is None:
+                continue
+            pA, pB, cA, cB = spec
+            overlaps[_pair_key(pA, pB, cA, cB)] = S
+            overlaps[_pair_key(pB, pA, cB, cA)] = S.T
         ws = rotate_pairs([(a, b) for a, b, _c, _d in sp_specs],
                           [(c, d) for _a, _b, c, d in sp_specs])
         for spec, w in zip(sp_specs, ws):
             rot[_pair_key(*spec)] = w
 
-    prev = (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE)
-    _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE = tetci, overlaps, e1b, rot
+    prev = (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE, _YH_CACHE)
+    (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE,
+     _YH_CACHE) = tetci, overlaps, e1b, rot, yh
     try:
         yield
     finally:
-        _TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE = prev
+        (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE,
+         _YH_CACHE) = prev
 
 
 def _tetci_pair_w(p1, p2, coord1, coord2):

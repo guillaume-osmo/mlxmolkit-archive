@@ -40,6 +40,12 @@ def yh_rotated_integral_matrix(
     This is the shared computation used by both H_core (multiplied by -Z_B)
     and Fock J/K (multiplied by density elements).
     """
+    from .d_two_center import _YH_CACHE, _pair_key
+    if _YH_CACHE is not None:
+        hit = _YH_CACHE.get(_pair_key(pA, pB, coordA, coordB))
+        if hit is not None:
+            return hit
+
     R = float(np.linalg.norm(coordB - coordA))
     R_bohr = R * ANG_TO_BOHR
 

@@ -70,49 +70,8 @@ def _pair_terms(params, coords, i, j, starts, P, n_basis, w=None):
 
 
 
-def _pair_terms_many(params, coords, pairs, starts, P, n_basis):
-    """`_pair_terms` for a list of pairs, rotating them in one vectorised call.
-
-    The scalar rotation costs ~75 us per pair and was the single largest line
-    in a gradient profile. Grouping the pairs and rotating them together turns
-    that into a handful of array operations; the assembly below stays per pair,
-    but it is only numpy slicing.
-
-    d-bearing pairs used to fall back to the scalar path on the grounds that
-    "there are few of them". That is true of the pair count and false of the
-    cost: one d pair costs 2.58 ms in `_tetci_pair_w` against ~70 us for an sp
-    pair, so thioanisole (16 atoms, one sulfur) took 1440 ms per gradient while
-    menthol (31 atoms, no d) took 389 ms. They are batched here through the
-    same TETCI call `prepare_batch` uses.
-    """
-    from .rotation_batch import rotate_pairs
-
-    sp, dd = [], []
-    for i, j in pairs:
-        (sp if params[i].n_basis <= 4 and params[j].n_basis <= 4 else dd).append((i, j))
-
-    from .d_two_center import _ROT_CACHE, _pair_key
-
-    out = {}
-    if sp:
-        if _ROT_CACHE is not None:
-            ws = [_ROT_CACHE.get(_pair_key(params[i], params[j],
-                                           coords[i], coords[j])) for i, j in sp]
-            if any(w is None for w in ws):        # a geometry the cache never saw
-                ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
-                                  [(coords[i], coords[j]) for i, j in sp])
-        else:
-            ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
-                              [(coords[i], coords[j]) for i, j in sp])
-        for k, (i, j) in enumerate(sp):
-            out[(i, j)] = _pair_terms(params, coords, i, j, starts, P, n_basis,
-                                      w=ws[k])
-    for i, j in dd:
-        out[(i, j)] = _pair_terms(params, coords, i, j, starts, P, n_basis)
-    return out
-
-
-def _pair_energy_many(params, coords, pairs, starts, P, n_basis, shift=None):
+def _pair_energy_many(params, coords, pairs, starts, P, n_basis, shift=None,
+                      ws_all=None, S_all=None):
     """Each pair's scalar contribution to `sum(P * (2H + T))`.
 
     A pair's dH and dT are exactly zero outside its four blocks — [sA,sA],
@@ -131,29 +90,42 @@ def _pair_energy_many(params, coords, pairs, starts, P, n_basis, shift=None):
     global shift gives the displaced energy of every pair at once — which is
     what lets the gradient take six batched passes over all pairs instead of
     6N passes over the N-1 pairs touching each atom in turn.
+
+    `ws_all` and `S_all` are the rotations and overlaps for exactly `pairs`, in
+    order. A caller that computed them itself passes them here rather than
+    letting this look each one up: the cache is keyed on coordinate bytes, so
+    serving 2701 pairs from it costs 2701 key constructions and 2701 dict gets
+    per pass, which was the largest cost in this function — larger than the
+    contractions it exists to perform. `ws_all` also arrives as one stacked
+    array, so a shape group slices it instead of restacking 2701 rows.
     """
-    from .scf import (_pair_resonance_block, _pair_fock_twocentre,
-                      _pair_core_attraction)
+    from .scf import (_pair_resonance_block, _pair_resonance_blocks,
+                      _pair_fock_twocentre, _pair_core_attraction)
     from .rotation_batch import rotate_pairs
-    from .d_two_center import _ROT_CACHE, _pair_key
+    from .d_two_center import _OVERLAP_CACHE, _ROT_CACHE, _pair_key
 
     if shift is None:
         coords_b = coords
     else:
         coords_b = coords + np.asarray(shift, dtype=np.float64)
 
-    sp, dd = [], []
-    for i, j in pairs:
-        (sp if params[i].n_basis <= 4 and params[j].n_basis <= 4
-         else dd).append((i, j))
+    sp, dd, sp_pos = [], [], []
+    for k, (i, j) in enumerate(pairs):
+        if params[i].n_basis <= 4 and params[j].n_basis <= 4:
+            sp.append((i, j))
+            sp_pos.append(k)
+        else:
+            dd.append((i, j))
 
     out: dict[tuple[int, int], float] = {}
 
     if sp:
         ws = None
-        if _ROT_CACHE is not None and shift is None:
+        if ws_all is not None:
+            ws = ws_all[np.asarray(sp_pos)] if dd else ws_all
+        elif _ROT_CACHE is not None:
             ws = [_ROT_CACHE.get(_pair_key(params[i], params[j],
-                                           coords[i], coords[j])) for i, j in sp]
+                                           coords[i], coords_b[j])) for i, j in sp]
             if any(w is None for w in ws):
                 ws = None
         if ws is None:
@@ -177,16 +149,37 @@ def _pair_energy_many(params, coords, pairs, starts, P, n_basis, shift=None):
             rows_a = ia[:, None] + np.arange(nA)
             rows_b = ib[:, None] + np.arange(nB)
 
-            W = np.stack([ws[k] for k in ks])[:, :nA, :nA, :nB, :nB]
+            W = (ws[sel] if isinstance(ws, np.ndarray)
+                 else np.stack([ws[k] for k in ks]))[:, :nA, :nA, :nB, :nB]
             P_AA = P[rows_a[:, :, None], rows_a[:, None, :]]
             P_BB = P[rows_b[:, :, None], rows_b[:, None, :]]
             P_AB = P[rows_a[:, :, None], rows_b[:, None, :]]
             P_BA = P[rows_b[:, :, None], rows_a[:, None, :]]
 
-            h_ab = np.stack([
-                _pair_resonance_block(params[sp[k][0]], params[sp[k][1]],
-                                      coords[sp[k][0]], coords_b[sp[k][1]])
-                for k in ks])
+            # The cache holds this group's overlaps whenever the caller
+            # declared the geometry, which is the gradient's own path. Fall
+            # back to the scalar block otherwise — the cache is an
+            # optimisation, never a precondition.
+            pA = [params[sp[k][0]] for k in ks]
+            pB = [params[sp[k][1]] for k in ks]
+            S = None
+            if S_all is not None:
+                fetched = [S_all[sp_pos[k]] for k in ks]
+                if all(s is not None for s in fetched):
+                    S = np.stack(fetched)
+            elif _OVERLAP_CACHE is not None:
+                fetched = [_OVERLAP_CACHE.get(
+                    _pair_key(params[sp[k][0]], params[sp[k][1]],
+                              coords[sp[k][0]], coords_b[sp[k][1]])) for k in ks]
+                if all(s is not None for s in fetched):
+                    S = np.stack(fetched)
+            if S is not None:
+                h_ab = _pair_resonance_blocks(pA, pB, S)
+            else:
+                h_ab = np.stack([
+                    _pair_resonance_block(params[sp[k][0]], params[sp[k][1]],
+                                          coords[sp[k][0]], coords_b[sp[k][1]])
+                    for k in ks])
             val_b = np.asarray([float(params[sp[k][1]].n_valence) for k in ks])
             val_a = np.asarray([float(params[sp[k][0]].n_valence) for k in ks])
             h_aa = -val_b[:, None, None] * W[:, :, :, 0, 0]
@@ -246,7 +239,7 @@ def analytical_gradient(
         result: SCF result dict
         gradient: (n_atoms, 3) in eV/Angstrom
     """
-    from .scf import _build_basis_info, _build_core_hamiltonian, _build_fock
+    from .scf import _build_basis_info
     from .d_two_center import pair_cache
 
     PARAMS = get_params(method)
@@ -274,31 +267,53 @@ def analytical_gradient(
             delta[d] = sign * step
             shifts.append((d, sign, delta))
 
-    # Every pair this gradient will ask for, at every geometry it will ask at:
-    # the reference geometry — which the SCF, H_ref, F_ref and pair_ref all
-    # use — and each displacement's own N-1 dirty pairs. `_pair_terms_many`
-    # already batched the sp rotation, but only within one displacement: 86
-    # calls of ~15 pairs for benzaldehyde, where all 1092 in one call is 2.4 ms
-    # against 23.6. Batching across all 6N geometries is the whole win.
-    pair_specs = [(params[i], params[j], coords[i], coords[j])
-                  for i in range(n_atoms) for j in range(i + 1, n_atoms)]
-    for _d, _sign, delta in shifts:
-        for i in range(n_atoms):
-            for j in range(i + 1, n_atoms):
-                pair_specs.append((params[i], params[j],
-                                   coords[i], coords[j] + delta))
+    all_pairs = [(i, j) for i in range(n_atoms) for j in range(i + 1, n_atoms)]
+    ref_specs = [(params[i], params[j], coords[i], coords[j])
+                 for i, j in all_pairs]
 
-    with pair_cache(pair_specs):
+    # An all-sp molecule takes the ordered path: the six displaced geometries
+    # are computed here in one batch each and handed to `_pair_energy_many`
+    # positionally, so they never enter the cache. The cache is keyed on
+    # coordinate bytes, and for 6 * N(N-1)/2 pairs that key is most of the
+    # cost — building the dict, then a key and a dict get per pair per pass,
+    # to serve a consumer that already knows exactly which row it wants. Only
+    # the reference geometry still needs to be looked up by key, because the
+    # SCF reaches it through routines that take one pair at a time.
+    #
+    # A d-bearing molecule keeps declaring everything: its displaced pairs are
+    # consumed by `_pair_terms`, which reaches the TETCI, attraction and
+    # overlap caches by key from several call sites.
+    if any(p.n_basis == 9 for p in params):
+        pair_specs = list(ref_specs)
+        for _d, _sign, delta in shifts:
+            pair_specs.extend((params[i], params[j], coords[i], coords[j] + delta)
+                              for i, j in all_pairs)
+        with pair_cache(pair_specs):
+            return _gradient_body(atoms, coords, method, step, molecular_charge,
+                                  scf_result, PARAMS, info, params, starts,
+                                  n_atoms, shifts, all_pairs, None, None)
+
+    from .overlap_batch import overlap_pairs
+    from .rotation_batch import rotate_pairs
+
+    shifted_specs = []
+    for _d, _sign, delta in shifts:
+        shifted_specs.extend((params[i], params[j], coords[i], coords[j] + delta)
+                             for i, j in all_pairs)
+    ws_shift = rotate_pairs([(a, b) for a, b, _c, _d in shifted_specs],
+                            [(c, d) for _a, _b, c, d in shifted_specs])
+    S_shift = overlap_pairs(shifted_specs)
+
+    with pair_cache(ref_specs):
         return _gradient_body(atoms, coords, method, step, molecular_charge,
                               scf_result, PARAMS, info, params, starts,
-                              n_atoms, shifts)
+                              n_atoms, shifts, all_pairs, ws_shift, S_shift)
 
 
 def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
-                   PARAMS, info, params, starts, n_atoms, shifts):
+                   PARAMS, info, params, starts, n_atoms, shifts, all_pairs,
+                   ws_shift, S_shift):
     """The gradient itself, run inside the TETCI cache installed above."""
-    from .scf import _build_core_hamiltonian, _build_fock
-
     # `scf_result` lets a batched caller solve every molecule's SCF in one
     # dispatch and hand the converged density in, rather than each gradient
     # re-solving its own.
@@ -309,34 +324,15 @@ def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
     P = result['density']
     n_basis = info['n_basis']
 
-    H_ref = _build_core_hamiltonian(atoms, coords, info)
-    F_ref = _build_fock(H_ref, P, info, atoms, coords)
-
-    # The one-centre Fock block is whatever F is not explained by H and the
-    # two-centre pairs. It depends only on P and the atom parameters, so it is
-    # the same at every displaced geometry and never needs rebuilding.
-    all_pairs = [(i, j) for i in range(n_atoms) for j in range(i + 1, n_atoms)]
-    pair_ref = _pair_terms_many(params, coords, all_pairs, starts, P, n_basis)
-    T_ref = np.zeros((n_basis, n_basis))
-    for _dH, dT in pair_ref.values():
-        T_ref += dT
-    G_one = F_ref - H_ref - T_ref
-
-    # Core-core repulsion is a plain sum over pairs, so it gets the same
-    # treatment as H and F: keep the reference total and the per-pair terms,
-    # and patch only the pairs that move. Rebuilding it in full at each of the
-    # 6N displacements was 46% of a menthol gradient.
-    E_nuc_ref = nuclear_repulsion_for_method(atoms, coords, PARAMS, method)
-    nuc_ref = {(i, j): pair_repulsion_for_method(atoms, coords, i, j, PARAMS, method)
-               for i in range(n_atoms) for j in range(i + 1, n_atoms)}
-
-    # E_elec = 0.5 * sum(P * (H + F)) with F = H + G_one + T, so it is
-    # 0.5 * sum(P * (2H + G_one + T)). G_one and the one-centre part of H do
-    # not move, so a displaced geometry differs from the reference only by the
-    # pairs that changed — and each pair's whole contribution is one scalar.
-    E_elec_ref = 0.5 * float(np.sum(P * (H_ref + F_ref)))
-    pair_energy_ref = _pair_energy_many(params, coords, all_pairs, starts, P,
-                                        n_basis)
+    # Nothing at the reference geometry is needed. A central difference is
+    # (E(+d) - E(-d)) / 2d: the reference value cancels. The earlier scheme
+    # patched a displaced energy onto a reference total, so it had to build
+    # H_ref, F_ref, the one-centre Fock block and a per-pair core-core dict
+    # first; the rigid-shift scheme differences the pair terms directly and
+    # never refers to any of them. Building them anyway cost 36% of a
+    # cholesterol gradient, most of it the 2 * N(N-1)/2 full (n_basis,
+    # n_basis) matrices `_pair_terms_many` allocates to be summed into a
+    # T_ref that then fed only a dead variable.
 
     # Six batched passes over every pair, rather than 6N passes over the N-1
     # pairs touching one atom. Each pass shifts every pair's second atom by
@@ -345,7 +341,6 @@ def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
     # evaluations against the 6N * (N-1) = 6N^2 the per-atom scheme needed,
     # and each pass is one shape-grouped contraction over all 2701 pairs
     # instead of 444 contractions over 73.
-    pair_index = {key: k for k, key in enumerate(all_pairs)}
     ia = np.fromiter((i for i, _ in all_pairs), dtype=int, count=len(all_pairs))
     ib = np.fromiter((j for _, j in all_pairs), dtype=int, count=len(all_pairs))
 
@@ -373,18 +368,27 @@ def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
                 np.stack([coords_i[k], coords_j[k]]), 0, 1, PARAMS, method)
             for k, (i, j) in enumerate(all_pairs)])
 
-    def pair_energies(delta):
-        """Every pair's total energy with its second atom shifted by delta."""
-        elec = _pair_energy_many(params, coords, all_pairs, starts, P, n_basis,
-                                 shift=delta)
+    n_pairs = len(all_pairs)
+
+    def pair_energies(g, delta):
+        """Every pair's total energy with its second atom shifted by delta.
+
+        `g` indexes the shift, which is also the block of `ws_shift`/`S_shift`
+        this geometry occupies — they were built shift-major over `all_pairs`.
+        """
+        block = slice(g * n_pairs, (g + 1) * n_pairs)
+        elec = _pair_energy_many(
+            params, coords, all_pairs, starts, P, n_basis, shift=delta,
+            ws_all=None if ws_shift is None else ws_shift[block],
+            S_all=None if S_shift is None else S_shift[block])
         elec_arr = np.fromiter((elec[key] for key in all_pairs), dtype=float,
-                               count=len(all_pairs))
+                               count=n_pairs)
         return 0.5 * elec_arr + pair_repulsions(coords[ia], coords[ib] + delta)
 
     plus = {}
     minus = {}
-    for d, sign, delta in shifts:
-        (plus if sign > 0 else minus)[d] = pair_energies(delta)
+    for g, (d, sign, delta) in enumerate(shifts):
+        (plus if sign > 0 else minus)[d] = pair_energies(g, delta)
 
     gradient = np.zeros((n_atoms, 3))
     for d in range(3):

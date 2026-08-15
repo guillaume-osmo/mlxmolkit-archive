@@ -231,6 +231,9 @@ def _assemble(jcall, S, rot, n_a, n_b):
     return di
 
 
+_UNSEEN = object()
+
+
 def overlap_pairs(pair_specs):
     """Molecular-frame overlaps for a heterogeneous list of sp pairs.
 
@@ -260,6 +263,15 @@ def overlap_pairs(pair_specs):
         ends = np.asarray([spec[3] for spec in pair_specs], dtype=np.float64)
         coincident = np.linalg.norm(ends - starts, axis=1) < 1e-10
 
+    # Which group a pair belongs to is decided by its two elements alone, not
+    # by where they sit — so it is memoised on (Z_A, Z_B). A gradient hands
+    # this the same N(N-1)/2 element pairs once per displaced geometry, and the
+    # triage was 40% of `overlap_pairs`' own time: two `principal_qn` lookups
+    # and a dict get per spec, 18,907 times for cholesterol against the six
+    # distinct element pairs that actually occur. The memo is call-local
+    # because Z does not identify a parameter set across methods.
+    triage: dict[tuple[int, int], tuple | None] = {}
+
     for k, (pA, pB, rA, rB) in enumerate(pair_specs):
         if coincident[k]:
             # Coincident centres: the scalar short-circuits to an identity
@@ -269,13 +281,19 @@ def overlap_pairs(pair_specs):
             np.fill_diagonal(block, 1.0)
             out[k] = block
             continue
-        swap = principal_qn(pA.Z) < principal_qn(pB.Z)
-        a, b = (pB, pA) if swap else (pA, pB)
-        jcall = _JCALL.get((principal_qn(a.Z), principal_qn(b.Z)))
-        if jcall is None or a.n_basis > 4 or b.n_basis > 4:
+        zkey = (pA.Z, pB.Z)
+        group = triage.get(zkey, _UNSEEN)
+        if group is _UNSEEN:
+            swap = principal_qn(pA.Z) < principal_qn(pB.Z)
+            a, b = (pB, pA) if swap else (pA, pB)
+            jcall = _JCALL.get((principal_qn(a.Z), principal_qn(b.Z)))
+            group = (None if jcall is None or a.n_basis > 4 or b.n_basis > 4
+                     else (jcall, a.n_basis, b.n_basis, swap))
+            triage[zkey] = group
+        if group is None:
             out[k] = overlap_molecular_frame(pA, pB, rA, rB)
             continue
-        groups.setdefault((jcall, a.n_basis, b.n_basis, swap), []).append(k)
+        groups.setdefault(group, []).append(k)
 
     for (jcall, n_a, n_b, swap), idxs in groups.items():
         sel = np.array(idxs)
