@@ -37,6 +37,17 @@ dependencies = [
 
 [project.optional-dependencies]
 rdkit = ["rdkit"]
+# numba stays optional at runtime — every call site is guarded and falls back
+# to the NumPy path — but when it is installed the floor is 0.67. numba 0.60
+# pins numpy<2.1 and cannot import under the numpy>=2.0 this package requires
+# once the environment moves past 2.0; 0.67 allows numpy<2.6.
+#
+# Only `_generate_rotation_matrix_kernel` is live. `_w_withquaternion_kernel`
+# is disabled at `_W_KERNEL_ENABLED` because it returns wrong d-orbital
+# integrals — silently, and not as a JIT artifact: it fails identically under
+# NUMBA_DISABLE_JIT=1 (CSC -786.50 against the correct -501.09). Do not
+# re-enable it without the exactness check in tests/test_numba_w_kernel.py.
+jit = ["numba>=0.67"]
 # scikit-image supplies marching cubes for connolly.py and surface.py. 0.25 is
 # the first release built against numpy 2; 0.22 imports fine under numpy 1 and
 # raises a binary-incompatibility ValueError under numpy 2.
@@ -53,8 +64,12 @@ test = [
     # clean clone — and `-p no:cov` does not help because pytest-cov is not
     # what pulls coverage in.
     "coverage>=7.6",
+    # Run the suite with the JIT path live. The wrong-d-orbital-integral bug
+    # (#72) was invisible here for a whole campaign and surfaced only on a
+    # second machine that happened to have numba installed.
+    "numba>=0.67",
 ]
-all = ["rdkit", "scikit-image>=0.25"]
+all = ["rdkit", "scikit-image>=0.25", "numba>=0.67"]
 
 [project.urls]
 Homepage = "https://github.com/guillaume-osmo/mlxmolkit"
