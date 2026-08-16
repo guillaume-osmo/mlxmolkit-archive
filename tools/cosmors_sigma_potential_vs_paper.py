@@ -8,6 +8,8 @@ compare shapes after the same standardization.
 
 This script lets the user choose the σ-profile backend per molecule:
 
+  --backend pm6       :  NDDO (PM6) charges + ddCOSMO — mlxmolkit.cosmo.
+                         Also rm1 / am1 / pm3. ~50 ms per molecule.
   --backend tmcosmo   :  hybrid g-xTB --opt + GFN2 --tmcosmo inf (cheap)
   --backend orca      :  tiered g-xTB --opt + ORCA BP86/TZVP COSMORS (DFT)
 
@@ -97,6 +99,31 @@ def sigma_pot_tmcosmo(smi: str) -> np.ndarray:
     return mu  # J/mol
 
 
+def sigma_pot_nddo(smi: str, method: str = "PM6") -> np.ndarray:
+    """mu_S on PAPER_SIGMA_E_PER_A2 from NDDO charges through ddCOSMO.
+
+    This is `mlxmolkit.cosmo` — the semiempirical path — as opposed to the
+    g-xTB/GFN2 backends above, which is what every other cosmors_* tool
+    measures. The COSMO module was never benchmarked against this dataset.
+
+    `smiles_to_cosmo` already returns Klamt-averaged segment sigmas, so it
+    feeds `sigma_potential_from_arrays` directly rather than going through the
+    averaging again.
+    """
+    from mlxmolkit.cosmo import smiles_to_cosmo
+    from mlxmolkit.xtb import sigma_potential_from_arrays
+
+    cosmo = smiles_to_cosmo(smi, method=method)
+    if cosmo is None:
+        raise RuntimeError(f"smiles_to_cosmo returned None for {smi!r}")
+    _, mu = sigma_potential_from_arrays(
+        np.asarray(cosmo["seg_sigma_av"], dtype=np.float64),
+        np.asarray(cosmo["seg_area"], dtype=np.float64),
+        sigma_grid_e_per_A2=PAPER_SIGMA_E_PER_A2,
+    )
+    return mu  # J/mol
+
+
 def sigma_pot_orca(smi: str, n_cores: int = 1) -> np.ndarray:
     """μ_S from g-xTB opt + ORCA BP86/def2-TZVP COSMORS (single conformer)."""
     from mlxmolkit.xtb import (
@@ -159,7 +186,9 @@ def _worker(task: dict) -> dict | None:
     try:
         t0 = time.perf_counter()
         meta_extra: dict = {}
-        if backend == "tmcosmo":
+        if backend in ("pm6", "rm1", "am1", "pm3"):
+            mu_ours = sigma_pot_nddo(smi, method=backend.upper())
+        elif backend == "tmcosmo":
             mu_ours = sigma_pot_tmcosmo(smi)
         elif backend == "orca":
             mu_ours = sigma_pot_orca(smi, n_cores=task.get("orca_cores", 1))
@@ -198,7 +227,10 @@ def main() -> None:
     parser.add_argument("--skip", type=int, default=0,
                         help="skip the first N matching rows before starting (use to pull the next batch)")
     parser.add_argument("--max-heavy", type=int, default=10)
-    parser.add_argument("--backend", choices=["tmcosmo", "orca", "orca-multi", "orca-auto"], default="tmcosmo",
+    parser.add_argument("--backend",
+                        choices=["pm6", "rm1", "am1", "pm3",
+                                 "tmcosmo", "orca", "orca-multi", "orca-auto"],
+                        default="tmcosmo",
                         help="orca-multi: RDKit→g-xTB-screen→ORCA on each survivor, Boltzmann-weighted. "
                              "orca-auto: detects complex cases and switches between single and deep-multi.")
     parser.add_argument("--n-conformers", type=int, default=10,
