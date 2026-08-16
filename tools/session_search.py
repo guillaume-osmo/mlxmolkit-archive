@@ -225,6 +225,28 @@ def cmd_search(args) -> None:
     # session already overturned. Recency is evidence: a more recent statement
     # about the same thing is usually the corrected one. rank is negative and
     # more-negative is better, so age is *added* as a penalty.
+    if args.hybrid:
+        hits, n_lex, n_dense = hybrid_search(con, args.query, args.limit,
+                                             args.recency)
+        print(f"{len(hits)} hybrid match(es) for {args.query!r}  "
+              f"(bm25 {n_lex}, cosine {n_dense})\n")
+        for h in hits:
+            text, project, session, role, ts = h["row"]
+            print(f"\033[1m{(ts or '')[:16].replace('T',' ')}  {project}  "
+                  f"[{role}]\033[0m  {session[:8]}  "
+                  f"rrf {h['rrf']:.4f}  {'+'.join(h['via'])}")
+            print(f"    {' '.join(text.split())[:250]}\n")
+        return
+
+    if args.semantic:
+        hits = semantic_search(con, args.query, args.limit)
+        print(f"{len(hits)} semantic match(es) for {args.query!r}\n")
+        for text, project, session, role, ts, score in hits:
+            print(f"\033[1m{(ts or '')[:16].replace('T',' ')}  {project}  "
+                  f"[{role}]\033[0m  {session[:8]}  cos {score:.3f}")
+            print(f"    {' '.join(text.split())[:260]}\n")
+        return
+
     if args.fuzzy:
         hits = con.execute(
             "SELECT f.text, m.project, f.session, 'user', max(m.ts) "
@@ -403,6 +425,243 @@ def cmd_recall(args) -> None:
     for text, project, session, ts, _ in keep[:args.limit]:
         print(f"- [{(ts or '')[:10]} {project} {session[:8]}] {snippet(text, terms, 200)}")
 
+
+def all_signals(con, refresh: bool = False) -> dict[str, set[str]]:
+    """Signals per session, cached — recomputing costs a full table scan."""
+    con.execute("CREATE TABLE IF NOT EXISTS signals "
+                "(session TEXT PRIMARY KEY, sig TEXT, last_ts TEXT)")
+    known = {r[0]: (r[1], r[2]) for r in
+             con.execute("SELECT session, sig, last_ts FROM signals")}
+    live = dict(con.execute(
+        "SELECT session, max(ts) FROM messages WHERE ts != '' GROUP BY session"))
+    out, dirty = {}, []
+    for session, last in live.items():
+        cached = known.get(session)
+        if cached and cached[1] == last and not refresh:
+            out[session] = set(filter(None, cached[0].split("\x1f")))
+            continue
+        sig = session_signals(con, session)
+        out[session] = sig
+        dirty.append((session, "\x1f".join(sorted(sig)), last))
+    if dirty:
+        con.executemany("INSERT OR REPLACE INTO signals VALUES (?,?,?)", dirty)
+        con.commit()
+    return out
+
+
+def cmd_goals(args) -> None:
+    """Cluster sessions into goals.
+
+    A session is a unit of *time*; a goal is a unit of *work*, and the two do
+    not line up. One goal runs across several sessions, several days and often
+    several repositories — the mlxmolkit work here reaches into osmo, and the
+    f2b thread spans three checkouts. Grouping by project directory therefore
+    splits goals apart and merges unrelated ones, because the directory is
+    just where the shell happened to be.
+
+    So the grouping is the artifact graph: sessions sharing files, branches or
+    issue numbers are joined, and connected components are the goals. Edges
+    are thresholded on Jaccard so one shared README does not fuse everything.
+    """
+    con = connect()
+    sigs = {k: v for k, v in all_signals(con).items() if len(v) >= args.min_signals}
+
+    # Drop hub signals. `README.md`, `setup.py` and a handful of issue numbers
+    # appear in most sessions, and a shared README says nothing about two
+    # sessions being the same work. Left in, they fused 75 unrelated sessions
+    # spanning two months into a single "goal". Anything in more than
+    # `--max-df` of sessions carries no information and is removed.
+    from collections import Counter
+    df = Counter(sig for s_ in sigs.values() for sig in s_)
+    cutoff = max(2, int(args.max_df * len(sigs)))
+    hubs = {sig for sig, n in df.items() if n > cutoff}
+    sigs = {k: (v - hubs) for k, v in sigs.items()}
+    sigs = {k: v for k, v in sigs.items() if len(v) >= args.min_signals}
+    names = sorted(sigs)
+    if args.verbose and hubs:
+        print(f"  dropped {len(hubs)} hub signal(s) seen in >{cutoff} sessions: "
+              f"{', '.join(sorted(hubs)[:8])}\n")
+
+    parent = {n: n for n in names}
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    edges = 0
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            sa, sb = sigs[a], sigs[b]
+            shared = sa & sb
+            if not shared:
+                continue
+            if len(shared) / len(sa | sb) >= args.threshold:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+                edges += 1
+
+    clusters: dict[str, list[str]] = {}
+    for n in names:
+        clusters.setdefault(find(n), []).append(n)
+
+    meta = {r[0]: (r[1], r[2], r[3]) for r in con.execute(
+        "SELECT session, min(ts), max(ts), count(*) FROM messages "
+        "WHERE ts != '' GROUP BY session")}
+    projects = {r[0]: r[1] for r in con.execute(
+        "SELECT session, project FROM messages GROUP BY session")}
+
+    ranked = sorted(clusters.values(),
+                    key=lambda c: max(meta[s][1] for s in c), reverse=True)
+    print(f"{len(ranked)} goal(s) from {len(names)} sessions, "
+          f"{edges} edges at Jaccard >= {args.threshold}\n")
+
+    for group in ranked[:args.limit]:
+        group = sorted(group, key=lambda s: meta[s][1])
+        first, last = meta[group[0]][0], max(meta[s][1] for s in group)
+        repos = sorted({projects[s].split("/")[-1] or projects[s] for s in group})
+        msgs = sum(meta[s][2] for s in group)
+        opening = con.execute(
+            "SELECT text FROM messages WHERE session=? AND role='user' "
+            "ORDER BY ts LIMIT 1", (group[0],)).fetchone()
+        gist = " ".join((opening[0] if opening else "").split())[:130]
+
+        shared = set.intersection(*(sigs[s] for s in group)) if len(group) > 1 else sigs[group[0]]
+        print(f"\033[1m{first[:10]} → {last[:10]}\033[0m  "
+              f"{len(group)} session(s), {msgs} msgs")
+        print(f"    repos: {', '.join(repos[:4])}")
+        if shared:
+            print(f"    shared: {', '.join(sorted(shared)[:6])}")
+        print(f"    {gist}")
+        print(f"    ids: {' '.join(s[:8] for s in group[:8])}\n")
+
+
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBED_DIM = 384
+
+
+def _load_embedder():
+    from sentence_transformers import SentenceTransformer
+    import torch
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    return SentenceTransformer(EMBED_MODEL, device=device), device
+
+
+def cmd_embed(args) -> None:
+    """Dense vectors for every message, so recall survives different wording.
+
+    FTS5 and trigram are both lexical: they need the words, or at least the
+    characters. "the dataset that was too big for perfumery" finds nothing
+    lexically even though the answer exists, because the answer says
+    "applicability domain" and "MW > 300 Da".
+
+    Stored as float16 in SQLite — 57,880 x 384 x 2 B is ~44 MB, and the
+    precision loss is far below the noise in a cosine ranking. Only user
+    prompts and assistant prose are embedded; tool invocations are excluded
+    for the same reason `recall` skips them.
+    """
+    import numpy as np
+
+    con = connect()
+    con.execute("CREATE TABLE IF NOT EXISTS embeddings ("
+                "rowid_ INTEGER PRIMARY KEY, vec BLOB)")
+    have = {r[0] for r in con.execute("SELECT rowid_ FROM embeddings")}
+    rows = [(r[0], r[1]) for r in con.execute(
+        "SELECT rowid, text FROM messages WHERE ts != ''")
+        if r[0] not in have and not r[1].lstrip().startswith("[")]
+    if not rows:
+        print("embeddings up to date")
+        return
+
+    model, device = _load_embedder()
+    print(f"embedding {len(rows)} message(s) on {device}…")
+    t0 = time.perf_counter()
+    B = 512
+    for i in range(0, len(rows), B):
+        chunk = rows[i:i + B]
+        vecs = model.encode([t[:1200] for _, t in chunk],
+                            batch_size=128, normalize_embeddings=True,
+                            show_progress_bar=False)
+        con.executemany("INSERT OR REPLACE INTO embeddings VALUES (?,?)",
+                        [(rid, np.asarray(v, dtype=np.float16).tobytes())
+                         for (rid, _), v in zip(chunk, vecs)])
+        con.commit()
+        done = min(i + B, len(rows))
+        print(f"  {done}/{len(rows)}  {done/(time.perf_counter()-t0):.0f}/s", end="\r")
+    print(f"\n{len(rows)} embedded in {time.perf_counter()-t0:.0f}s")
+
+
+def semantic_search(con, query: str, limit: int):
+    import numpy as np
+
+    rows = con.execute(
+        "SELECT e.rowid_, e.vec, m.text, m.project, m.session, m.role, m.ts "
+        "FROM embeddings e JOIN messages m ON m.rowid = e.rowid_").fetchall()
+    if not rows:
+        raise SystemExit("no embeddings — run `embed` first")
+    mat = np.frombuffer(b"".join(r[1] for r in rows),
+                        dtype=np.float16).reshape(len(rows), EMBED_DIM)
+    model, _ = _load_embedder()
+    q = np.asarray(model.encode([query], normalize_embeddings=True)[0],
+                   dtype=np.float32)
+    scores = mat.astype(np.float32) @ q
+    top = np.argpartition(-scores, min(limit, len(scores) - 1))[:limit]
+    top = top[np.argsort(-scores[top])]
+    return [(rows[i][2], rows[i][3], rows[i][4], rows[i][5], rows[i][6],
+             float(scores[i])) for i in top]
+
+
+def hybrid_search(con, query: str, limit: int, recency: float, k: int = 60):
+    """Reciprocal-rank fusion of lexical and semantic retrieval.
+
+    The two fail in opposite directions and neither dominates:
+
+      * BM25 needs the words. "the dataset molecules were too big to smell"
+        returns nothing, though the answer is there under "applicability
+        domain" and "MW > 300 Da".
+      * Cosine needs no words but has no notion of an exact token, so a
+        specific identifier — a branch name, `MF_ALPHA_PM6`, issue #4268 —
+        ranks no better than a paraphrase of it.
+
+    RRF merges the two *rankings* rather than their scores, which is the point:
+    a bm25 rank and a cosine similarity are not on a common scale, and
+    normalising them is a tuning exercise that has to be redone per corpus.
+    Rank position needs no calibration. Each list contributes 1/(k + rank),
+    k = 60 as in Cormack et al.
+    """
+    lex_sql = ("SELECT text, project, session, role, ts, "
+               "  rank + ? * (julianday('now') - julianday(substr(ts,1,19))) AS score "
+               "FROM messages WHERE messages MATCH ? AND ts != '' "
+               "ORDER BY score LIMIT ?")
+    try:
+        lexical = con.execute(lex_sql, (recency, query, limit * 4)).fetchall()
+    except sqlite3.OperationalError:
+        # Unparseable as FTS5 (bare punctuation, stray quotes) — semantic alone
+        # still answers, which is better than failing the whole query.
+        lexical = []
+
+    try:
+        dense = semantic_search(con, query, limit * 4)
+    except SystemExit:
+        dense = []
+
+    fused: dict[tuple, dict] = {}
+    for rank, row in enumerate(lexical):
+        key = (row[2], row[4])
+        fused.setdefault(key, {"row": row[:5], "rrf": 0.0, "via": []})
+        fused[key]["rrf"] += 1.0 / (k + rank)
+        fused[key]["via"].append(f"bm25#{rank+1}")
+    for rank, row in enumerate(dense):
+        key = (row[2], row[4])
+        fused.setdefault(key, {"row": row[:5], "rrf": 0.0, "via": []})
+        fused[key]["rrf"] += 1.0 / (k + rank)
+        fused[key]["via"].append(f"cos#{rank+1}")
+
+    out = sorted(fused.values(), key=lambda d: -d["rrf"])[:limit]
+    return out, len(lexical), len(dense)
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -417,6 +676,11 @@ def main() -> None:
     s.add_argument("--since", help="ISO date, e.g. 2026-06-01")
     s.add_argument("--until")
     s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--hybrid", action="store_true",
+                   help="reciprocal-rank fusion of bm25 and cosine — use this "
+                        "unless you want to see one method alone")
+    s.add_argument("--semantic", action="store_true",
+                   help="dense-vector search — finds by meaning, needs `embed`")
     s.add_argument("--fuzzy", action="store_true",
                    help="trigram substring match — survives typos and "
                         "punctuation (cosmosac finds COSMO-SAC)")
@@ -440,6 +704,20 @@ def main() -> None:
     rc.add_argument("prompt")
     rc.add_argument("--limit", type=int, default=3)
     rc.set_defaults(func=cmd_recall)
+
+    g = sub.add_parser("goals", help="cluster sessions into units of work, across repos")
+    g.add_argument("--threshold", type=float, default=0.10,
+                   help="Jaccard needed to join two sessions (default 0.10)")
+    g.add_argument("--min-signals", type=int, default=4)
+    g.add_argument("--max-df", type=float, default=0.15,
+                   help="drop signals appearing in more than this fraction of "
+                        "sessions; they are hubs and carry no information")
+    g.add_argument("--verbose", action="store_true")
+    g.add_argument("--limit", type=int, default=12)
+    g.set_defaults(func=cmd_goals)
+
+    e = sub.add_parser("embed", help="build dense vectors for semantic search")
+    e.set_defaults(func=cmd_embed)
 
     args = ap.parse_args()
     if args.cmd == "index":
