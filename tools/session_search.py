@@ -110,7 +110,13 @@ def connect() -> sqlite3.Connection:
     con.executescript(
         """
         CREATE TABLE IF NOT EXISTS files (
-            path TEXT PRIMARY KEY, mtime REAL, size INTEGER, n_rows INTEGER
+            path TEXT PRIMARY KEY, mtime REAL, size INTEGER, n_rows INTEGER,
+            -- Bytes already consumed. Transcripts are append-only while a
+            -- session is live, so the file being written to right now is
+            -- exactly the one that would otherwise be re-parsed in full on
+            -- every refresh. Seeking to this offset makes a refresh cost the
+            -- new lines only.
+            offset INTEGER DEFAULT 0
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
             text, project UNINDEXED, session UNINDEXED, role UNINDEXED,
@@ -136,8 +142,8 @@ def index_all(con: sqlite3.Connection, verbose: bool = True) -> None:
     if verbose and len(roots) > 1:
         print(f"indexing {len(roots)} transcript roots: "
               + ", ".join(str(r) + (f" [{t}]" if t else "") for r, t in roots))
-    seen = {row[0]: (row[1], row[2]) for row in
-            con.execute("SELECT path, mtime, size FROM files")}
+    seen = {row[0]: (row[1], row[2], row[3], row[4]) for row in
+            con.execute("SELECT path, mtime, size, offset, n_rows FROM files")}
     added = skipped = 0
     t0 = time.perf_counter()
 
@@ -148,14 +154,25 @@ def index_all(con: sqlite3.Connection, verbose: bool = True) -> None:
             skipped += 1
             continue
 
-        con.execute("DELETE FROM messages WHERE path = ?", (str(path),))
-        con.execute("DELETE FROM messages_fuzzy WHERE session = ?", (path.stem,))
+        # Append-only growth: keep what is indexed and read from the offset.
+        # Anything else — a shrunk file, a rewritten one, a row with no
+        # recorded offset — falls back to a full reparse, because a wrong
+        # offset silently indexes from the middle of a line.
+        start = 0
+        if known and known[2] and stat.st_size > known[2]:
+            start = known[2]
+        else:
+            con.execute("DELETE FROM messages WHERE path = ?", (str(path),))
+            con.execute("DELETE FROM messages_fuzzy WHERE session = ?", (path.stem,))
+
         project = project_label(path.parent)
         if account:
             project = f"{account}:{project}"
         session = path.stem
         rows = []
         with path.open(errors="replace") as fh:
+            if start:
+                fh.seek(start)
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -180,12 +197,21 @@ def index_all(con: sqlite3.Connection, verbose: bool = True) -> None:
         con.executemany(
             "INSERT INTO messages_fuzzy (text, session) VALUES (?,?)",
             [(r[0][:2000], r[2]) for r in rows if r[3] == "user"])
+
+        # `tell()` on an iterating text file is unreliable, so the offset that
+        # gets stored is the size that was just fully consumed.
+        end = stat.st_size
+        # known = (mtime, size, offset, n_rows); keep the prior count only
+        # when this was an incremental read, since a full reparse replaced it.
+        prior = (known[3] if known and start else 0) or 0
         con.execute(
-            "INSERT OR REPLACE INTO files (path, mtime, size, n_rows) VALUES (?,?,?,?)",
-            (str(path), stat.st_mtime, stat.st_size, len(rows)))
+            "INSERT OR REPLACE INTO files (path, mtime, size, n_rows, offset) "
+            "VALUES (?,?,?,?,?)",
+            (str(path), stat.st_mtime, stat.st_size, prior + len(rows), end))
         added += 1
         if verbose:
-            print(f"  indexed {project}/{session[:8]}  {len(rows)} messages")
+            how = f"+{len(rows)} new" if start else f"{len(rows)} messages"
+            print(f"  indexed {project}/{session[:8]}  {how}")
 
     con.commit()
     total = con.execute("SELECT count(*) FROM messages").fetchone()[0]
@@ -397,15 +423,47 @@ def cmd_recall(args) -> None:
     terms = [t for t in re.findall(r"[A-Za-z][\w-]{3,}", args.prompt)][:12]
     if len(terms) < 2:
         return
+    # Recall runs on every prompt, so it must stay in the tens of
+    # milliseconds. Dense retrieval cannot: `import sentence_transformers` is
+    # 2.6 s and loading the model another 2.9 s, paid per invocation because a
+    # hook is a fresh subprocess — 7 s wall against 0.4 s of actual encoding.
+    # So the default fuses the two cheap retrievers, bm25 and trigram, which
+    # cost milliseconds and disagree usefully: bm25 ranks by term weight,
+    # trigram survives the misspelling or the punctuation. `--semantic` opts
+    # into the dense leg for interactive use, where 7 s is affordable.
     query = " OR ".join(f'"{t}"' for t in terms)
     try:
-        rows = con.execute(
+        lex = con.execute(
             "SELECT text, project, session, ts, "
             "  rank + 0.02 * (julianday('now') - julianday(substr(ts,1,19))) AS score "
             "FROM messages WHERE messages MATCH ? AND ts != '' "
             "ORDER BY score LIMIT ?", (query, args.limit * 6)).fetchall()
     except sqlite3.OperationalError:
         return
+
+    fuzz = con.execute(
+        "SELECT f.text, m.project, f.session, max(m.ts), 0 "
+        "FROM messages_fuzzy f JOIN messages m ON m.session = f.session "
+        "WHERE " + " OR ".join(["f.text LIKE ?"] * len(terms[:4])) +
+        " GROUP BY f.rowid ORDER BY max(m.ts) DESC LIMIT ?",
+        [f"%{t}%" for t in terms[:4]] + [args.limit * 3]).fetchall() if terms else []
+
+    if args.semantic:
+        try:
+            fused, _, _ = hybrid_search(con, args.prompt, args.limit * 6, 0.02)
+            lex = [(f["row"][0], f["row"][1], f["row"][2], f["row"][4], 0)
+                   for f in fused]
+        except (sqlite3.OperationalError, SystemExit):
+            pass
+
+    seen_keys, rows = set(), []
+    for rank, row in enumerate(list(lex) + list(fuzz)):
+        key = (row[2], row[3])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        rows.append(row)
+
     # Require several query terms in the hit, or every prompt drags in
     # something loosely related.
     keep = []
@@ -703,6 +761,9 @@ def main() -> None:
     rc = sub.add_parser("recall", help="compact prior context for a prompt (for hooks)")
     rc.add_argument("prompt")
     rc.add_argument("--limit", type=int, default=3)
+    rc.add_argument("--semantic", action="store_true",
+                    help="add the dense leg — accurate but ~7s per call, so "
+                         "not for a per-prompt hook")
     rc.set_defaults(func=cmd_recall)
 
     g = sub.add_parser("goals", help="cluster sessions into units of work, across repos")
