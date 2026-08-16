@@ -116,6 +116,15 @@ def connect() -> sqlite3.Connection:
             text, project UNINDEXED, session UNINDEXED, role UNINDEXED,
             ts UNINDEXED, path UNINDEXED, tokenize='porter unicode61'
         );
+        -- Trigram index for fuzzy recall. FTS5's porter tokenizer matches
+        -- whole stemmed words, so "cosmosac" never finds "COSMO-SAC" and a
+        -- typo finds nothing at all. Trigram matches on 3-character runs, so
+        -- substrings and misspellings still hit. It is not semantic — no
+        -- tokenizer is — but it covers the "I half-remember the word" case
+        -- that lexical search otherwise fails outright.
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fuzzy USING fts5(
+            text, session UNINDEXED, tokenize='trigram'
+        );
         """
     )
     return con
@@ -140,6 +149,7 @@ def index_all(con: sqlite3.Connection, verbose: bool = True) -> None:
             continue
 
         con.execute("DELETE FROM messages WHERE path = ?", (str(path),))
+        con.execute("DELETE FROM messages_fuzzy WHERE session = ?", (path.stem,))
         project = project_label(path.parent)
         if account:
             project = f"{account}:{project}"
@@ -165,6 +175,11 @@ def index_all(con: sqlite3.Connection, verbose: bool = True) -> None:
         con.executemany(
             "INSERT INTO messages (text, project, session, role, ts, path) "
             "VALUES (?,?,?,?,?,?)", rows)
+        # Trigram indexes are ~3x the size of a word index, so only the user's
+        # own prompts go in: that is what a half-remembered phrase came from.
+        con.executemany(
+            "INSERT INTO messages_fuzzy (text, session) VALUES (?,?)",
+            [(r[0][:2000], r[2]) for r in rows if r[3] == "user"])
         con.execute(
             "INSERT OR REPLACE INTO files (path, mtime, size, n_rows) VALUES (?,?,?,?)",
             (str(path), stat.st_mtime, stat.st_size, len(rows)))
@@ -210,6 +225,22 @@ def cmd_search(args) -> None:
     # session already overturned. Recency is evidence: a more recent statement
     # about the same thing is usually the corrected one. rank is negative and
     # more-negative is better, so age is *added* as a penalty.
+    if args.fuzzy:
+        hits = con.execute(
+            "SELECT f.text, m.project, f.session, 'user', max(m.ts) "
+            "FROM messages_fuzzy f JOIN messages m ON m.session = f.session "
+            "WHERE f.text LIKE ? GROUP BY f.rowid ORDER BY max(m.ts) DESC LIMIT ?",
+            (f"%{args.query}%", args.limit)).fetchall()
+        if not hits:
+            print(f"no fuzzy match for {args.query!r}")
+            return
+        terms = [t for t in re.findall(r"\w+", args.query) if len(t) > 2]
+        print(f"{len(hits)} fuzzy match(es) for {args.query!r}\n")
+        for text, project, session, role, ts in hits:
+            print(f"\033[1m{(ts or '')[:16].replace('T',' ')}  {project}  [{role}]\033[0m  {session[:8]}")
+            print(f"    {snippet(text, terms or [args.query])}\n")
+        return
+
     sql = (f"SELECT text, project, session, role, ts, "
            f"  rank + ? * (julianday('now') - julianday(substr(ts,1,19))) AS score "
            f"FROM messages WHERE {' AND '.join(where)} "
@@ -332,6 +363,46 @@ def cmd_related(args) -> None:
         print(f"    via: {', '.join(sorted(shared)[:6])}")
         print(f"    {gist}\n")
 
+
+def cmd_recall(args) -> None:
+    """Compact prior context for a prompt — designed for a hook, not a human.
+
+    Prints nothing when nothing scores well. A hook that always injects
+    something trains the reader to ignore it, and burns context on every turn
+    for the many prompts that need no history at all.
+    """
+    con = connect()
+    terms = [t for t in re.findall(r"[A-Za-z][\w-]{3,}", args.prompt)][:12]
+    if len(terms) < 2:
+        return
+    query = " OR ".join(f'"{t}"' for t in terms)
+    try:
+        rows = con.execute(
+            "SELECT text, project, session, ts, "
+            "  rank + 0.02 * (julianday('now') - julianday(substr(ts,1,19))) AS score "
+            "FROM messages WHERE messages MATCH ? AND ts != '' "
+            "ORDER BY score LIMIT ?", (query, args.limit * 6)).fetchall()
+    except sqlite3.OperationalError:
+        return
+    # Require several query terms in the hit, or every prompt drags in
+    # something loosely related.
+    keep = []
+    for text, project, session, ts, _ in rows:
+        # A tool invocation that merely *searched* for a term is not knowledge
+        # about it. Without this, recall for any topic returns the greps run
+        # while looking for the answer instead of the answer.
+        if text.lstrip().startswith("["):
+            continue
+        low = text.lower()
+        overlap = sum(1 for t in terms if t.lower() in low)
+        if overlap >= max(2, len(terms) // 3):
+            keep.append((text, project, session, ts, overlap))
+    if not keep:
+        return
+    print("Relevant prior sessions (auto-recall):")
+    for text, project, session, ts, _ in keep[:args.limit]:
+        print(f"- [{(ts or '')[:10]} {project} {session[:8]}] {snippet(text, terms, 200)}")
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -346,6 +417,9 @@ def main() -> None:
     s.add_argument("--since", help="ISO date, e.g. 2026-06-01")
     s.add_argument("--until")
     s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--fuzzy", action="store_true",
+                   help="trigram substring match — survives typos and "
+                        "punctuation (cosmosac finds COSMO-SAC)")
     s.add_argument("--recency", type=float, default=0.02,
                    help="penalty per day of age; 0 disables the tilt "
                         "(default 0.02, ~1 bm25 point per 50 days)")
@@ -361,6 +435,11 @@ def main() -> None:
     r.add_argument("--min-shared", type=int, default=2)
     r.add_argument("--limit", type=int, default=10)
     r.set_defaults(func=cmd_related)
+
+    rc = sub.add_parser("recall", help="compact prior context for a prompt (for hooks)")
+    rc.add_argument("prompt")
+    rc.add_argument("--limit", type=int, default=3)
+    rc.set_defaults(func=cmd_recall)
 
     args = ap.parse_args()
     if args.cmd == "index":
