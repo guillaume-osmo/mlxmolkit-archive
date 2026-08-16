@@ -4,6 +4,33 @@ Source: Bell, Mickoleit, Hsieh, Lin, Vrabec, Breitkopf, Jäger, *A Benchmark
 Open-Source Implementation of COSMO-SAC*, J. Chem. Theory Comput. 2020, 16,
 2635−2646, [10.1021/acs.jctc.9b01016](https://dx.doi.org/10.1021/acs.jctc.9b01016).
 
+## The data is already here
+
+`~/Downloads/COSMOSAC-v1.0.1.zip` (the NIST reference implementation, 8354
+files) ships **both historical series** under `profiles/`:
+
+| set | count | path |
+|---|---|---|
+| **VT-2005** (Mullins/Virginia Tech) | **1432** `.txt` profiles | `profiles/VT2005/Sigma_Profiles_v2/` |
+| **UD** (University of Delaware) | **6789** `.sigma` files, InChIKey-named | `profiles/UD/sigma3/` |
+
+plus `to_sigma.py`, `generate_all_profiles.py`, and GAMESS / Gaussian09 /
+DMol3 test cases. Nothing needs downloading — the two series asked for are in
+the zip already on disk.
+
+### And a closer reference for PM6: LVPP
+
+[github.com/lvpp/sigma](https://github.com/lvpp/sigma) — 2500+ molecules, with
+**COSMO-SAC parametrisations under `pars/`** and optimised gas-phase
+geometries. Current profiles come from NWChem, but **earlier versions were
+computed with GAMESS and MOPAC**.
+
+MOPAC-derived σ-profiles are the closest published reference to what our PM6 +
+ddCOSMO path produces. If we want to know whether our semiempirical surface is
+right *as a semiempirical surface*, rather than judged against DFT, that is
+the set to use. Zenodo [10.5281/zenodo.3613785](https://doi.org/10.5281/zenodo.3613785);
+Ferrarini et al., AIChE J 2018; Soares et al., JCTC 2025 for the NWChem module.
+
 ## Why this and not ADFCRS
 
 ADFCRS-2018 needs an SCM licence — the download is 401 without one. This paper
@@ -124,3 +151,19 @@ it as an acceptor, which is a deliberate divergence worth keeping and flagging.
 
 Steps 1–4 are the ones that make the existing PM6 benchmark interpretable.
 Step 6 is the question that started this.
+
+## Adjacent, noted not chosen
+
+* **Transformer surrogate.** Kang, Chiu, Huang, Wong, *A surrogate model of
+  sigma profile and COSMOSAC activity coefficient predictions of using
+  transformer with SMILES input*, Digital Chemical Engineering 2 (2022) 100016
+  (open access). Predicts σ-profiles straight from SMILES, skipping the QM.
+  Reports that σ-profile R² barely improves over their earlier UDCS model
+  while activity coefficients improve markedly — i.e. profile accuracy is not
+  the binding constraint on γ. Worth knowing before optimising the wrong
+  quantity.
+* **g-xTB.** [grimme-lab/g-xtb](https://github.com/grimme-lab/g-xtb), latest
+  v2.0.1 (May 2026). The repo states development happens there but the final
+  implementation lands in [tblite](https://github.com/tblite/tblite). This is
+  where the missing `xtb-*-gxtb-*` build comes from; the stock xtb ignores
+  `--gxtb` with a warning, which `gxtb_optimize_geometry` now refuses.
