@@ -18,10 +18,45 @@ import numpy as np
 from . import params as _P
 
 
+CHARGE_SOURCES = {
+    'PM6': 'MF_ALPHA_PM6',
+    'DFT': 'MF_ALPHA_DFT',
+    'ddcosmo': 'MF_ALPHA_DDCOSMO',
+    'simple': 'MF_ALPHA_SIMPLE',
+    'sh4': 'MF_ALPHA_SH4',
+    'sh6': 'MF_ALPHA_SH6',
+}
+
+
+def misfit_alpha(charge_source: str | None = None) -> float:
+    """The misfit prefactor alpha' calibrated for a given source of charges.
+
+    alpha' absorbs the systematic scale of whatever produced the surface
+    charges, so it is not a universal constant: the calibrated values span a
+    factor of 13 (DFT 7.6e6 to ddCOSMO 1.0e8). They were all present in
+    `params` but nothing selected between them — `_compute_interaction_matrices`
+    read the bare `MF_ALPHA`, which is ddCOSMO's — so COSMO-RS on PM6 charges
+    ran with a misfit prefactor 3.12x too large, and nothing said so.
+
+    `None` keeps the historical `MF_ALPHA`, so existing callers and every
+    benchmark recorded against them are unchanged.
+    """
+    if charge_source is None:
+        return _P.MF_ALPHA
+    try:
+        return getattr(_P, CHARGE_SOURCES[charge_source])
+    except KeyError:
+        raise ValueError(
+            f"unknown charge_source {charge_source!r}; "
+            f"expected one of {sorted(CHARGE_SOURCES)} or None"
+        ) from None
+
+
 def _compute_interaction_matrices(
     sigma_arr: np.ndarray,
     hb_type_arr: np.ndarray,
     T: float,
+    charge_source: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute misfit and hydrogen bonding interaction matrices.
 
@@ -38,7 +73,7 @@ def _compute_interaction_matrices(
 
     # Misfit: E_mf = (α'/2) · a_eff · (σ + σ')²
     sigma_sum = sigma_arr[:, np.newaxis] + sigma_arr[np.newaxis, :]
-    A_mf = 0.5 * _P.MF_ALPHA * _P.A_EFF * sigma_sum ** 2
+    A_mf = 0.5 * misfit_alpha(charge_source) * _P.A_EFF * sigma_sum ** 2
 
     # Hydrogen bonding: only donor/acceptor pairs contribute
     A_hb = np.zeros((n, n))
@@ -112,6 +147,7 @@ def activity_coefficients(
     x: np.ndarray,
     T: float = 298.15,
     refst: str = 'pure_component',
+    charge_source: str | None = None,
 ) -> np.ndarray:
     """Compute activity coefficients for a mixture.
 
@@ -119,6 +155,10 @@ def activity_coefficients(
         mol_profiles: list of sigma analysis dicts (from sigma.full_sigma_analysis)
             Each must have: 'sigma_grid', 'sigma_profile', 'total_area',
                            'seg_sigma_av', 'seg_hb_type'
+        charge_source: what produced the surface charges — 'PM6', 'DFT',
+            'ddcosmo', 'simple', 'sh4', 'sh6'. Selects the calibrated misfit
+            prefactor; see :func:`misfit_alpha`. `None` keeps the historical
+            `MF_ALPHA` so existing results are reproducible.
         x: (n_mol,) mole fractions
         T: temperature in Kelvin
         refst: reference state ('pure_component' or 'cosmo')
@@ -171,7 +211,8 @@ def activity_coefficients(
         hb_type_arr[k] = np.argmax(hb_counts)
 
     # Segment interaction energies
-    A_mf, A_hb = _compute_interaction_matrices(sigma_grid, hb_type_arr, T)
+    A_mf, A_hb = _compute_interaction_matrices(
+        sigma_grid, hb_type_arr, T, charge_source=charge_source)
     A_int = A_mf + A_hb
 
     # Boltzmann factors

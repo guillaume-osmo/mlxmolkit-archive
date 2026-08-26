@@ -398,7 +398,8 @@ def _ef_optimize(atoms, coords, max_iter, grad_tol, method, verbose,
         new_coords = coords + step.reshape(n_atoms, 3)
         new_result, new_grad = analytical_gradient(
             atoms, new_coords, method=method,
-            molecular_charge=molecular_charge)
+            molecular_charge=molecular_charge,
+            P_init=result.get('density'))
         actual = new_result['energy_eV'] - energy
 
         if actual > 0:
@@ -668,6 +669,7 @@ def nddo_optimize(
                 trial_coords,
                 method=method,
                 molecular_charge=molecular_charge,
+                P_init=result.get('density'),
             )
             trial_flat = trial_grad.flatten()
             return (trial_result['energy_eV'],
@@ -686,6 +688,7 @@ def nddo_optimize(
                 new_coords,
                 method=method,
                 molecular_charge=molecular_charge,
+                P_init=result.get('density'),
             )
         else:
             step, (new_coords, new_result, new_grad) = found

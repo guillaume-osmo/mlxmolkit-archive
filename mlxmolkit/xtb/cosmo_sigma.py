@@ -32,7 +32,48 @@ from pathlib import Path
 import numpy as np
 
 
-_DEFAULT_XTB = Path("/tmp/gxtb-v2-macos/bin/xtb")
+def _find_xtb() -> Path:
+    """Locate an xtb binary, preferring durable locations over /tmp.
+
+    This used to be the bare path `/tmp/gxtb-v2-macos/bin/xtb`. /tmp does not
+    survive a reboot, so the whole xtb pipeline broke silently after every
+    restart — and did, on the macOS upgrade that prompted this. A binary that
+    a pipeline requires does not belong in ephemeral storage.
+
+    Search order, first hit wins:
+
+    1. `$MLXMOLKIT_XTB` — an explicit override, e.g. the g-xTB build.
+    2. The running interpreter's environment (`<sys.prefix>/bin/xtb`).
+       `conda install xtb` lands here and supports `--cosmo`/`--tmcosmo`.
+    3. `xtb` on PATH.
+    4. The legacy /tmp location, so an existing unpacked build still works.
+
+    Note the stock xtb does NOT accept `--gxtb`; it segfaults on the flag.
+    g-xTB needs its own build (xtb-6.7.1-gxtb-*). The `--tmcosmo` COSMO step
+    works with either, so only the g-xTB geometry optimisation needs it.
+    """
+    import shutil
+    import sys
+
+    override = os.environ.get("MLXMOLKIT_XTB")
+    candidates = [Path(override)] if override else []
+    candidates += [
+        Path(sys.prefix) / "bin" / "xtb",
+        Path("/tmp/gxtb-v2-macos/bin/xtb"),
+    ]
+    found = shutil.which("xtb")
+    if found:
+        candidates.insert(-1, Path(found))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    # Nothing found: return the conventional path so the error surfaces at the
+    # call site with the path in it, rather than at import.
+    return Path("/tmp/gxtb-v2-macos/bin/xtb")
+
+
+_DEFAULT_XTB = _find_xtb()
 _ELEMENTS = (
     "X H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca "
     "Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr "
@@ -281,6 +322,20 @@ def gxtb_optimize_geometry(
             xtb_path=xtb_path,
             timeout=timeout,
         )
+        # A stock xtb does not implement --gxtb. It does not fail on it either:
+        # it prints "Unknown option '--gxtb' provided" as a warning, optimises
+        # with its default method (GFN2), writes a perfectly good xtbopt.xyz
+        # and exits 0. Nothing downstream can tell that the geometry is GFN2's
+        # rather than g-xTB's, so the whole hybrid pipeline would quietly
+        # become GFN2-opt + GFN2-tmcosmo while still being called hybrid.
+        if "Unknown option '--gxtb'" in log:
+            raise RuntimeError(
+                f"{xtb_path} does not implement --gxtb; it fell back to its "
+                f"default method and the geometry would be GFN2's, not "
+                f"g-xTB's. Point MLXMOLKIT_XTB at a g-xTB build "
+                f"(xtb-6.7.1-gxtb-*), or call the GFN2 path explicitly if "
+                f"that is what you want."
+            )
         opt_xyz = workdir / "xtbopt.xyz"
         if not opt_xyz.exists():
             raise RuntimeError(f"xtb --gxtb --opt produced no xtbopt.xyz:\n{log[-1500:]}")
