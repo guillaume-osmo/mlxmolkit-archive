@@ -229,6 +229,7 @@ def analytical_gradient(
     step: float = 1e-5,
     molecular_charge: float = 0.0,
     scf_result: dict | None = None,
+    P_init: np.ndarray | None = None,
 ) -> tuple[dict, np.ndarray]:
     """Compute energy and gradient.
 
@@ -291,7 +292,8 @@ def analytical_gradient(
         with pair_cache(pair_specs):
             return _gradient_body(atoms, coords, method, step, molecular_charge,
                                   scf_result, PARAMS, info, params, starts,
-                                  n_atoms, shifts, all_pairs, None, None)
+                                  n_atoms, shifts, all_pairs, None, None,
+                                  P_init)
 
     from .overlap_batch import overlap_pairs
     from .rotation_batch import rotate_pairs
@@ -307,19 +309,20 @@ def analytical_gradient(
     with pair_cache(ref_specs):
         return _gradient_body(atoms, coords, method, step, molecular_charge,
                               scf_result, PARAMS, info, params, starts,
-                              n_atoms, shifts, all_pairs, ws_shift, S_shift)
+                              n_atoms, shifts, all_pairs, ws_shift, S_shift,
+                              P_init)
 
 
 def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
                    PARAMS, info, params, starts, n_atoms, shifts, all_pairs,
-                   ws_shift, S_shift):
+                   ws_shift, S_shift, P_init=None):
     """The gradient itself, run inside the TETCI cache installed above."""
     # `scf_result` lets a batched caller solve every molecule's SCF in one
     # dispatch and hand the converged density in, rather than each gradient
     # re-solving its own.
     result = scf_result if scf_result is not None else nddo_energy(
         atoms, coords, method=method, max_iter=200, conv_tol=1e-8,
-        molecular_charge=molecular_charge,
+        molecular_charge=molecular_charge, P_init=P_init,
     )
     P = result['density']
     n_basis = info['n_basis']

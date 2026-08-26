@@ -59,7 +59,8 @@ Bit-exact reference primitives (vendored from PYSEQM, BSD-3, LANL)
 """
 
 # --- public API ---
-from .scf import nddo_energy, nddo_energy_batch
+from .scf import (nddo_energy, nddo_energy_batch, nddo_energy_many,
+                  shutdown_worker_pool)
 from .gradient import nddo_gradient, nddo_optimize, nddo_optimize_batch
 from .pm6_d3h4 import (
     pm6_d3h4_correction,
@@ -78,6 +79,8 @@ __all__ = [
     # SCF
     "nddo_energy",
     "nddo_energy_batch",
+    "nddo_energy_many",
+    "shutdown_worker_pool",
     # Gradient + geometry optimization
     "nddo_gradient",
     "nddo_optimize",
