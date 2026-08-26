@@ -1,410 +1,257 @@
-# mlxmolkit — GPU-accelerated molecular toolkit on Apple Silicon
+# mlxmolkit
 
-Port of [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to Apple Metal via [MLX](https://github.com/ml-explore/mlx). Three pipelines:
+**GPU-accelerated molecular toolkit for Apple Silicon** — a port of
+[nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) (CUDA) to Apple Metal
+via [MLX](https://github.com/ml-explore/mlx), extended with semi-empirical
+quantum chemistry.
 
-1. **Molecular Clustering** — Morgan FP → Tanimoto similarity → Butina clustering
-2. **3D Conformer Generation** — DG (4D) → ETK (3D) → MMFF94 optimization
-3. **PM6_D semi-empirical SCF** — full d-orbital NDDO (S/P/Cl/Br/I) with PM6-D3H4 corrections
+## What's in the box
 
-## What's new
+| Area | What it does | Entry point |
+|---|---|---|
+| **Conformers** | Drop-in for RDKit `EmbedMolecules`: DG (4D) → ETK (3D) → MMFF94, all on Metal. 8 ETKDG variants. N×k parallel | `generate_conformers_nk` |
+| **Clustering** | Morgan FP → Tanimoto → Butina, at 150k+ molecules with divide-and-conquer memory | `butina_tanimoto_mlx` |
+| **NDDO semi-empirical** | 7 methods (RM1, AM1, PM3, PM6, PM6_SP, PM6_D, AM1\*) + PM6-D3H4 corrections, energies **and** gradients/geometry optimization | `mlxmolkit.nddo` |
+| **xTB** | GFN0/1/2 and g-xTB energies, analytical gradients, ANCOPT geometry optimization, ALPB water solvation | `mlxmolkit.xtb` |
+| **COSMO / COSMO-RS** | σ-profiles, σ-potentials, activity coefficients, solubility in solvent mixtures | `mlxmolkit.xtb` (σ), `mlxmolkit.cosmo` (ddCOSMO) |
+| **Similarity & descriptors** | ERG fingerprints, dense cosine, CHEESE embeddings, Connolly surfaces, dipole atom features | top-level exports |
 
-Semi-empirical SCF on Apple Silicon — **7 methods** (RM1, AM1, PM3, PM6,
-PM6_SP, PM6_D, AM1\*) plus PM6-D3H4 post-SCF corrections — **bit-exact to
-PYSEQM** for PM6_D, with no PYSEQM/PyTorch runtime dependency. Every
-entry point is covered by `tests/test_{methods_api,pm6_d_native,pm6_d3h4,pyseqm_port,rm1_scf}.py`
-(83 tests total).
+Measured tables — throughput, memory scaling, quality vs RDKit — are in
+**[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
-| Method | Coverage | HoF (H2O, kcal/mol) | Status |
-|---|---|---:|---|
-| RM1 | H, C, N, O, F, P, S, Cl, Br, I | -57.81 | tested |
-| AM1 | H, C, N, O | -59.22 | tested |
-| PM3 | H, C, N, O, F, P, S, Cl, Br, I | -53.19 | tested |
-| PM6 / PM6_SP | H, C, N, O, F, P, S, Cl, Br, I (sp-only) | -54.19 | tested |
-| PM6_D | + d-orbitals on P, S, Cl, Br | bit-exact vs PYSEQM | tested |
-| AM1\* / RM1\* | H, C, N, O (\*-variants) | -53.71 / -54.47 | tested |
-| PM6-D3H4 | D3 dispersion + H4 H-bond + HH repulsion | post-SCF correction | tested |
-
-- **PM6_D SCF in pure NumPy** — per-pair W tensor matches PYSEQM to 2.66e-15 (machine epsilon). 27/27 SCF charge tests pass against frozen PYSEQM/MOPAC references.
-- **Full d-orbital support** — P, S, Cl (qn=3) and Br (qn=4) with the 22-integral local frame, rotated to molecular frame via Wigner D-matrices. Covers YH, YX, YY pair types.
-- **PM6-D3H4 post-SCF corrections** — Grimme D3 dispersion + Rezáč–Hobza H4 hydrogen-bond + HH-repulsion.
-- **DIIS + adaptive damping SCF** — converges reliably on hard cases (CCl4, SF6, DMSO) where plain mixing freezes the wrong basin.
-- **numba JIT + einsum hot kernels** — `w_withquaternion`, `GenerateRotationMatrix`, `Rotate2Center2Electron` accelerated; ~2× end-to-end per pair (3.3 → 1.6 ms per S-C pair on M3 Max).
-- **Bit-exactness regression suite** — 23 frozen-reference tests guard the numerical invariants of the vendored PYSEQM port.
-
-### Public API
-
-```python
-from mlxmolkit.nddo import (
-    # SCF
-    nddo_energy, nddo_energy_batch,
-    # PM6-D3H4 corrections
-    pm6_d3h4_correction, d3_energy, h4_energy, hh_repulsion,
-    # Parameters
-    METHOD_PARAMS, get_params, ElementParams,
-)
-
-# Bit-exact primitives (vendored from PYSEQM)
-from mlxmolkit.nddo._pyseqm_port import (
-    diatom_overlap_matrixD, two_elec_two_center_int,
-    qn_int, qnD_int,
-)
-
-# Example: PM6_D total energy with D3H4 corrections
-result = nddo_energy(atoms=[16, 1, 1], coords=[[0,0,0], [0.97,0,0.93], [-0.97,0,0.93]], method='PM6_D')
-correction = pm6_d3h4_correction(atoms=[16, 1, 1], coords=...)
-```
-
-## Installation
+## Install
 
 ```bash
 pip install mlxmolkit-rdkit
 ```
 
-Requires macOS with Apple Silicon (M1/M2/M3/M4). RDKit is needed for molecular input:
+RDKit is needed for molecular input:
 
 ```bash
 conda install -c conda-forge rdkit
 pip install mlxmolkit-rdkit
 ```
 
-## Quick Start
+**Requirements:** macOS on Apple Silicon (M1–M4).
+
+## Quick start
 
 ```python
 from mlxmolkit import generate_conformers_nk, butina_tanimoto_mlx
+import mlx.core as mx
 
-# 3D conformers: 100 molecules x 10 conformers each
+# 3D conformers — N molecules x k conformers, one GPU batch
 result = generate_conformers_nk(
     smiles_list=["c1ccccc1", "CC(=O)O", "CC(=O)Oc1ccccc1C(=O)O"],
     n_confs_per_mol=10,
     run_mmff=True,
 )
 
-# Clustering: 150k+ molecules
-import mlx.core as mx
-result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
+# Clustering — 150k+ molecules
+clusters = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
+
+# Semi-empirical SCF
+from mlxmolkit.nddo import nddo_energy
+e = nddo_energy(atoms=[8, 1, 1], coords=[[0,0,0], [0.97,0,0.93], [-0.97,0,0.93]],
+                method="PM6_D")
+
+# xTB
+from mlxmolkit.xtb import gfn2_energy, ancopt
+e = gfn2_energy(atoms, coords)
 ```
 
-## Features
+---
 
-- **Conformer Generation** — Drop-in replacement for RDKit's ETKDG (`EmbedMolecules`). Supports ETKDG, ETKDGv2, ETKDGv3, srETKDGv3, KDG, ETDG, ETDGv2, and pure DG.
-- **MMFF94 Optimization** — GPU-accelerated force field optimization (`MMFFOptimizeMoleculesConfs`). All 7 MMFF energy terms with fused Metal kernel. Full BFGS or L-BFGS in-kernel (zero CPU round-trips).
-- **Molecular Clustering** — Butina clustering at 150k+ molecules with divide-and-conquer memory management.
-- **N x k Parallel** — Generate k conformers for N molecules simultaneously. Constraints shared across conformers (`conf_to_mol` indirection, 50% memory savings).
+## Read this before you benchmark it
 
-## Performance
+### MMFF on Metal is *not* faster than RDKit at matched accuracy
 
-### Conformer Generation (N=20 molecules, k=50 conformers = 1000 total)
+This is the number the throughput tables do not show, and it decides whether you
+should use this path at all. 50 molecules × 50 conformers, M3 Max, quiet box,
+fresh `Chem.Mol` copies per method:
 
-| Pipeline | Time | Throughput | GPU Memory |
-|----------|------|-----------|------------|
-| DG only | 1.00s | 1,002 conf/s | 2.6 MB |
-| DG + ETK | 1.11s | 900 conf/s | 2.6 MB |
-| DG + ETK + MMFF | 1.63s | 614 conf/s | 5.1 MB |
+| Method | ms/conf | vs RDKit 14T | mean abs ΔE | within 0.1 kcal/mol |
+|---|---:|---:|---:|---:|
+| RDKit 1 thread | 1.59 | 0.13× | — | — |
+| **RDKit 14 threads** | **0.20** | 1.00× | 0.0000 | — |
+| FUSED 200 it | **0.16** | **1.22×** | 1.742 | 800/2500 |
+| FUSED 2000 it | 1.24 | 0.16× | 0.073 | 2326/2500 |
+| MULTI 1000 it | 1.36 | 0.15× | **0.015** | **2470/2500** |
 
-### Conformer Memory Scaling (DG + ETK + MMFF, batch=500)
+**The kernel is fast; the optimizer converges slowly.** At 200 iterations the
+fused path genuinely beats 14-thread RDKit — but it needs ~2000 iterations to
+match RDKit's energies, and cost is linear in iterations. So the throughput win
+is spent on iteration count, and **at matched accuracy Metal is ~6× behind
+RDKit-14T and roughly at parity with single-threaded RDKit.**
 
-| Conformers | Batch | GPU (BFGS) | GPU (L-BFGS) | Time | Throughput |
-|-----------|-------|-----------|-------------|------|-----------|
-| 1,000 | 1000 | 5.1 MB | 2.9 MB | 0.43s | 2,342/s |
-| 2,000 | 500 | 2.6 MB | 1.5 MB | 1.43s | 1,402/s |
-| 4,000 | 500 | 2.6 MB | 1.5 MB | 1.91s | 2,094/s |
-| 10,000 | 500 | **2.6 MB** | **1.5 MB** | 4.82s | 2,075/s |
+The lever is convergence per iteration — line search, preconditioning,
+curvature — not kernel speed. Getting there at 200–500 iterations would beat
+RDKit-14T outright; it is already within 1.22× at 200.
 
-GPU memory stays constant regardless of total conformers thanks to divide-and-conquer batching.
+### Three ways to measure this wrong
 
-### Scale Tests
+1. **`mmff_optimize_batch(mol, conf_ids)` batches the conformers of *one*
+   molecule** — batch width ~10, which measures kernel dispatch overhead rather
+   than throughput. The real entry points are
+   `mmff_optimize_metal_multi_mol` / `..._fused_multi_mol` in
+   `mmff_metal_optimizer.py`, exercised by `bench_multi_mol.py`.
+2. **`MMFFOptimizeMoleculeConfs` optimizes in place.** Reusing molecules across
+   methods measures "re-converge something already at a minimum", which inflates
+   whichever method runs second *and* its apparent accuracy. Always take a fresh
+   `Chem.Mol(m)` per method.
+3. **Benchmark on a quiet box.** A loaded machine flatters the GPU path against
+   a 14-thread CPU baseline.
 
-| Scale | Pipeline | Time | Throughput | Convergence |
-|-------|----------|------|-----------|-------------|
-| N=1000, k=10 | DG + ETK | 5.0s | **2,017 conf/s** | 99.7% |
-| N=1000, k=10 | DG + ETK + MMFF | 8.0s | **1,250 conf/s** | 99.7% |
-| N=10000, k=1 | DG + ETK | 17.7s | **565 conf/s** | 99.6% |
-| N=10000, k=1 | DG + ETK + MMFF | 37.9s | **264 conf/s** | 99.6% |
-| **N=10000, k=10** | **DG + ETK** | **38.1s** | **2,625 conf/s** | **99.7%** |
-| **N=10000, k=10** | **DG + ETK + MMFF** | **67.9s** | **1,473 conf/s** | **99.7%** |
+### Other choices that matter
 
-100,000 conformers in a single GPU batch. All stages on Metal (including MMFF94 — zero RDKit post-processing).
+| Choice | Use | Because |
+|---|---|---|
+| BFGS vs L-BFGS | **BFGS** below ~150 atoms (with H) | Better curvature ⇒ fewer iterations. Memory is O(n²) in the dense Hessian, so L-BFGS only wins when that exceeds ~1 MB/conformer. The pipeline auto-switches at 150+ (`mmff_use_lbfgs=None`) |
+| Explicit hydrogens | **Always** — the pipeline calls `AddHs` for you | DG constraints are more complete and the bond/angle/torsion terms are fully defined; convergence is materially better |
+| Batch size | Largest that fits (auto-sized by default) | Fewer kernel launches: 1,610 conf/s at batch 100 → 4,442 at batch 1000+ |
+| Iterations | Auto (`dg_max_iters=0`) | Scales as `base + scale · max(n_atoms, √n_constraints)`; small molecules exit early via in-kernel TOLX/gradient checks |
+| MMFF variant | `MMFF94s` for conjugated/aromatic | Softer torsion barriers |
 
-### Batch Size Impact (N=20, k=50, C=1000)
+---
 
-| Batch | Batches | Time | conf/s |
-|------:|--------:|-----:|-------:|
-| 100 | 10 | 0.62s | 1,610 |
-| 500 | 2 | 0.29s | 3,394 |
-| 1000+ | 1 | 0.22s | 4,442 |
+## Semi-empirical NDDO
 
-Larger batches = fewer kernel launches = higher throughput. Auto-sizing (default) picks the largest batch that fits in free memory.
+Seven methods plus PM6-D3H4 post-SCF corrections, **bit-exact to
+[PYSEQM](https://github.com/lanl/PYSEQM) for PM6_D**, with no PYSEQM or PyTorch
+runtime dependency.
 
-### GPU Memory per Conformer
+| Method | Element coverage | HoF (H₂O, kcal/mol) |
+|---|---|---:|
+| RM1 | H, C, N, O, F, P, S, Cl, Br, I | −57.81 |
+| AM1 | H, C, N, O | −59.22 |
+| PM3 | H, C, N, O, F, P, S, Cl, Br, I | −53.19 |
+| PM6 / PM6_SP | H, C, N, O, F, P, S, Cl, Br, I (sp-only) | −54.19 |
+| PM6_D | + d-orbitals on P, S, Cl, Br | bit-exact vs PYSEQM |
+| AM1\* / RM1\* | H, C, N, O (\*-variants) | −53.71 / −54.47 |
+| PM6-D3H4 | D3 dispersion + H4 H-bond + HH repulsion | post-SCF correction |
 
-| Atoms | DG (4D) | ETK (3D) | MMFF (BFGS) | MMFF (L-BFGS) |
-|------:|--------:|---------:|------------:|--------------:|
-| 5 | 1.9 KB | 1.4 KB | 1.3 KB | 1.4 KB |
-| 12 | 4.4 KB | 3.3 KB | 6.0 KB | 3.3 KB |
-| 21 | 7.6 KB | 5.7 KB | 17.2 KB | 5.7 KB |
-| 30 | 10.8 KB | 8.1 KB | 34.1 KB | 8.1 KB |
-| 50 | 18.0 KB | 13.5 KB | 92.0 KB | 13.5 KB |
-| 64 | 23.1 KB | 17.3 KB | **149.2 KB** | 17.3 KB |
+- **Full d-orbital support** — P, S, Cl (qn=3) and Br (qn=4) via the 22-integral
+  local frame, rotated to the molecular frame with Wigner D-matrices. Covers YH,
+  YX and YY pair types.
+- **Bit-exactness** — the per-pair W tensor matches PYSEQM to 2.66e-15 (machine
+  epsilon); 27/27 SCF charge tests pass against frozen PYSEQM/MOPAC references,
+  guarded by 23 frozen-reference regression tests.
+- **DIIS + adaptive damping** — converges on hard cases (CCl₄, SF₆, DMSO) where
+  plain mixing freezes in the wrong basin.
 
-MMFF BFGS memory grows as O(n^2) due to the dense Hessian (n_atoms x 3)^2. **BFGS is faster than L-BFGS at all typical drug-like sizes** (up to 74 atoms with H) because the better curvature information requires fewer iterations. L-BFGS is only needed for very large molecules (>150 atoms) where the Hessian exceeds ~1 MB per conformer.
+```python
+from mlxmolkit.nddo import (
+    nddo_energy, nddo_energy_batch,            # SCF
+    nddo_gradient, nddo_optimize, nddo_optimize_batch,   # forces + geometry
+    pm6_d3h4_correction, d3_energy, h4_energy, hh_repulsion,
+    METHOD_PARAMS, get_params, ElementParams,
+)
+```
 
-| Molecule | Atoms (with H) | BFGS | L-BFGS | Winner |
-|----------|---------------|------|--------|--------|
-| Methane | 5 | 0.255s | 0.215s | BFGS |
-| Benzene | 12 | 0.213s | 0.222s | ~tie |
-| Aspirin | 21 | 0.241s | 0.230s | ~tie |
-| Testosterone | 49 | 0.364s | 0.335s | BFGS |
-| Cholesterol | 74 | 0.590s | 0.486s | BFGS |
+Bit-exact primitives vendored from PYSEQM live in
+`mlxmolkit.nddo._pyseqm_port` (`diatom_overlap_matrixD`,
+`two_elec_two_center_int`, `qn_int`, `qnD_int`).
 
-Recommendation: use BFGS (default) for all molecules <150 atoms with H. The pipeline auto-switches to L-BFGS at 150+ atoms (`mmff_use_lbfgs=None`, the default).
+## xTB and COSMO-RS
 
-**Important:** Always add explicit hydrogens (`Chem.AddHs`) before conformer generation. Convergence is significantly better with explicit H because the distance geometry constraints are more complete and the force field terms (bond/angle/torsion) are fully defined. The pipeline calls `AddHs` automatically.
+`mlxmolkit.xtb` exposes 51 public functions. The main groups:
 
-With 64 GB unified memory, a single batch can hold:
+| Group | Functions |
+|---|---|
+| Energies | `gfn0_energy`, `gfn1_energy`, `gfn2_energy`, `gxtb_energy` |
+| Gradients | `gfn0_gradient`, `gfn1_gradient(_analytical)`, `gfn2_gradient(_analytical)`, `gxtb_energy_gradient` |
+| Geometry optimization | `ancopt`, `gxtb_optimize_geometry`, `gfn2_alpb_water_optimize(_batch)` |
+| Water solvation (ALPB) | `gfn2_energy_alpb_water`, `alpb_water_correction(_native)`, `gfn2_alpb_water_singlepoint` |
+| σ-profiles | `sigma_profile_histogram`, `sigma_profile_klamt`, `klamt_average_sigmas`, `CosmoSegments`, `parse_xtb_cosmo`, `write_cosmo_file` |
+| σ-potentials | `sigma_potential`, `sigma_potential_from_arrays`, `sigma_potential_ensemble`, `cosmors_sigma_potential_auto` |
+| COSMO-RS | `make_cosmors`, `activity_coefficients`, `ActivityResult`, `OPENCOSMORS25A_PARAMS` |
+| Solubility | `ideal_solid_solubility_ln_x`, `solubility_in_solvent_mixture`, `solute_solvent_mixture_x`, `estimate_delta_h_fusion_walden` |
+| Tiered / hybrid | `hybrid_gxtb_gfn2_cosmo(_from_smiles)`, `tiered_gxtb_orca_cosmors(_from_smiles)`, `tiered_multiconformer_gxtb_orca`, `orca_cosmors_singlepoint` |
 
-| Molecule size | DG/ETK | MMFF (BFGS) | MMFF (L-BFGS) |
-|--------------|-------:|------------:|--------------:|
-| 12 atoms | ~9.8M conformers | ~7.4M | ~9.8M |
-| 30 atoms | ~3.9M conformers | ~1.3M | ~3.9M |
-| 64 atoms | ~1.8M conformers | **~300K** | ~1.8M |
+`mlxmolkit.cosmo` holds the ddCOSMO implementation itself (cavity construction,
+Lebedev grids, spherical harmonics, σ-profiles). It exports no `__all__` — treat
+it as internal to the σ-profile path rather than a stable API.
 
-The divide-and-conquer queue automatically splits into multiple batches when total exceeds free memory.
+## Conformers and clustering
 
-### Clustering (Enamine REAL subset, Apple M3 Max)
+```python
+from mlxmolkit.conformer_pipeline_v2 import generate_conformers_nk
 
-| N | Fused sim→CSR | Butina | **Total** | vs RDKit | Memory |
-|---|---|---|---|---|---|
-| 20k | 0.26s | 0.09s | **0.35s** | **152x** | 0.1 MB |
-| 50k | 1.26s | 0.36s | **1.62s** | — | 0.5 MB |
-| 100k | 4.87s | 0.97s | **5.84s** | — | 1.3 MB |
-| 150k+ | blockwise | — | scales | — | bounded |
+result = generate_conformers_nk(
+    smiles_list=[...],
+    n_confs_per_mol=50,
+    variant="ETKDGv3",          # DG, KDG, ETDG, ETDGv2, ETKDG, ETKDGv2, ETKDGv3, srETKDGv3
+    run_mmff=True,
+    mmff_variant="MMFF94",      # or MMFF94s
+    mmff_use_lbfgs=False,       # None = auto-switch at 150+ atoms
+    max_confs_per_batch=500,    # divide-and-conquer; auto-sized by default
+)
+```
 
-### ETKDG Variant Comparison (N=20, k=50)
+Clustering, low-level:
 
-| Variant | conf/s | Convergence |
-|---------|--------|-------------|
-| DG | 1,005 | 100.0% |
-| KDG | 910 | 99.1% |
-| ETDG | 1,009 | 100.0% |
-| ETDGv2 | 1,008 | 100.0% |
-| ETKDG | 907 | 99.1% |
-| ETKDGv2 | 904 | 99.1% |
-| ETKDGv3 | 895 | 99.1% |
-| srETKDGv3 | 914 | 100.0% |
+```python
+from mlxmolkit import (
+    fp_uint8_to_uint32, fused_neighbor_list_metal,
+    tanimoto_neighbors_blockwise, butina_from_neighbor_list_csr,
+)
 
-### RDKit vs mlxmolkit conformer quality (N=20, k=10)
+fp_u32 = fp_uint8_to_uint32(mx.array(fp_bytes))
+offsets, indices = fused_neighbor_list_metal(fp_u32, cutoff=0.4)   # N <= 100k
+offsets, indices = tanimoto_neighbors_blockwise(fp_u32, cutoff=0.4)  # 150k+
+result = butina_from_neighbor_list_csr(offsets, indices, N, cutoff=0.4)
+```
 
-After the ETK/MMFF packing fixes and batched MLX Horn alignment, the current
-RDKit-vs-mlxmolkit comparison on the CHEESE charge-training subset reports:
-
-| Setting | Value |
-|---------|------:|
-| RDKit reference | ETKDGv3 + MMFF94 |
-| mlxmolkit path | ETKDGv3 + MMFF94 |
-| Mean best shape Carbo | 0.934633 |
-| Mean best electrostatic Carbo | 0.996936 |
-| Mean best combined score | 0.966551 |
-| Median best heavy-atom RMSD | 0.449579 A |
-
-The scoring path aligns all mlxmolkit conformers to all RDKit conformers with
-batched MLX Horn quaternion alignment, then evaluates paired shape Carbo and
-electrostatic Carbo in one MLX tensor pass per molecule. It avoids per-pair CPU
-Kabsch/SVD loops and repeated tiny CHEESE kernel launches.
-
-Reproduce with:
+Example scripts:
 
 ```bash
-python tools/compare_rdkit_mlx_conformers.py \
-  --limit 20 \
-  --n-conformers 10 \
-  --out outputs/cheese_projection/rdkit_vs_mlx_conformers_20_k10_batched_scoring_after_fixes.csv
+python examples/conf3d_example.py --n-mols 1000 --n-confs 10 --mmff
+python examples/conf3d_example.py --smiles "c1ccccc1" "CC(=O)O" --n-confs 50 --mmff
 ```
 
 ## Architecture
 
-### Conformer Generation (N x k parallel)
+### Conformer generation (N × k parallel)
 
 ```
 SMILES x N
     |
 [RDKit CPU] Extract params ONCE per molecule
     |
-[Pack] SharedConstraintBatch (conf_to_mol indirection)
+[Pack] SharedConstraintBatch (conf_to_mol indirection, ~50% memory saved)
     |
-+-- Stage 1: DG minimize (4D, Metal TPM=32) --------+
-|   One threadgroup per conformer                    |
-|   L-BFGS in-kernel, GPU-parallel line search       |
-|   Shared constraints via conf_to_mol               |
-+----------------------------------------------------+
++-- Stage 1: DG minimize (4D, Metal TPM=32) ----------+
+|   One threadgroup per conformer                      |
+|   L-BFGS in-kernel, GPU-parallel line search         |
++-------------------------------------------------------+
     |
 [Extract 3D] Drop 4th coordinate
     |
-+-- Stage 2: ETK minimize (3D, Metal TPM=32) --------+
-|   CSD torsion + improper + 1-2/1-3/1-4 distance     |
-|   Optional parallel_grad for large molecules        |
-+-----------------------------------------------------+
++-- Stage 2: ETK minimize (3D, Metal TPM=32) ---------+
+|   CSD torsion + improper + 1-2/1-3/1-4 distance      |
++-------------------------------------------------------+
     |
 +-- Stage 3: MMFF94 optimize (Metal, in-kernel) ------+
-|   7 energy terms: bond, angle, stretch-bend,         |
-|   OOP, torsion, vdW, electrostatic                   |
-|   BFGS (default) or L-BFGS option                    |
-+------------------------------------------------------+
+|   7 terms: bond, angle, stretch-bend, OOP,           |
+|   torsion, vdW, electrostatic. BFGS or L-BFGS        |
++-------------------------------------------------------+
     |
 Optimized 3D conformers
 ```
 
+Constraints are shared across the conformers of a molecule via `conf_to_mol`
+indirection, which is where the ~50% memory saving comes from.
+
 ### Clustering (divide-and-conquer for 150k+)
 
 ```
-Morgan FP (RDKit CPU)
+Morgan FP (RDKit CPU) -> uint8 -> uint32 packing
         |
-   uint8 -> uint32 packing
++-- N <= 100k: fused Metal kernel, single dispatch, no NxN matrix
++-- N >  100k: blockwise D&C, tile both dims (auto-sized),
+|              mx.eval() between tiles to free GPU
         |
-+-- N <= 100k: Fused Metal Kernel ------+
-|   Single dispatch, no NxN matrix       |
-+-- N > 100k: Blockwise D&C ------------+
-|   Tile both dimensions (auto-sized)    |
-|   mx.eval() between tiles (free GPU)  |
-+----------------------------------------+
-        |
-   Butina greedy (CPU, numpy CSR)
-        |
-   Clusters
-```
-
-## Adaptive Iteration Scaling
-
-Iterations auto-scale by molecule complexity (default). Small molecules converge early via in-kernel TOLX/gradient checks — no wasted GPU compute.
-
-Formula: `max_iters = base + scale * max(n_atoms, sqrt(n_constraints))`
-
-| Molecule | Atoms | Constraints | DG iters | ETK iters | MMFF iters |
-|----------|-------|-------------|----------|-----------|------------|
-| Methane | 5 | 10 | 400 | 200 | 275 |
-| Benzene | 12 | 66 | 540 | 270 | 380 |
-| Aspirin | 21 | 210 | 720 | 360 | 515 |
-| Testosterone | 49 | 1176 | 1280 | 640 | 935 |
-| 64-atom | 64 | 2016 | 1580 | 790 | 1160 |
-
-Override with explicit values when needed:
-
-```python
-# Auto (default) — scales with molecule size
-result = generate_conformers_nk(smiles_list, n_confs_per_mol=10)
-
-# Fixed iterations for fine control
-result = generate_conformers_nk(smiles_list, n_confs_per_mol=10,
-    dg_max_iters=1000, etk_max_iters=500, mmff_max_iters=400)
-```
-
-## Optimization Options
-
-| Option | Flag | Effect | When to use |
-|--------|------|--------|-------------|
-| Auto iterations (default) | `dg_max_iters=0` | Scales with molecule size | Always (default) |
-| Warm-start retry | automatic | Re-runs non-converged with 2x iters | Always (automatic) |
-| ETK parallel gradient | `parallel_grad=True` | 1.18x ETK speedup | Many distance constraints |
-| DG parallel gradient | `parallel_grad=True` | Parallelizes dist gradient | >500 distance constraints |
-| MMFF94s variant | `mmff_variant="MMFF94s"` | Softer torsion barriers | Conjugated/aromatic molecules |
-| MMFF L-BFGS | `mmff_use_lbfgs=True` | 5x less memory | Molecules >50 atoms |
-| MMFF BFGS (default) | `mmff_use_lbfgs=False` | 2x faster for small mols | Molecules <50 atoms |
-| ETKDG variant | `variant="ETKDGv3"` | 8 variants supported | Choose per use case |
-
-### MMFF94 Force Field Variants
-
-| Variant | Flag | Torsion barriers | Best for |
-|---------|------|-----------------|----------|
-| MMFF94 (default) | `mmff_variant="MMFF94"` | Standard | General molecules |
-| MMFF94s | `mmff_variant="MMFF94s"` | Softer for conjugated systems | Aromatic, planar, conjugated |
-
-## Usage
-
-### 3D Conformer Generation
-
-```python
-from mlxmolkit.conformer_pipeline_v2 import generate_conformers_nk
-
-# Basic: 10 conformers per molecule, ETKDGv2
-result = generate_conformers_nk(
-    smiles_list=["c1ccccc1", "CC(=O)O", "CC(=O)Oc1ccccc1C(=O)O"],
-    n_confs_per_mol=10,
-)
-for mol in result.molecules:
-    print(f"{mol.n_atoms} atoms, {len(mol.positions_3d)} conformers")
-
-# Full pipeline with MMFF94
-result = generate_conformers_nk(
-    smiles_list=["c1ccccc1", "CC(=O)O"],
-    n_confs_per_mol=50,
-    variant="ETKDGv3",
-    run_mmff=True,
-    mmff_use_lbfgs=False,       # BFGS (default, fast for <50 atoms)
-    max_confs_per_batch=500,    # divide-and-conquer batch size
-)
-
-# Pure distance geometry (no torsion refinement)
-result = generate_conformers_nk(
-    smiles_list=["c1ccccc1"],
-    n_confs_per_mol=100,
-    variant="DG",
-)
-
-# Large molecules: use L-BFGS for MMFF
-result = generate_conformers_nk(
-    smiles_list=[large_smiles],
-    n_confs_per_mol=20,
-    run_mmff=True,
-    mmff_use_lbfgs=True,        # L-BFGS for >50 atoms
-)
-```
-
-### Example Script
-
-```bash
-# Basic: 20 molecules x 10 conformers
-python examples/conf3d_example.py
-
-# Scale test: 1000 molecules x 10 conformers with MMFF
-python examples/conf3d_example.py --n-mols 1000 --n-confs 10 --mmff
-
-# All options
-python examples/conf3d_example.py --n-mols 100 --n-confs 20 --variant ETKDGv3 \
-    --mmff --mmff-variant MMFF94s --batch-size 200
-
-# Custom SMILES
-python examples/conf3d_example.py --smiles "c1ccccc1" "CC(=O)O" --n-confs 50 --mmff
-```
-
-### Molecular Clustering
-
-```python
-from mlxmolkit import butina_tanimoto_mlx
-import mlx.core as mx
-
-# Automatic: fused kernel for N<=100k, blockwise for N>100k
-result = butina_tanimoto_mlx(mx.array(fp_bytes), cutoff=0.4)
-print(f"{len(result.clusters)} clusters")
-```
-
-### Low-level API
-
-```python
-from mlxmolkit import (
-    fp_uint8_to_uint32,
-    fused_neighbor_list_metal,
-    tanimoto_neighbors_blockwise,
-    butina_from_neighbor_list_csr,
-)
-
-fp_u32 = fp_uint8_to_uint32(mx.array(fp_bytes))
-
-# Small N: fused single-dispatch
-offsets, indices = fused_neighbor_list_metal(fp_u32, cutoff=0.4)
-
-# Large N (150k+): divide-and-conquer blockwise
-offsets, indices = tanimoto_neighbors_blockwise(fp_u32, cutoff=0.4)
-
-result = butina_from_neighbor_list_csr(offsets, indices, N, cutoff=0.4)
+Butina greedy (CPU, numpy CSR) -> clusters
 ```
 
 ## Tests
@@ -414,31 +261,22 @@ pip install -e .
 pytest tests/ -v
 ```
 
-## Conformer Quality vs RDKit
-
-mlxmolkit conformers rescored by RDKit's MMFF94 for fair comparison (k=20, ETKDGv2):
-
-After MMFF optimization, mlxmolkit conformers converge to the **same energy basins** as RDKit:
-
-| Molecule | Atoms | RMSD (pre-MMFF) | RMSD (post-MMFF) | E gap |
-|----------|------:|----------------:|-----------------:|------:|
-| Benzene | 12 | 0.12 A | **0.00 A** | **0.0** |
-| Aspirin | 21 | 0.98 A | **0.00 A** | **0.0** |
-| Ibuprofen | 33 | 1.79 A | **0.96 A** | **0.6** |
-| Acetaminophen | 20 | 0.99 A | **0.00 A** | **0.0** |
-
-Full nvMolKit pipeline: DG (4D) → 4D→3D collapse → setReferenceValues → stereo checks → ETK (3D) → MMFF94. Bond/angle geometry matches RDKit within 0.03 A. After MMFF, energy gap is <1 kcal/mol.
+905 tests across 85 files. Five modules under `tests/test_opencheese_*` and
+`test_cheese_conformer_ensembles.py` currently fail to collect — they import
+`tools.*` helpers that are not importable as a package.
 
 ## References
 
 - [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) — NVIDIA's CUDA implementation (Apache 2.0)
-- [shivampatel10/mlxmolkit](https://github.com/shivampatel10/mlxmolkit) — TPM threadgroup kernels and MMFF Metal implementation
-- [PYSEQM](https://github.com/lanl/PYSEQM) — LANL semi-empirical reference (BSD-3 Clause); the NumPy port in `mlxmolkit/nddo/_pyseqm_port/` is a mechanical torch→numpy translation of selected modules
+- [shivampatel10/mlxmolkit](https://github.com/shivampatel10/mlxmolkit) — TPM threadgroup kernels and the MMFF Metal implementation
+- [PYSEQM](https://github.com/lanl/PYSEQM) — LANL semi-empirical reference (BSD-3); the NumPy port in `mlxmolkit/nddo/_pyseqm_port/` is a mechanical torch→numpy translation of selected modules
 - [RDKit blog: Butina clustering with nvMolKit](https://greglandrum.github.io/rdkit-blog/posts/2026-02-28-nvmolkit-clustering.html)
 - [MLX](https://github.com/ml-explore/mlx) — Apple's ML framework with Metal kernel support
-- [MMFF94](https://doi.org/10.1002/(SICI)1096-987X(199604)17:5/6<490::AID-JCC1>3.0.CO;2-P) — Halgren, J. Comput. Chem. 1996
-- [Butina, D. (1999)](https://doi.org/10.1021/ci9803381) — Performance of Kier-Hall and molecular connectivity indices
+- [MMFF94](https://doi.org/10.1002/(SICI)1096-987X(199604)17:5/6<490::AID-JCC1>3.0.CO;2-P) — Halgren, *J. Comput. Chem.* 1996
+- [Butina, D. (1999)](https://doi.org/10.1021/ci9803381)
 
 ## Acknowledgements
 
-Portions of the PM6_D / SCF / TETCI development were assisted by Claude (Anthropic). All commits are authored by the maintainer; Claude was used as a research/refactoring aide.
+Portions of the PM6_D / SCF / TETCI development were assisted by Claude
+(Anthropic). All commits are authored by the maintainer; Claude was used as a
+research and refactoring aide.
