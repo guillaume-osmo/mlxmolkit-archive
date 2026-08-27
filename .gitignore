@@ -13,3 +13,4 @@ outputs/
 *.pth
 *.ckpt
 *.oeb
+!data/gxtb_onecxints_extracted.npz
