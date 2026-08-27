@@ -141,10 +141,54 @@ def gxtb_aes_fock(P: np.ndarray, basis: GXTBQVSZPBasis, atoms: np.ndarray,
 
 # --- one-center (onsite) exchange: onecxints over same-atom shell pairs ---
 import numpy as _np
-_ONEC = _np.load(__import__("os").path.join(__import__("os").path.dirname(__file__),
-                 "..", "..", "data", "gxtb_onecxints_extracted.npz"))
-ONECX_TBL = _ONEC["onecxints"]   # (103,10)
-ONECX_LIDX = _ONEC["lidx"]       # (4,4)
+import os as _os
+
+_ONECX_PATH = _os.path.join(
+    _os.path.dirname(__file__), "..", "..", "data", "gxtb_onecxints_extracted.npz"
+)
+
+# This table is an extraction artifact with no regeneration script: `git log --
+# '*onecxints*'` is empty, and unlike eeqbc2025 / mctc_vdwrad / qvszp there is no
+# tools/extract_*.py that rebuilds it.  It was also matched by the blanket
+# `*.npz` in .gitignore, so it was never committed and survived only in a
+# working tree.  It is committed here (with a .gitignore exception) because the
+# only remaining copy was outside this repository.
+#
+# The load is lazy rather than at module scope.  Previously importing this
+# module raised a bare FileNotFoundError naming a path, which meant a clean
+# checkout could not import mlxmolkit.xtb.gxtb_aes AT ALL -- silently disabling
+# use_aes, use_aniso_h0 and use_twobody_third_order -- while the test suite
+# stayed green by skipping on the same missing file.
+#
+# The source data also survives in the shipped binary
+# (___tblite_data_onecxints_MOD_get_onecxints_{number,symbol} in libxtb.dylib),
+# so it is re-derivable the way the other tables were.
+_ONEC = None
+
+
+def _onecx_tables():
+    """Load the one-centre exchange tables, or explain precisely what is missing."""
+    global _ONEC
+    if _ONEC is None:
+        if not _os.path.exists(_ONECX_PATH):
+            raise FileNotFoundError(
+                f"g-xTB one-centre exchange table not found: {_ONECX_PATH}\n"
+                "The terms that need it (use_aes, use_aniso_h0, "
+                "use_twobody_third_order) cannot run without it. Re-extract from "
+                "___tblite_data_onecxints_MOD_get_onecxints_* in the g-xTB "
+                "libxtb.dylib, following tools/extract_qvszp_params.py."
+            )
+        _ONEC = _np.load(_ONECX_PATH)
+    return _ONEC["onecxints"], _ONEC["lidx"]   # (103, 10), (4, 4)
+
+
+def __getattr__(name):
+    # Keep ONECX_TBL / ONECX_LIDX working for callers, now lazily.
+    if name == "ONECX_TBL":
+        return _onecx_tables()[0]
+    if name == "ONECX_LIDX":
+        return _onecx_tables()[1]
+    raise AttributeError(name)
 
 
 def gxtb_onsite_gamma(basis, atoms):
@@ -159,6 +203,7 @@ def gxtb_onsite_gamma(basis, atoms):
     sl = _np.asarray(basis.shell_l)
     n = bts.size
     g = _np.zeros((n, n))
+    _onecx_tbl, _onecx_lidx = _onecx_tables()
     for mu in range(n):
         ish = int(bts[mu]); ai = int(sa[ish]); li = int(sl[ish])
         Z = int(atoms[ai])
@@ -166,8 +211,8 @@ def gxtb_onsite_gamma(basis, atoms):
             jsh = int(bts[nu]); aj = int(sa[jsh]); lj = int(sl[jsh])
             if ai != aj:
                 continue
-            pack = int(ONECX_LIDX[li, lj])
-            g[mu, nu] = float(ONECX_TBL[Z - 1, pack - 1])
+            pack = int(_onecx_lidx[li, lj])
+            g[mu, nu] = float(_onecx_tbl[Z - 1, pack - 1])
     return g
 
 
@@ -220,8 +265,9 @@ def _onsite_base(basis, atoms):
     n = bts.size
     base = _np.zeros((n, n))
     same = aoat[:, None] == aoat[None, :]
-    pack = ONECX_LIDX[aol[:, None], aol[None, :]] - 1   # (n,n) packed index
-    val = ONECX_TBL[Zao[:, None] - 1, pack]             # (n,n) onecx per AO-pair (uses mu's Z)
+    _onecx_tbl, _onecx_lidx = _onecx_tables()
+    pack = _onecx_lidx[aol[:, None], aol[None, :]] - 1  # (n,n) packed index
+    val = _onecx_tbl[Zao[:, None] - 1, pack]            # (n,n) onecx per AO-pair (uses mu's Z)
     base = _np.where(same, val, 0.0)
     _ONSITE_BASE_CACHE[key] = (basis, base, bts)
     return base, bts
