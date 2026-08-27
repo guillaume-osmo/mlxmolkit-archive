@@ -1248,10 +1248,12 @@ def _nddo_energy_at_geometry(
     # which an H_core-diagonalisation guess did for EtBr (q(Br) = +0.22 against
     # MOPAC's -0.16). A previous geometry's *converged* density is safe in a
     # way an H_core guess is not: it is already the right root.
+    warm_start = False
     if P_init is not None:
         P_init = np.asarray(P_init, dtype=np.float64)
         if P_init.shape == P.shape:
             P = P_init.copy()
+            warm_start = True
         elif verbose:
             print(f"  ignoring P_init of shape {P_init.shape}, "
                   f"expected {P.shape}")
@@ -1299,8 +1301,13 @@ def _nddo_energy_at_geometry(
         # Build Fock matrix
         F = _fock(H, P)
 
-        # DIIS extrapolation (after first few iterations)
-        if iteration >= 2:
+        # DIIS extrapolation (after first few iterations).
+        #
+        # Held off until iteration 2 from a cold start, where the first Fock
+        # matrices are built from a neutral-atom guess and are poor DIIS
+        # vectors. A converged density handed in through `P_init` is not that:
+        # it is already the right root, so there is nothing to wait for.
+        if iteration >= (0 if warm_start else 2):
             # Error vector: e = F @ P - P @ F (commutator, should be zero at convergence)
             e = F @ P - P @ F
             diis_F_list.append(F.copy())
@@ -1369,9 +1376,14 @@ def _nddo_energy_at_geometry(
             P = P_new
             break
 
-        # Adaptive density mixing — always mix, stronger damping for d-orbitals
+        # Adaptive density mixing — always mix, stronger damping for d-orbitals.
+        #
+        # The unconditional damping of the first three iterations exists to stop
+        # a neutral-atom guess oscillating while it is still far away. Applied
+        # to a `P_init` warm start it damps a density that is already close,
+        # and the measured `delta` below is a better guide from iteration 0.
         has_d = any(p.n_basis > 4 for p in params)
-        if iteration < 3:
+        if iteration < 3 and not warm_start:
             mix = 0.3 if has_d else 0.5
         elif delta > 0.1:
             mix = 0.05 if has_d else 0.4  # heavy damping for d-orbital atoms
